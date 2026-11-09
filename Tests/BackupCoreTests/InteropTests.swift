@@ -8,6 +8,22 @@ struct InteropTests {
         ProcessInfo.processInfo.environment[key].map { URL(filePath: $0, directoryHint: .isDirectory) }
     }
 
+    // These fixtures contain only synthetic files and portable records. Copy the
+    // bytes so exFAT's AppleDouble entries do not enter the cross-platform ZIP.
+    private func copyFixture(_ source: URL, to target: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: target, withIntermediateDirectories: false)
+        for item in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isDirectoryKey])
+            where !item.lastPathComponent.hasPrefix("._") {
+            let output = target.appending(path: item.lastPathComponent)
+            if try item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
+                try copyFixture(item, to: output)
+            } else {
+                try Data(contentsOf: item).write(to: output)
+            }
+        }
+    }
+
     @Test("Export a Swift-created exFAT v2 backup interrupted during a patch")
     func exportInteropFixture() async throws {
         guard let exported = location("BACKUP_GENIUS_EXPORT_FIXTURE") else { return }
@@ -40,7 +56,7 @@ struct InteropTests {
         await #expect(throws: BackupError.self) { try await engine.syncNow() }
         #expect(fm.fileExists(atPath: target.appending(path: "\(journalPath)/pending.json").path))
         await engine.finishAndClose()
-        try fm.copyItem(at: target, to: exported)
+        try copyFixture(target, to: exported)
     }
 
     @Test("Recover a C++ v2 transaction, restore its history and take over from Swift")
@@ -57,7 +73,7 @@ struct InteropTests {
             try? fm.removeItem(at: target)
             try? fm.removeItem(at: root)
         }
-        try fm.copyItem(at: imported, to: target)
+        try copyFixture(imported, to: target)
         let engine = SyncEngine(storage: root.appending(path: "State"), allowInternal: true, monitor: false,
                                 testFormat: parent == root ? .exfat : nil)
         _ = try await engine.openExisting(target: target)
