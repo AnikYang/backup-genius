@@ -1,0 +1,58 @@
+{
+  "bytesPerFile": 1024,
+  "cases": {
+    "batchMove": {
+      "checkingSeconds": 29.047220417,
+      "elapsedSeconds": 29.698525792,
+      "examined": 2000,
+      "historyWrittenBytes": 0,
+      "issues": 0,
+      "latestWrittenBytes": 0,
+      "sourceReadBytes": 0,
+      "targetReadBytes": 0
+    },
+    "editOnePercent": {
+      "checkingSeconds": 0.030449292,
+      "elapsedSeconds": 8.701142667,
+      "examined": 1000,
+      "historyWrittenBytes": 1024000,
+      "issues": 0,
+      "latestWrittenBytes": 1024000,
+      "sourceReadBytes": 1024000,
+      "targetReadBytes": 1024000
+    },
+    "initial": {
+      "checkingSeconds": 1.562402292,
+      "elapsedSeconds": 484.753490959,
+      "examined": 101001,
+      "historyWrittenBytes": 0,
+      "issues": 0,
+      "latestWrittenBytes": 135954432,
+      "sourceReadBytes": 135954432,
+      "targetReadBytes": 0
+    },
+    "largeFileOneBlock": {
+      "checkingSeconds": 0.000125833,
+      "elapsedSeconds": 0.099932792,
+      "examined": 1,
+      "historyWrittenBytes": 33554432,
+      "issues": 0,
+      "latestWrittenBytes": 65536,
+      "sourceReadBytes": 33554432,
+      "targetReadBytes": 33554432
+    },
+    "unchanged": {
+      "checkingSeconds": 2.525e-05,
+      "elapsedSeconds": 0.034751958,
+      "examined": 0,
+      "historyWrittenBytes": 0,
+      "issues": 0,
+      "latestWrittenBytes": 0,
+      "sourceReadBytes": 0,
+      "targetReadBytes": 0
+    }
+  },
+  "files": 100000,
+  "filesystem": "apfs",
+  "host": "macOS POSIX test backend"
+}

@@ -205,7 +205,9 @@ Records Index::all(std::string_view bucket) {
 Records Index::below(std::string_view bucket, std::string_view path) {
     Records values;
     auto lower = std::string(path) + "/", upper = std::string(path) + "0";
-    statement("SELECT key,value FROM cache WHERE bucket=? AND (key=? OR (key>=? AND key<?))", {bucket, path, lower, upper},
+    statement("SELECT key,value FROM cache WHERE bucket=? AND key>=? AND key<?"
+              " UNION ALL SELECT key,value FROM cache WHERE bucket=? AND key=?",
+              {bucket, lower, upper, bucket, path},
               [&](sqlite3_stmt* stmt) { values.emplace(textColumn(stmt, 0), Json::parse(textColumn(stmt, 1))); });
     return values;
 }
