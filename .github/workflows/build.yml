@@ -1,0 +1,152 @@
+name: Build and verify
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Run 100,000-file benchmarks on Windows test volumes
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test APFS and exFAT, export a prepared Swift transaction
+        run: |
+          mkdir -p dist
+          export BACKUP_GENIUS_EXPORT_FIXTURE="$PWD/dist/swift-fixture"
+          Scripts/test-volumes.sh
+          (cd dist && zip -qr swift-fixture.zip swift-fixture)
+      - name: Package macOS app
+        run: |
+          Scripts/build-app.sh
+          codesign --verify --strict 'dist/Backup Genius.app'
+          ditto -c -k --sequesterRsrc --keepParent 'dist/Backup Genius.app' dist/Backup-Genius-macOS.zip
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: fixture-swift
+          path: dist/swift-fixture.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: bundle-macOS
+          path: dist/Backup-Genius-macOS.zip
+          if-no-files-found: error
+
+  windows:
+    needs: mac
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x64
+            runner: windows-2025-vs2026
+          - architecture: ARM64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: fixture-swift
+          path: Windows/out/fixtures
+      - name: Build Windows app and tests
+        shell: pwsh
+        run: ./Windows/build.ps1 -Architecture ${{ matrix.architecture }}
+      - name: Test NTFS, exFAT, and a Mac to Windows takeover
+        shell: pwsh
+        env:
+          BG_BENCHMARK: ${{ inputs.benchmark || startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          Expand-Archive Windows/out/fixtures/swift-fixture.zip Windows/out/fixtures
+          $mac = Resolve-Path Windows/out/fixtures/swift-fixture
+          $output = Join-Path (Resolve-Path Windows/out/fixtures) 'cpp-fixture'
+          ./Windows/test-volumes.ps1 -Architecture ${{ matrix.architecture }} -MacFixture $mac.Path -OutputFixture $output -Benchmark:($env:BG_BENCHMARK -eq 'true')
+          tar.exe -a -cf dist/cpp-fixture.zip -C Windows/out/fixtures cpp-fixture
+          if ($LASTEXITCODE -ne 0) { throw 'Could not package the C++ fixture' }
+      - name: Launch WinUI on Windows 11
+        if: matrix.architecture == 'ARM64'
+        shell: powershell
+        run: ./Windows/Tests/smoke-ui.ps1 -Architecture ARM64
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: fixture-cpp-${{ matrix.architecture }}
+          path: dist/cpp-fixture.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: bundle-Windows-${{ matrix.architecture }}
+          path: dist/Backup-Genius-Windows-${{ matrix.architecture }}.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.2
+        if: inputs.benchmark || startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: performance-Windows-${{ matrix.architecture }}
+          path: dist/performance-*.json
+          if-no-files-found: error
+
+  round-trip:
+    needs: windows
+    runs-on: xcode-27
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: fixture-cpp-x64
+          path: dist
+      - name: Recover the Windows transaction on exFAT and take over from Swift
+        run: |
+          unzip -q dist/cpp-fixture.zip -d dist
+          BACKUP_GENIUS_IMPORT_FIXTURE="$PWD/dist/cpp-fixture" Scripts/test-volumes.sh --filter importInteropFixture
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [mac, windows, round-trip]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: bundle-*
+          path: packages
+          merge-multiple: true
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: performance-Windows-*
+          path: packages
+          merge-multiple: true
+      - name: Publish preview and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd packages
+          sha256sum ./*.zip ./*.json > SHA256SUMS.txt
+          cat > "$RUNNER_TEMP/backup-genius-release.md" <<'NOTES'
+          Backup Genius preview for macOS 27 and Windows 11 25H2 or later.
+
+          The macOS bundle uses an ad hoc signature. Windows ZIPs include the Windows App SDK runtime and have no commercial signature.
+
+          The workflow verifies APFS, NTFS and exFAT test volumes and exchanges interrupted exFAT backup records across platforms. Benchmark JSON files describe the runner and workload.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" ./*.zip ./*.json SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease --title "Backup Genius $GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/backup-genius-release.md"

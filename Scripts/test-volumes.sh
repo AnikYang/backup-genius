@@ -28,4 +28,10 @@ partition="$(printf '%s\n' "$attached" | awk '/Microsoft Basic Data/{print $1; e
 [[ -n "$exfat_disk" && -n "$partition" ]]
 diskutil mount "$partition"
 exfat="$(diskutil info -plist "$partition" | plutil -extract MountPoint raw -)"
-BACKUP_GENIUS_TEST_APFS="$apfs" BACKUP_GENIUS_TEST_EXFAT="$exfat" Scripts/swift-local.sh test "$@"
+export BACKUP_GENIUS_TEST_APFS="$apfs" BACKUP_GENIUS_TEST_EXFAT="$exfat"
+if [[ "$#" -gt 0 && "$1" == -- ]]; then
+    shift
+    "$@"
+else
+    Scripts/swift-local.sh test "$@"
+fi

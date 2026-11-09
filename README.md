@@ -1,29 +1,42 @@
 # Backup Genius
 
-Backup Genius 是面向 macOS 27 的外置硬盘备份工具。它把 Mac 上一个文件夹的变化单向同步到 APFS 或 exFAT 硬盘，并在硬盘上保留 30 天的旧版。
+Backup Genius 将一个源文件夹单向同步到外置硬盘。最新副本保持普通文件结构，替换和删除的文件保留 30 天。Mac 支持 APFS 和 exFAT，Windows 支持 NTFS 和 exFAT。
 
 ## 使用
 
-1. 打开 [Backup Genius.app](dist/Backup%20Genius.app)，选择“设置备份…”。
-2. 选择源文件夹和硬盘上的目标文件夹。建议为任务建立一个独立文件夹。
-3. 保存任务。默认在硬盘连接时自动同步。关掉窗口后，可从菜单栏查看状态。
-4. 在“历史版本”中选择文件和恢复位置。恢复会创建新目录，便于比对。
+1. 选择“设置备份”，指定源文件夹和外置硬盘上的目标文件夹。每项任务使用独立的目标目录。
+2. 保存任务。连接硬盘后应用会自动同步。Mac 菜单栏和 Windows 托盘可查看状态、暂停或推出硬盘。
+3. 在“历史版本”选择一个版本和恢复位置。应用在所选位置创建一个新文件夹。
+4. 在另一台电脑接上 exFAT 硬盘，选择“打开已有备份”和“预览接管”。首次接管选择空目录。已有源目录的两端变化会先比较和预览，确认冲突的处理方式后才继续自动同步。
 
-exFAT 上的最新副本是普通文件，可在 Windows 打开。硬盘的 **.backup-genius** 目录保存可移植的版本、校验和恢复记录。“打开已有备份…”可以在没有原 Mac 索引时载入历史。同步完成前请通过应用的“安全推出”释放硬盘。异常拔出后，应用会在重新连接时处理尚未提交的更新。
+应用使用硬盘上的 .backup-genius 目录保存版本、校验和恢复记录。现有 exFAT v1 备份可读，在开始共享写入时升级为 v2。出现未提交的 v1 事务时，先在 Mac 上恢复。v2 事务可由任一端恢复。
 
-软件会保留目录中未纳入任务的文件，并提示同名、类型或命名冲突。无法读取的文件、尚未下载的文件和扩展属性超过 2 MiB 的文件会列为“需要处理”。选择本地 APFS 恢复目录可以还原记录的 Mac 文件属性和符号链接。
+特殊文件、冲突名称和权限问题会显示在活动记录。外部新增且未纳入任务的文件保持原样。Windows 保存常用文件属性及符号链接记录，Mac 保存扩展属性和 ACL。跨平台无法还原的项目会标为待处理。
 
-## 构建与验证
+## 构建
 
-需要 macOS 27 SDK 和 Swift 6.2 或以上。本地包使用临时代码签名和 App Sandbox。
+Mac 需要 macOS 27 SDK 和 Swift 6.2 或更新版本。构建脚本生成临时签名的 dist/Backup Genius.app。
 
-    Scripts/build-app.sh
-    Scripts/swift-local.sh test
-    Scripts/test-volumes.sh
+~~~sh
+Scripts/build-app.sh
+Scripts/test-volumes.sh
+~~~
 
-真实卷测试脚本会创建并挂载两个临时磁盘镜像。测试目录和生成文件独立于现有备份任务。运行基准时可传入文件数量、测试卷目录和 JSON 报告路径。
+Windows 使用 Visual Studio 2026（或 Visual Studio 2022 17.14）、C++ 桌面工作负载与 Windows 11 SDK。Windows App SDK 固定为 2.6.5。解压 ZIP 后运行 BackupGenius.exe，依赖保留在同一目录。首版支持 Windows 11 25H2 及之后的版本。
 
-    Scripts/swift-local.sh build -c release --build-system native --product BackupBench
-    .build/release/BackupBench 100000 "/Volumes/Test Drive" "$PWD/Reports/benchmark-local.json"
+~~~powershell
+./Windows/build.ps1 -Architecture x64
+./Windows/build.ps1 -Architecture ARM64
+./Windows/test-volumes.ps1 -Architecture x64
+~~~
 
-参见 [性能报告](Reports/Performance.md)。
+Windows 卷测试使用独立的 VHDX。日常备份以普通用户身份运行。卷测试的挂载与格式化步骤需要管理员权限。
+
+## 验证
+
+- [磁盘协议 v2](Protocol/README.md) 描述 Swift 和 C++ 共用的格式和接管规则。
+- [Mac 基线性能](Reports/Performance.md) 记录 APFS 与 exFAT 虚拟卷实测。
+- [跨平台验证](Reports/Cross-platform.md) 区分本地、GitHub Actions 和实机验证。
+- GitHub Actions 构建三套包，交换两个引擎生成的中断事务。版本标签触发预览包和 SHA-256 校验文件发布。
+
+源码使用 [MIT 许可证](LICENSE)。
