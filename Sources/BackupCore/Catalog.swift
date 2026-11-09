@@ -33,6 +33,7 @@ final class Catalog {
                 );
                 CREATE INDEX IF NOT EXISTS files_by_name ON files(folded);
                 CREATE INDEX IF NOT EXISTS files_by_identity ON files(identity);
+                CREATE TABLE IF NOT EXISTS aligned (path TEXT PRIMARY KEY, payload BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS dirty (side TEXT NOT NULL, path TEXT NOT NULL, flags INTEGER NOT NULL,
                     PRIMARY KEY(side, path));
                 CREATE TABLE IF NOT EXISTS versions (id TEXT PRIMARY KEY, time REAL NOT NULL, payload BLOB NOT NULL);
@@ -299,7 +300,27 @@ final class Catalog {
         }
     }
 
-    func apply(_ batch: DiskBatch, caseSensitive: Bool) throws {
+    func alignment() throws -> [String: FileRecord] {
+        var result: [String: FileRecord] = [:]
+        try run("SELECT path,payload FROM aligned", []) {
+            result[string($0, 0)] = try JSONDecoder().decode(FileRecord.self, from: data($0, 1))
+        }
+        return result
+    }
+
+    func bindSource(_ identity: String) throws {
+        try transaction {
+            try execute("DELETE FROM aligned")
+            try execute("INSERT INTO aligned SELECT path,payload FROM files")
+            try set("aligned.source", identity)
+            try execute("DELETE FROM dirty WHERE side='source'")
+            try set("source.stream", "")
+            try set("source.cursor", "0")
+            try set("source.full", "1")
+        }
+    }
+
+    func apply(_ batch: DiskBatch, caseSensitive: Bool, align: Bool = false) throws {
         try transaction {
             guard try generation + 1 == batch.generation else { throw BackupError.message("备份记录顺序异常") }
             for chunk in batch.chunks {
@@ -309,6 +330,7 @@ final class Catalog {
             for edit in batch.edits {
                 if let old = edit.from {
                     try execute("DELETE FROM files WHERE path=?", [.text(old)])
+                    if align { try execute("DELETE FROM aligned WHERE path=?", [.text(old)]) }
                 }
                 if let record = edit.next {
                     try execute("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)", [
@@ -316,8 +338,12 @@ final class Catalog {
                         .text(record.source.identity), .text(record.source.kind.rawValue),
                         .blob(try JSONEncoder().encode(record)),
                     ])
-                } else {
+                    if align {
+                        try execute("INSERT OR REPLACE INTO aligned SELECT path,payload FROM files WHERE path=?", [.text(record.path)])
+                    }
+                } else if edit.method != .archive {
                     try execute("DELETE FROM files WHERE path=?", [.text(edit.path)])
+                    if align { try execute("DELETE FROM aligned WHERE path=?", [.text(edit.path)]) }
                 }
                 if let version = edit.archive {
                     let id = version.item.id.uuidString
@@ -348,6 +374,7 @@ final class Catalog {
             }
             try set("generation", String(batch.generation))
             try set("lastBatch", batch.id.uuidString)
+            if let writer = batch.writer { try set("writer", writer.uuidString) }
         }
     }
 }

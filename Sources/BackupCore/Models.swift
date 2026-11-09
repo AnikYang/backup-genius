@@ -38,7 +38,7 @@ public struct BackupJob: Codable, Sendable, Identifiable {
 
 public enum SyncState: String, Codable, Sendable {
     case unconfigured, disconnected, ready, checking, syncing, recovering, verifying
-    case upToDate, paused, needsAttention
+    case upToDate, paused, needsAttention, takeoverRequired
 
     public var busy: Bool {
         switch self {
@@ -139,6 +139,13 @@ struct FileTime: Codable, Equatable, Sendable {
         nanoseconds = time.tv_nsec
     }
 
+    init(seconds: Int, nanoseconds: Int) {
+        self.seconds = seconds
+        self.nanoseconds = nanoseconds
+    }
+
+    var valid: Bool { (0..<1_000_000_000).contains(nanoseconds) }
+
     var posix: timespec { timespec(tv_sec: seconds, tv_nsec: nanoseconds) }
 }
 
@@ -170,6 +177,19 @@ struct FileStamp: Codable, Equatable, Sendable {
         flags = raw.st_flags
     }
 
+    var portable: Self {
+        var raw = stat()
+        switch kind {
+        case .regular: raw.st_mode = S_IFREG
+        case .directory: raw.st_mode = S_IFDIR
+        case .symlink: raw.st_mode = S_IFLNK
+        case .unsupported: break
+        }
+        raw.st_size = kind == .regular ? size : 0
+        raw.st_mtimespec = modified.posix
+        return Self(raw)
+    }
+
     var identity: String { "\(inode):\(birth.seconds):\(birth.nanoseconds)" }
 
     func sameContentIdentity(as other: Self) -> Bool {
@@ -191,6 +211,9 @@ struct MacAttributes: Codable, Equatable, Sendable {
     var birth: FileTime
     var extended: [String: Data] = [:]
     var acl: String?
+    var windows: UInt32? = nil
+    var windowsLink: Bool? = nil
+    var windowsLinkDirectory: Bool? = nil
 }
 
 struct FileRecord: Codable, Sendable {
@@ -200,6 +223,7 @@ struct FileRecord: Codable, Sendable {
     var attributes: MacAttributes
     var hashes = Data()
     var link: Data?
+    var portableID: UUID? = nil
 }
 
 struct ChunkLocation: Codable, Hashable, Sendable {
@@ -216,6 +240,15 @@ struct ArchivedVersion: Codable, Sendable {
     var clone: UUID?
     var hashes = Data()
     var link: Data?
+}
+
+func macLink(_ target: Data?, attributes: MacAttributes, at path: String) throws -> Data {
+    guard let target else { throw BackupError.message("缺少符号链接数据：\(path)") }
+    if attributes.windowsLink == true {
+        guard let value = String(data: target, encoding: .utf8), !value.hasPrefix("/"), !value.contains(":"),
+              !value.contains("\\") else { throw BackupError.message("此符号链接需要在 Windows 恢复：\(path)") }
+    }
+    return target
 }
 
 struct Changes: Sendable {

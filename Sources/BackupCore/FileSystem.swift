@@ -473,10 +473,12 @@ final class Tree: @unchecked Sendable {
     }
 
     func writeDocument<T: Encodable>(_ value: T, at path: String, replacing: Bool = false) throws {
+        let data = try JSONEncoder().encode(value)
+        guard data.count <= 64 * 1024 * 1024 else { throw BackupError.message("备份记录超过大小限制：\(path)") }
         let temp = pathJoin(pathParent(path), ".write-\(UUID().uuidString)")
         let fd = try createFile(temp)
         do {
-            try fd.write(JSONEncoder().encode(value), at: 0)
+            try fd.write(data, at: 0)
             try fd.flush(full: true)
             try rename(temp, to: path, replacing: replacing)
             try directory(pathParent(path)).flush(directory: true)

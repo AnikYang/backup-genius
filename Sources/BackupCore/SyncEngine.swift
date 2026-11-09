@@ -65,6 +65,8 @@ public final class SyncEngine: @unchecked Sendable {
     private var suppressConnection = false
     private var progress = SyncProgress()
     private var lastPublished: Double = 0
+    private var host = UUID()
+    private var takeover: (draft: TakeoverDraft, job: BackupJob, access: Scope)?
 
     public convenience init(storage: URL) {
         self.init(storage: storage, allowInternal: false, monitor: true)
@@ -141,6 +143,15 @@ public final class SyncEngine: @unchecked Sendable {
     private func load() throws {
         guard !started else { return }
         try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+        let hostURL = storage.appending(path: "host-id")
+        if FileManager.default.fileExists(atPath: hostURL.path) {
+            guard let saved = UUID(uuidString: try String(contentsOf: hostURL, encoding: .utf8)) else {
+                throw BackupError.message("本机备份标识无效")
+            }
+            host = saved
+        } else {
+            try host.uuidString.write(to: hostURL, atomically: true, encoding: .utf8)
+        }
         let scratchURL = storage.appending(path: "scratch", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: scratchURL, withIntermediateDirectories: true)
         scratch = try Tree(scratchURL.resolvingSymlinksInPath())
@@ -159,6 +170,7 @@ public final class SyncEngine: @unchecked Sendable {
     private func periodic() {
         guard let job, let repository, !isPaused else { return }
         do {
+            guard try !requiresTakeover(repository, job: job), !job.restoreOnly || !repository.descriptor.portable else { return }
             let due = try verifyDue(repository.catalog)
             if !job.restoreOnly, job.automatic, due || streamFailure {
                 _ = try run(verify: due)
@@ -180,7 +192,7 @@ public final class SyncEngine: @unchecked Sendable {
                 let volume = try engine.inspect(output.url)
                 try engine.validateVolume(volume)
                 let identity = try engine.identity(input)
-                let marker = try Repository.enroll(output, volume: volume, sourceIdentity: identity, source: input.url)
+                let marker = try Repository.enroll(output, volume: volume, sourceIdentity: identity, source: input.url, host: engine.host)
                 let configured = BackupJob(
                     id: marker.job, source: input.url, target: output.url, volumeID: volume.identifier,
                     volumeName: volume.name, format: volume.format,
@@ -204,10 +216,10 @@ public final class SyncEngine: @unchecked Sendable {
                 try engine.validateVolume(volume)
                 let marker = try Repository.marker(output, volume: volume)
                 let configured = BackupJob(
-                    id: marker.job, source: URL(fileURLWithPath: marker.sourcePath), target: output.url,
+                    id: marker.job, source: marker.sourcePath.map { URL(fileURLWithPath: $0) } ?? output.url, target: output.url,
                     volumeID: volume.identifier, volumeName: volume.name, format: volume.format,
                     sourceBookmark: nil, targetBookmark: engine.bookmark(target, readOnly: false),
-                    sourceIdentity: marker.sourceIdentity, targetRelativePath: try VolumeLocation(output.root).relative(output.url),
+                    sourceIdentity: marker.sourceIdentity ?? "", targetRelativePath: try VolumeLocation(output.root).relative(output.url),
                     automatic: false, restoreOnly: true)
                 try engine.activate(configured, sourceAccess: nil, targetAccess: access)
                 return configured
@@ -233,6 +245,7 @@ public final class SyncEngine: @unchecked Sendable {
         sourceMonitor = nil
         sourceScope = nil
         targetScope = nil
+        takeover = nil
         self.job = job
         catalog = index
         progress = SyncProgress()
@@ -378,7 +391,7 @@ public final class SyncEngine: @unchecked Sendable {
             publish()
             return
         }
-        let next = try Repository(tree: tree, volume: volume, job: job, catalog: catalog, interruption: interruption)
+        let next = try Repository(tree: tree, volume: volume, job: job, catalog: catalog, host: host, interruption: interruption)
         repository = next
         do {
             if try next.needsRecovery() {
@@ -390,16 +403,30 @@ public final class SyncEngine: @unchecked Sendable {
                 try catalog.putActivity([Activity(date: Date(), kind: .recovered, path: "备份硬盘",
                                                    detail: "已回滚未完成的更新", bytes: 0)])
             }
+            if job.format == .exfat && !job.restoreOnly && !next.descriptor.portable,
+               next.descriptor.sourceIdentity == job.sourceIdentity {
+                try catalog.bindSource(job.sourceIdentity)
+                try next.upgrade(owner: host)
+            }
+            if next.descriptor.portable && !job.restoreOnly, try next.owner == host,
+               try catalog.generation == 0 && catalog.get("aligned.source") == nil {
+                try catalog.bindSource(job.sourceIdentity)
+            }
             try catalog.recordChanges(Changes(fullScan: true), side: "target")
             startTargetMonitor(tree)
             progress.trackedFiles = try catalog.fileCount()
-            progress.state = isPaused ? .paused : .ready
+            progress.state = try requiresTakeover(next, job: job) ? .takeoverRequired : (isPaused ? .paused : .ready)
             progress.message = nil
             publish()
         } catch {
             repository = nil
             throw error
         }
+    }
+
+    private func requiresTakeover(_ repo: Repository, job: BackupJob) throws -> Bool {
+        if !repo.descriptor.portable || job.restoreOnly { return false }
+        return try repo.owner != host || repo.catalog.get("aligned.source") != job.sourceIdentity || repo.catalog.get("takeover.pending") == "1"
     }
 
     private func startSourceMonitor(_ source: Tree, catalog: Catalog) throws {
@@ -461,7 +488,8 @@ public final class SyncEngine: @unchecked Sendable {
         do {
             let changed = try persistEvents(flush: false)
             if changed { automaticRetries = 0 }
-            guard let job, job.automatic, !job.restoreOnly, !isPaused, repository != nil, changed || force else { return }
+            guard let job, job.automatic, !job.restoreOnly, !isPaused, let repository, changed || force,
+                  try !requiresTakeover(repository, job: job) else { return }
             _ = try run(verify: false)
             if unstableThisRun, automaticRetries < 2 {
                 automaticRetries += 1
@@ -564,6 +592,132 @@ public final class SyncEngine: @unchecked Sendable {
     public func activity() async throws -> [Activity] { try await perform { try $0.catalog?.activities() ?? [] } }
     public func history() async throws -> [HistoryItem] { try await perform { try $0.catalog?.versions().map(\.item) ?? [] } }
 
+    private func alignmentURL(_ job: BackupJob) -> URL {
+        storage.appending(path: "alignment-\(job.id.uuidString).json")
+    }
+
+    public func previewTakeover(source folder: URL) async throws -> TakeoverPreview {
+        try await perform { engine in
+            try engine.refresh()
+            guard let job = engine.job, let repo = engine.repository, job.format == .exfat else {
+                throw BackupError.message("请先连接并打开 exFAT 备份")
+            }
+            let access = Scope(folder)
+            let source = try Tree(folder.resolvingSymlinksInPath())
+            try engine.validateFolders(source.url, repo.tree.url)
+            let identity = try engine.identity(source)
+            let configured = BackupJob(id: job.id, source: source.url, target: repo.tree.url, volumeID: job.volumeID,
+                                       volumeName: job.volumeName, format: job.format,
+                                       sourceBookmark: engine.bookmark(folder, readOnly: false), targetBookmark: job.targetBookmark,
+                                       sourceIdentity: identity, targetRelativePath: job.targetRelativePath,
+                                       automatic: job.restoreOnly || job.automatic, restoreOnly: false)
+            let checkpoint = engine.alignmentURL(job)
+            if FileManager.default.fileExists(atPath: checkpoint.path) {
+                var saved = try JSONDecoder().decode(AlignmentCheckpoint.self, from: Data(contentsOf: checkpoint))
+                guard saved.source == identity else { throw BackupError.message("请选择上次接管使用的源文件夹") }
+                saved.preview.resuming = true
+                engine.takeover = (TakeoverDraft(preview: saved.preview, local: [:], disk: saved.disk), configured, access)
+                return saved.preview
+            }
+            let local = try localAlignment(source)
+            let bound = try repo.catalog.get("aligned.source") == identity
+            guard bound || local.isEmpty else { throw BackupError.message("首次接管请选择一个空文件夹") }
+            let base = bound ? try repo.catalog.alignment() : [:]
+            let disk = try repo.verifiedAlignment()
+            let preview = TakeoverPreview(id: UUID(), generation: try repo.catalog.generation,
+                                          changes: compareAlignment(local: local, disk: disk, base: base))
+            engine.takeover = (TakeoverDraft(preview: preview, local: local, disk: disk), configured, access)
+            return preview
+        }
+    }
+
+    public func confirmTakeover(_ id: UUID, choices: [String: TakeoverChoice]) async throws -> BackupJob {
+        try await perform { engine in
+            guard let session = engine.takeover, session.draft.preview.id == id, let repo = engine.repository,
+                  session.job.id == repo.descriptor.job else { throw BackupError.message("请重新预览接管") }
+            let source = try Tree(session.access.url.resolvingSymlinksInPath())
+            guard try engine.identity(source) == session.job.sourceIdentity else { throw BackupError.message("源文件夹已替换") }
+            let checkpointURL = engine.alignmentURL(session.job)
+            let draft = session.draft
+            let plan: AlignmentCheckpoint
+            if draft.preview.resuming {
+                plan = try JSONDecoder().decode(AlignmentCheckpoint.self, from: Data(contentsOf: checkpointURL))
+                guard plan.preview.id == id, plan.source == session.job.sourceIdentity,
+                      try repo.owner == plan.writer || repo.owner == engine.host,
+                      try equalContents(repo.verifiedAlignment(), plan.disk) else {
+                    throw BackupError.message("备份已在另一台电脑更改，无法继续上次接管")
+                }
+            } else {
+                guard try repo.catalog.generation == draft.preview.generation,
+                      try equalContents(localAlignment(source), draft.local),
+                      try equalContents(repo.verifiedAlignment(), draft.disk) else {
+                    throw BackupError.message("预览后文件已更改，请重新检查")
+                }
+                let steps = try engine.alignmentSteps(draft, choices: choices)
+                plan = AlignmentCheckpoint(source: session.job.sourceIdentity, writer: try repo.owner,
+                                           preview: draft.preview, disk: draft.disk, steps: steps)
+                try JSONEncoder().encode(plan).write(to: checkpointURL, options: .atomic)
+            }
+            try repo.catalog.set("takeover.pending", "1")
+            try JSONEncoder().encode(session.job).write(to: engine.configURL, options: .atomic)
+            engine.job = session.job
+            engine.sourceScope = session.access
+            engine.sourceMonitor = nil
+            engine.setPaused(false)
+            engine.progress.state = .recovering
+            engine.progress.message = "正在对齐源文件夹"
+            engine.publish()
+            do {
+                if !repo.descriptor.portable { try repo.upgrade(owner: nil) }
+                for step in plan.steps {
+                    if engine.isPaused { throw BackupError.paused }
+                    try repo.applyAlignment(step, source: source)
+                }
+                try source.checkRoot()
+                try repo.claim()
+                try repo.catalog.bindSource(session.job.sourceIdentity)
+                try FileManager.default.removeItem(at: checkpointURL)
+                try repo.catalog.set("takeover.pending", "0")
+                try repo.catalog.recordChanges(Changes(fullScan: true), side: "target")
+                engine.takeover = nil
+                engine.progress.state = .ready
+                engine.progress.message = nil
+                engine.publish()
+                engine.schedule(force: true)
+                return session.job
+            } catch {
+                engine.fail(error)
+                throw error
+            }
+        }
+    }
+
+    private func alignmentSteps(_ draft: TakeoverDraft, choices: [String: TakeoverChoice]) throws -> [AlignmentStep] {
+        var copies: [AlignmentStep] = []
+        var updates: [AlignmentStep] = []
+        var removals: [AlignmentStep] = []
+        for change in draft.preview.changes {
+            let path = change.path
+            if change.kind == .blocked { throw BackupError.message("请先处理名称或文件类型冲突：\(path)") }
+            if change.kind == .send { continue }
+            let local = draft.local[path]
+            let incoming = draft.disk[path]
+            if change.kind == .conflict {
+                guard let choice = choices[path] else { throw BackupError.message("请选择如何处理冲突：\(path)") }
+                if choice == .local { continue }
+                if choice == .both {
+                    guard change.canKeepBoth, let local else { throw BackupError.message("无法保留两份：\(path)") }
+                    let copy = pathJoin(pathParent(path), "Backup Genius conflict \(UUID().uuidString)")
+                    copies.append(AlignmentStep(path: copy, before: nil, desired: local, copyLocal: path))
+                }
+            }
+            let step = AlignmentStep(path: path, before: local, desired: incoming)
+            if incoming == nil { removals.append(step) } else { updates.append(step) }
+        }
+        func depth(_ item: AlignmentStep) -> Int { item.path.split(separator: "/").count }
+        return copies + removals.sorted { depth($0) > depth($1) } + updates.sorted { depth($0) < depth($1) }
+    }
+
     private func date(_ key: String, catalog: Catalog) throws -> Date? {
         guard let value = try catalog.get(key), let number = Double(value) else { return nil }
         return Date(timeIntervalSinceReferenceDate: number)
@@ -614,6 +768,11 @@ public final class SyncEngine: @unchecked Sendable {
         try refresh()
         guard let job, !job.restoreOnly else { throw BackupError.message("请先设置备份任务") }
         guard let repository, let scratch, let catalog else { throw BackupError.disconnected }
+        if try requiresTakeover(repository, job: job) {
+            progress.state = .takeoverRequired
+            publish()
+            return progress
+        }
         let source = try sourceTree(job)
         try startSourceMonitor(source, catalog: catalog)
         try persistEvents(flush: true)
@@ -821,7 +980,7 @@ public final class SyncEngine: @unchecked Sendable {
                 try output.mkdir(path, existing: true)
                 directories.append((path, record.attributes))
             case .symlink:
-                guard let link = record.link else { throw BackupError.message("缺少链接数据：\(record.path)") }
+                let link = try macLink(record.link, attributes: record.attributes, at: record.path)
                 try output.createLink(link, at: path)
                 try output.applyLinkTime(record.attributes, at: path)
             case .unsupported:

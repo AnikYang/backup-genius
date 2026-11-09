@@ -15,6 +15,7 @@ extension SyncState {
         case .upToDate: "已同步"
         case .paused: "备份已暂停"
         case .needsAttention: "需要处理"
+        case .takeoverRequired: "等待接管"
         }
     }
 
@@ -27,13 +28,14 @@ extension SyncState {
         case .syncing, .recovering: "arrow.triangle.2.circlepath"
         case .paused: "pause.circle"
         case .needsAttention: "exclamationmark.triangle"
+        case .takeoverRequired: "arrow.left.arrow.right.circle"
         }
     }
 
     var color: Color {
         switch self {
         case .upToDate: .green
-        case .needsAttention: .orange
+        case .needsAttention, .takeoverRequired: .orange
         case .disconnected, .paused, .unconfigured: .secondary
         default: .accentColor
         }
@@ -115,6 +117,10 @@ struct MainWindow: View {
                         Menu {
                             Button("在 Finder 中打开", action: model.openFolder).disabled(model.volume == nil)
                             Button("完整校验", action: model.verify).disabled(!model.canSync)
+                            if model.job?.format == .exfat {
+                                Button("接管同步…") { model.setup = .takeover }
+                                    .disabled(model.volume == nil || model.progress.state.busy || model.ejecting || model.restoring)
+                            }
                             Divider()
                             Button("更改备份…") { model.setup = .configure }
                                 .disabled(model.progress.state.busy || model.restoring || model.ejecting)
@@ -129,7 +135,7 @@ struct MainWindow: View {
         .navigationSplitViewStyle(.balanced)
         .onChange(of: model.page) { _, _ in model.loadRecords() }
         .sheet(item: $model.setup) { mode in
-            SetupView(model: model, mode: mode)
+            if mode == .takeover { TakeoverView(model: model) } else { SetupView(model: model, mode: mode) }
         }
         .alert("需要处理", isPresented: Binding(
             get: { model.error != nil }, set: { if !$0 { model.error = nil } }
@@ -183,6 +189,9 @@ struct Overview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     status
+                    if model.progress.state == .takeoverRequired || (job.restoreOnly && job.format == .exfat && model.volume != nil) {
+                        Button("预览接管…") { model.setup = .takeover }.buttonStyle(.borderedProminent)
+                    }
                     route(job)
                     metrics
                     if model.progress.unmanaged > 0 || model.progress.issueCount > 0 {
@@ -321,6 +330,7 @@ struct Overview: View {
             return "最新备份可用。"
         case .paused: return "随时可以继续检查和同步。"
         case .needsAttention: return "打开活动记录查看需要处理的项目。"
+        case .takeoverRequired: return "先对齐本机文件夹与备份内容，再继续自动同步。"
         case .unconfigured: return "选择要备份的文件夹。"
         }
     }

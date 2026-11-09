@@ -1,0 +1,391 @@
+#include "../Core/Engine.h"
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <thread>
+
+using namespace bg;
+namespace {
+void expect(bool ok, std::string_view description) {
+    if (!ok) throw std::runtime_error(std::string(description));
+}
+void write(const Tree& tree, std::string_view rel, std::string_view data) {
+    tree.parents(rel);
+    auto file = tree.file(rel, tree.entry(rel) ? File::Mode::write : File::Mode::create);
+    file.write(0, data);
+    file.resize(static_cast<int64_t>(data.size()));
+    file.flush();
+}
+Bytes read(const Tree& tree, std::string_view rel) {
+    auto file = tree.file(rel);
+    return file.read(0, static_cast<size_t>(file.stamp().size));
+}
+struct Fixture {
+    fs::path root, source, target, state, restore;
+    Fixture(const fs::path& volume = {}) {
+        auto temp = fs::canonical(fs::temp_directory_path());
+        root = temp / ("bg-test-" + uuid());
+        fs::create_directory(root);
+        source = root / "source";
+        target = (volume.empty() ? root : volume) / ("bg-target-" + uuid());
+        state = root / "state";
+        restore = root / "restore";
+        for (const auto& p : {source, target, state, restore}) fs::create_directory(p);
+    }
+    ~Fixture() {
+        std::error_code error;
+        fs::remove_all(target, error);
+        fs::remove_all(root, error);
+    }
+};
+
+void incremental(const fs::path& volume) {
+    Fixture f(volume);
+    const Tree source(f.source), disk(f.target);
+    SyncEngine engine(f.state, {}, true);
+    Bytes data(3 * blockSize, 'a');
+    write(source, "images/payload.bin", data);
+    write(source, "images/small.txt", "one");
+    write(source, ".hidden", "hidden");
+    engine.configure(f.source, f.target, false);
+    auto first = engine.sync();
+    expect(first.state == SyncState::upToDate && first.latestWritten == data.size() + 9, "first copy");
+    expect(read(disk, "images/payload.bin") == data && read(disk, ".hidden") == "hidden", "initial data");
+    auto idle = engine.sync();
+    expect(idle.sourceRead == 0 && idle.targetRead == 0 && idle.latestWritten == 0 && idle.historyWritten == 0, "unchanged I/O");
+    auto before = source.entry("images/payload.bin").value();
+    data[blockSize + 19] = 'b';
+    write(source, "images/payload.bin", data);
+    source.metadata("images/payload.bin", before.modified, before.created, before.attributes);
+    engine.recordChanges({{{"images/payload.bin", contentChange}}});
+    auto patch = engine.sync();
+    expect(patch.state == SyncState::upToDate && patch.latestWritten == blockSize && patch.historyWritten > 0, "one block delta");
+    expect(read(disk, "images/payload.bin") == data, "patched content");
+    auto versions = engine.history();
+    expect(versions.size() == 1, "history count");
+    auto restored = Tree(engine.restore(f.restore, versions[0].at("id").get<std::string>()));
+    expect(read(restored, "payload.bin") == Bytes(3 * blockSize, 'a'), "historical contents");
+
+    source.rename("images/small.txt", "images/temporary-name");
+    source.rename("images/temporary-name", "images/Small.txt");
+    engine.recordChanges({{{"images/small.txt", nameChange}, {"images/Small.txt", nameChange}}});
+    auto moved = engine.sync();
+    expect(moved.latestWritten == 0 && read(disk, "images/Small.txt") == "one", "case-only move");
+
+    data.resize(2 * blockSize, 'c');
+    write(source, "images/payload.bin", data);
+    engine.recordChanges({{{"images/payload.bin", contentChange}}});
+    expect(engine.sync().latestWritten == 0 && read(disk, "images/payload.bin") == data, "truncate");
+    data += Bytes(2 * blockSize + 19, 'd');
+    write(source, "images/payload.bin", data);
+    engine.recordChanges({{{"images/payload.bin", contentChange}}});
+    expect(engine.sync().latestWritten == 2 * blockSize + 19 && read(disk, "images/payload.bin") == data, "grow");
+    write(disk, "outside.txt", "unmanaged");
+    write(disk, "images/Small.txt", "foreign");
+    engine.recordChanges({{}, true}, true);
+    const auto external = engine.sync();
+    expect(external.unmanaged >= 1, "unmanaged content reported");
+    expect(read(disk, "outside.txt") == "unmanaged", "unmanaged content preserved");
+    expect(read(disk, "images/Small.txt") == "one", "external edit reconciled: " + engine.activities().dump());
+    source.remove("images/Small.txt");
+    engine.recordChanges({{{"images/Small.txt", nameChange}}});
+    engine.sync();
+    expect(!disk.entry("images/Small.txt"), "deleted from latest copy");
+}
+void interrupted(const fs::path& volume, Interruption at) {
+    Fixture f(volume);
+    const Tree source(f.source), disk(f.target);
+    Bytes data(2 * blockSize, 'a');
+    write(source, "payload.bin", data);
+    bool armed = false, triggered = false;
+    {
+        SyncEngine engine(f.state, {}, true, [&](Interruption step) {
+            if (armed && step == at) { triggered = true; throw std::runtime_error("injected interruption"); }
+        });
+        engine.configure(f.source, f.target, false);
+        engine.sync();
+        armed = true;
+        data.front() = 'b';
+        write(source, "payload.bin", data);
+        engine.recordChanges({{{"payload.bin", contentChange}}});
+        try { engine.sync(); } catch (const std::exception&) { if (!triggered) throw; }
+        expect(triggered && disk.entry(pendingPath).has_value(), "durable prepare record");
+    }
+    {
+        SyncEngine other(f.root / "other", {}, true);
+        other.openExisting(f.target);
+        expect(!disk.entry(pendingPath), "other installation recovers pending");
+        expect(read(disk, "payload.bin").front() == (at == Interruption::committed ? 'b' : 'a'), "commit or rollback contents");
+    }
+    SyncEngine restarted(f.state, {}, true);
+    restarted.start();
+    auto finished = restarted.sync();
+    expect(finished.state == SyncState::upToDate && read(disk, "payload.bin") == data, "restart continues");
+}
+void ownership(const fs::path& volume) {
+    Fixture f(volume);
+    auto otherFolder = f.root / "source2";
+    fs::create_directory(otherFolder);
+    Tree a(f.source), b(otherFolder), disk(f.target);
+    write(a, "payload.bin", "baseline");
+    write(a, "receive.txt", "first");
+    {
+        SyncEngine first(f.state, {}, true);
+        first.configure(f.source, f.target, false);
+        first.sync();
+    }
+    {
+        SyncEngine other(f.root / "other", {}, true);
+        other.openExisting(f.target);
+        auto preview = other.previewTakeover(otherFolder);
+        other.confirmTakeover(preview.id, {});
+        expect(read(b, "payload.bin") == "baseline", "empty source initialized");
+        write(b, "payload.bin", "remote");
+        write(b, "receive.txt", "second");
+        other.sync();
+    }
+    write(a, "payload.bin", "local");
+    SyncEngine first(f.state, {}, true);
+    first.start();
+    expect(first.sync().state == SyncState::takeoverRequired, "old writer fenced");
+    auto preview = first.previewTakeover(f.source);
+    expect(std::any_of(preview.changes.begin(), preview.changes.end(), [](const auto& change) {
+        return change.path == "payload.bin" && change.kind == AlignmentKind::conflict;
+    }), "three-way conflict");
+    first.confirmTakeover(preview.id, {{"payload.bin", AlignmentChoice::both}});
+    first.sync();
+    expect(read(a, "receive.txt") == "second" && read(a, "payload.bin") == "remote", "aligned source");
+    bool found = false;
+    for (const auto& item : a.children()) {
+        if (item.starts_with("Backup Genius conflict")) {
+            expect(read(a, item) == "local" && read(disk, item) == "local", "kept both versions");
+            found = true;
+        }
+    }
+    expect(found, "conflict copy");
+}
+void pruning(const fs::path& volume) {
+    Fixture f(volume);
+    const Tree source(f.source), disk(f.target);
+    write(source, "payload", "old");
+    std::string id;
+    {
+        SyncEngine engine(f.state, {}, true);
+        engine.configure(f.source, f.target, false);
+        engine.sync();
+        write(source, "payload", "new");
+        engine.recordChanges({{{"payload", contentChange}}});
+        engine.sync();
+        expect(engine.history().size() == 1, "history before expiry");
+        id = engine.presentation().job.id;
+    }
+    {
+        Index settings(f.state / "settings.sqlite"), cache(f.state / (id + ".sqlite"));
+        bool interrupted = false;
+        Repository repo(disk, cache, identifier(settings.get("settings", "host")), [&](Interruption point) {
+            if (point == Interruption::pruning) { interrupted = true; throw std::runtime_error("interrupted cleanup"); }
+        });
+        repo.open();
+        try { repo.prune({now().seconds + 31 * 86400, 0}); }
+        catch (...) { if (!interrupted) throw; }
+        expect(interrupted && cache.count("archive") == 0 && read(disk, "payload") == "new", "prune commit precedes pack deletion");
+    }
+    SyncEngine reopened(f.root / "reopened", {}, true);
+    reopened.openExisting(f.target);
+    expect(reopened.history().empty() && read(disk, "payload") == "new", "interrupted prune replay");
+}
+#ifdef _WIN32
+void liveEvents(const fs::path& volume) {
+    Fixture f(volume);
+    Tree source(f.source), disk(f.target);
+    SyncEngine engine(f.state, {}, true);
+    write(source, "file.txt", "one");
+    engine.configure(f.source, f.target, true);
+    engine.sync();
+    const auto before = source.entry("file.txt").value();
+    write(source, "file.txt", "two");
+    source.metadata("file.txt", before.modified, before.created, before.attributes);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline) {
+        engine.poll();
+        if (read(disk, "file.txt") == "two") return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    throw std::runtime_error("ReadDirectoryChangesW missed same-size edit");
+}
+#endif
+void safety(const fs::path& volume) {
+    expect(!validPath("../escape") && !validPath(".backup-genius/job.json") &&
+        !representable("folder/LPT¹.txt") && !representable("file:stream") && !representable("trailing."), "path rules");
+    expect(integer(Json::parse("9007199254740993")) == 9007199254740993LL, "lossless integers");
+    expect(decodeTime(Json::parse(R"({"seconds":1700000000,"nanoseconds":123456789})")).nanoseconds == 123456789,
+        "lossless file time");
+    Fixture f(volume);
+    Tree source(f.source), disk(f.target);
+    write(source, "file", "original");
+    {
+        SyncEngine engine(f.state, {}, true);
+        engine.configure(f.source, f.target, false);
+        engine.sync();
+        bool locked = false;
+        try { SyncEngine duplicate(f.root / "another", {}, true); duplicate.openExisting(f.target); }
+        catch (...) { locked = true; }
+        expect(locked, "exclusive disk lease");
+        fs::rename(f.source, f.root / "source-moved");
+        bool failed = false;
+        try { engine.sync(); } catch (...) { failed = true; }
+        expect(failed && read(disk, "file") == "original", "missing source preserves latest");
+    }
+    auto entries = disk.children(journalPath);
+    auto found = std::find_if(entries.begin(), entries.end(), [](auto& value) {
+        return value.size() == 25 && value.ends_with(".json") && value.front() == '0';
+    });
+    expect(found != entries.end(), "expected a committed journal file");
+    const auto& entry = *found;
+    auto stored = Json::parse(disk.readDocument(join(journalPath, entry)));
+    stored["checksum"] = base64(Bytes(32, 'x'));
+    disk.writeDocument(join(journalPath, entry), stored.dump(), true);
+    bool rejected = false;
+    try { SyncEngine engine(f.root / "clean", {}, true); engine.openExisting(f.target); }
+    catch (...) { rejected = true; }
+    expect(rejected && read(disk, "file") == "original", "corrupt journal fails closed");
+}
+
+Json metrics(const SyncProgress& p) {
+    return {{"checkingSeconds", p.checkingSeconds}, {"elapsedSeconds", p.elapsedSeconds}, {"examined", p.examined},
+        {"sourceReadBytes", p.sourceRead}, {"targetReadBytes", p.targetRead}, {"latestWrittenBytes", p.latestWritten},
+        {"historyWrittenBytes", p.historyWritten}, {"issues", p.issues}};
+}
+void benchmark(int count, const fs::path& volume, const fs::path& output) {
+    expect(count >= 100 && count <= 1'000'000, "benchmark file count out of range");
+    Fixture f(volume);
+    Tree source(f.source);
+    SyncEngine engine(f.state, {}, true);
+    auto filename = [](int n, bool moved = false) {
+        return "group-" + std::to_string(n / 100) + (moved ? "/moved-" : "/item-") + std::to_string(n);
+    };
+    for (int n = 0; n < count; ++n) {
+        auto file = filename(n);
+        if (n % 100 == 0) source.parents(file);
+        // Data generation is outside the measured sync interval.
+        Bytes bytes(1024, 'e');
+        for (int i = 0; i < 8; ++i) bytes[i] = static_cast<char>(static_cast<uint64_t>(n) >> (i * 8));
+        source.file(file, File::Mode::create).write(0, bytes);
+    }
+    Bytes payload(32 * 1024 * 1024, 'z');
+    for (size_t i = 0; i < payload.size(); i += blockSize) {
+        for (int j = 0; j < 8; ++j) payload[i + j] = static_cast<char>(static_cast<uint64_t>(i / blockSize) >> (j * 8));
+    }
+    write(source, "large.bin", payload);
+    engine.configure(f.source, f.target, false);
+    Json cases;
+    cases["initial"] = metrics(engine.sync());
+    engine.sync(); // Let notifications for our first commit settle.
+    const auto idle = engine.sync();
+    expect(!idle.sourceRead && !idle.targetRead && !idle.latestWritten && !idle.historyWritten, "benchmark no-op reads/writes");
+    cases["unchanged"] = metrics(idle);
+    Changes changes;
+    for (int n = 0; n < count; n += 100) {
+        auto file = filename(n);
+        source.file(file, File::Mode::write).write(8, "m");
+        changes.paths[file] = contentChange;
+    }
+    engine.recordChanges(changes);
+    cases["editOnePercent"] = metrics(engine.sync());
+    changes = {};
+    for (int n = 0; n < count; n += 100) {
+        source.rename(filename(n), filename(n, true));
+        changes.paths[filename(n)] = nameChange;
+        changes.paths[filename(n, true)] = nameChange;
+    }
+    engine.recordChanges(changes);
+    cases["batchMove"] = metrics(engine.sync());
+    source.file("large.bin", File::Mode::write).write(9 * blockSize + 9, "\x9c");
+    engine.recordChanges({{{"large.bin", contentChange}}});
+    auto patch = engine.sync();
+    expect(patch.latestWritten == blockSize, "benchmark large-file patch");
+    cases["largeFileOneBlock"] = metrics(patch);
+    std::ofstream file(output, std::ios::binary);
+    file << Json{{"files", count}, {"bytesPerFile", 1024}, {"filesystem", inspect(f.target).format},
+        {"host",
+#ifdef _WIN32
+        "Windows"
+#else
+        "macOS POSIX test backend"
+#endif
+        }, {"cases", cases}}.dump(2) << '\n';
+    expect(file.good(), "write benchmark report");
+}
+void interop(const fs::path& input, const fs::path& output, const fs::path& volume) {
+    Fixture f(volume);
+    fs::copy(input, f.target, fs::copy_options::recursive | fs::copy_options::copy_symlinks);
+    auto source = Tree(f.source), disk = Tree(f.target);
+    bool armed = false, interrupted = false;
+    {
+        SyncEngine engine(f.state, {}, true, [&](Interruption at) {
+            if (armed && at == Interruption::firstBlock) { interrupted = true; throw std::runtime_error("injected cross-platform fault"); }
+        });
+        engine.openExisting(f.target);
+        expect(read(disk, "payload.bin").front() == 'M', "Swift prepared edit rolled back");
+        auto history = engine.history();
+        expect(!history.empty(), "read Swift history");
+        auto restored = Tree(engine.restore(f.restore, history[0].at("id").get<std::string>()));
+        expect(read(restored, "payload.bin").front() == 'A', "read Swift packed data");
+        auto preview = engine.previewTakeover(f.source);
+        engine.confirmTakeover(preview.id, {});
+        auto data = read(source, "payload.bin");
+        data[blockSize] = 'W';
+        write(source, "payload.bin", data);
+        write(source, "windows.txt", "written by the C++ engine\n");
+        engine.sync();
+        expect(read(disk, "payload.bin") == data, "write compatible current copy");
+        armed = true;
+        data.front() = 'Z';
+        write(source, "payload.bin", data);
+        engine.recordChanges({{{"payload.bin", contentChange}}});
+        try { engine.sync(); } catch (...) { if (!interrupted) throw; }
+        expect(interrupted && disk.entry(pendingPath).has_value(), "export prepared C++ transaction");
+    }
+    expect(!fs::exists(output), "fixture output already exists");
+    fs::copy(f.target, output, fs::copy_options::recursive | fs::copy_options::copy_symlinks);
+}
+
+int entry(std::vector<std::string> args) {
+    try {
+        if (args.size() == 5 && args[1] == "--benchmark") {
+            benchmark(std::stoi(args[2]), path(args[3]), path(args[4]));
+        } else if ((args.size() == 4 || args.size() == 5) && args[1] == "--interop") {
+            interop(path(args[2]), path(args[3]), args.size() == 5 ? path(args[4]) : fs::path{});
+        } else {
+            auto volume = args.size() == 2 ? path(args[1]) : fs::path{};
+            std::cout << "Incremental backup\n" << std::flush;
+            incremental(volume);
+            std::cout << "Interrupted transactions\n" << std::flush;
+            for (auto at : {Interruption::prepared, Interruption::firstBlock, Interruption::applied, Interruption::committed})
+                interrupted(volume, at);
+            std::cout << "Takeover and safety\n" << std::flush;
+            ownership(volume);
+            safety(volume);
+            pruning(volume);
+#ifdef _WIN32
+            liveEvents(volume);
+#endif
+            std::cout << "Passed: incremental, 4 interruption points, takeover, safety, pruning\n";
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}
+}
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) {
+    std::vector<std::string> args;
+    for (int i = 0; i < argc; ++i) args.push_back(utf8(fs::path(argv[i])));
+    return entry(std::move(args));
+}
+#else
+int main(int argc, char** argv) { return entry(std::vector<std::string>(argv, argv + argc)); }
+#endif

@@ -18,21 +18,25 @@ final class Repository {
     private(set) var volume: VolumeInfo
     let catalog: Catalog
     private let lock: FD
+    private(set) var descriptor: Marker
+    let host: UUID
     private let interruption: (@Sendable (InterruptionPoint) throws -> Void)?
 
-    static func enroll(_ tree: Tree, volume: VolumeInfo, sourceIdentity: String, source: URL) throws -> Marker {
+    static func enroll(_ tree: Tree, volume: VolumeInfo, sourceIdentity: String, source: URL, host: UUID) throws -> Marker {
         if try tree.entry(controlName) != nil {
             let marker = try tree.readDocument(Marker.self, from: markerPath)
             try check(marker, volume: volume)
-            guard marker.sourceIdentity == sourceIdentity else {
+            guard marker.portable || marker.sourceIdentity == sourceIdentity else {
                 throw BackupError.message("此备份绑定了另一源文件夹。可以打开已有备份进行恢复。")
             }
             return marker
         }
         try tree.mkdir(controlName)
         for dir in [journalPath, stagePath, packPath, clonePath] { try tree.mkdir(dir) }
-        let marker = Marker(version: 1, job: UUID(), volume: volume.identifier, format: volume.format,
-                            sourceIdentity: sourceIdentity, sourcePath: source.path)
+        let marker = volume.format == .exfat
+            ? Marker(version: 2, job: UUID(), format: volume.format, initialWriter: host, legacyGeneration: 0)
+            : Marker(version: 1, job: UUID(), volume: volume.identifier, format: volume.format,
+                     sourceIdentity: sourceIdentity, sourcePath: source.path)
         try tree.writeDocument(marker, at: markerPath)
         try tree.root.flush(directory: true)
         return marker
@@ -45,20 +49,21 @@ final class Repository {
     }
 
     private static func check(_ marker: Marker, volume: VolumeInfo) throws {
-        guard marker.version == 1, marker.format == volume.format,
-              marker.volume.isEmpty || marker.volume == volume.identifier else {
+        let legacy = marker.version == 1 && (marker.volume == "" || marker.volume == volume.identifier)
+        let portable = marker.portable && volume.format == .exfat && (marker.legacyGeneration ?? -1) >= 0
+        guard marker.format == volume.format, legacy || portable else {
             throw BackupError.message("此硬盘与原备份标识不符")
         }
     }
 
-    init(tree: Tree, volume: VolumeInfo, job: BackupJob, catalog: Catalog,
+    init(tree: Tree, volume: VolumeInfo, job: BackupJob, catalog: Catalog, host: UUID,
          interruption: (@Sendable (InterruptionPoint) throws -> Void)?) throws {
         self.tree = tree
         self.volume = volume
         self.catalog = catalog
+        self.host = host
         self.interruption = interruption
-        let marker = try Self.marker(tree, volume: volume)
-        guard marker.job == job.id else { throw BackupError.message("此文件夹属于另一项备份") }
+        descriptor = try Self.marker(tree, volume: volume)
         do {
             lock = try tree.createFile(lockPath)
         } catch BackupError.io(_, _, let code) where code == EEXIST {
@@ -67,9 +72,31 @@ final class Repository {
         guard flock(lock.value, LOCK_EX | LOCK_NB) == 0 else {
             throw BackupError.message("此备份正在另一个进程中使用")
         }
+        descriptor = try Self.marker(tree, volume: volume)
+        guard descriptor.job == job.id else { throw BackupError.message("此文件夹属于另一项备份") }
     }
 
     var rich: Bool { volume.format == .apfs }
+
+    var owner: UUID? {
+        get throws { try catalog.get("writer").flatMap(UUID.init(uuidString:)) ?? descriptor.initialWriter }
+    }
+
+    func upgrade(owner: UUID?) throws {
+        guard descriptor.version == 1, volume.format == .exfat else { return }
+        guard try !needsRecovery() else { throw BackupError.message("请先恢复旧版备份的未完成事务") }
+        let marker = Marker(version: 2, job: descriptor.job, format: .exfat, initialWriter: owner,
+                            legacyGeneration: try catalog.generation)
+        try tree.writeDocument(marker, at: markerPath, replacing: true)
+        descriptor = marker
+    }
+
+    func claim() throws {
+        var batch = try newBatch()
+        batch.takeover = true
+        batch.writer = host
+        try commit(batch, patches: [:], beforeApply: {})
+    }
 
     func refreshCapacity() {
         var info = statfs()
@@ -86,6 +113,14 @@ final class Repository {
 
     private func readBatch(_ path: String) throws -> DiskBatch {
         let batch = try tree.readDocument(Envelope.self, from: path).batch()
+        let portable = descriptor.portable && batch.generation > (descriptor.legacyGeneration ?? 0)
+        guard portable == (batch.version == 2), !portable || batch.writer != nil || batch.edits.allSatisfy({ $0.method == .archive }) else {
+            throw BackupError.message("备份记录与协议版本不符")
+        }
+        if batch.takeover == true {
+            guard portable, batch.writer != nil, batch.edits.isEmpty, batch.chunks.isEmpty,
+                  batch.pruned.isEmpty, batch.retiredPacks.isEmpty else { throw BackupError.message("接管记录无效") }
+        }
         for edit in batch.edits {
             try userPath(edit.path)
             if let from = edit.from { try userPath(from) }
@@ -93,6 +128,13 @@ final class Repository {
                 throw BackupError.message("备份记录的文件路径不一致")
             }
             if let archive = edit.archive { try userPath(archive.item.path) }
+            if portable {
+                if let next = edit.next { try checkRecipe(kind: next.source.kind, size: next.source.size, hashes: next.hashes) }
+                if let archive = edit.archive {
+                    guard archive.clone == nil else { throw BackupError.message("exFAT 历史记录包含克隆文件") }
+                    try checkRecipe(kind: archive.kind, size: archive.item.size, hashes: archive.hashes)
+                }
+            }
             if edit.rollbackBlocks.contains(where: { $0 < 0 || Int64($0) > Int64.max / Int64(blockSize) }) {
                 throw BackupError.message("恢复记录的块范围无效")
             }
@@ -106,6 +148,12 @@ final class Repository {
         return batch
     }
 
+    private func checkRecipe(kind: EntryKind, size: Int64, hashes: Data) throws {
+        guard size >= 0, hashes.count % digestSize == 0 else { throw BackupError.message("备份块清单无效") }
+        let count = kind == .regular ? size / Int64(blockSize) + (size % Int64(blockSize) == 0 ? 0 : 1) : 0
+        guard count == Int64(hashes.count / digestSize) else { throw BackupError.message("备份块清单与文件大小不符") }
+    }
+
     func needsRecovery() throws -> Bool { try tree.entry(pendingPath) != nil }
 
     @discardableResult
@@ -115,6 +163,7 @@ final class Repository {
             $0.count == 25 && $0.hasSuffix(".json") && Int64($0.prefix(20)) != nil
         }.sorted()
         let latest = try catalog.generation
+        guard (descriptor.legacyGeneration ?? 0) <= Int64(names.count) else { throw BackupError.message("旧版提交记录不完整") }
         guard latest <= Int64(names.count) else { throw BackupError.message("硬盘上的提交记录不完整") }
         if latest > 0 {
             let persisted = try readBatch(commitPath(latest))
@@ -128,7 +177,11 @@ final class Repository {
             guard batch.generation == generation, pathName(commitPath(generation)) == names[index] else {
                 throw BackupError.message("硬盘上的提交记录不连续")
             }
-            try catalog.apply(batch, caseSensitive: volume.caseSensitive)
+            if batch.version == 2, batch.takeover != true, try batch.writer != owner {
+                throw BackupError.message("备份写入者与接管记录不符")
+            }
+            let align = try batch.writer == host && batch.takeover != true && catalog.get("aligned.source") != nil
+            try catalog.apply(batch, caseSensitive: volume.caseSensitive, align: align)
         }
         let recovered = try recover()
         for name in try tree.names(in: stagePath) {
@@ -150,9 +203,12 @@ final class Repository {
             return false
         }
         guard batch.generation == generation + 1 else { throw BackupError.message("待恢复的提交记录顺序异常") }
+        if batch.version == 2, batch.takeover != true, try batch.writer != owner {
+            throw BackupError.message("待恢复的记录与接管状态不符")
+        }
         let newChunks = Dictionary(batch.chunks.map { ($0.hash, $0) }, uniquingKeysWith: { first, _ in first })
         for edit in batch.edits.reversed() {
-            try rollback(edit, chunks: newChunks)
+            try rollback(edit, chunks: newChunks, portable: batch.version == 2)
         }
         try flushParents(batch.edits)
         try clearPending()
@@ -170,19 +226,38 @@ final class Repository {
 
     func commit(_ input: DiskBatch, patches: [String: PatchData], beforeApply: () throws -> Void) throws {
         var batch = input
-        guard !batch.edits.isEmpty || !batch.pruned.isEmpty || !batch.retiredPacks.isEmpty else { return }
+        guard !batch.edits.isEmpty || !batch.pruned.isEmpty || !batch.retiredPacks.isEmpty || batch.takeover == true else { return }
         try tree.checkRoot()
         guard try !needsRecovery() else { throw BackupError.message("需要先恢复上一次同步") }
+        let generation = try catalog.generation
+        guard batch.generation == generation + 1 else { throw BackupError.message("备份记录已变更，请重新检查") }
+        if descriptor.portable {
+            let owner = try owner
+            let archiveOnly = !batch.edits.isEmpty && batch.edits.allSatisfy { $0.method == .archive }
+            guard owner == host || batch.takeover == true || archiveOnly else { throw BackupError.message("请先接管此备份") }
+            if generation > 0 {
+                let head = try readBatch(commitPath(generation))
+                guard head.id.uuidString == (try catalog.get("lastBatch")) else { throw BackupError.message("提交记录已变更") }
+            }
+            batch.version = 2
+            batch.writer = batch.takeover == true ? host : owner
+            for i in batch.edits.indices {
+                if var next = batch.edits[i].next {
+                    next.portableID = try next.portableID ?? catalog.file(batch.edits[i].from ?? next.path)?.portableID ?? UUID()
+                    batch.edits[i].next = next
+                }
+            }
+        }
         try beforeApply()
         try tree.directory(stagePath).flush(directory: true)
-        try tree.writeDocument(try Envelope(batch), at: pendingPath)
+        try tree.writeDocument(try envelope(batch), at: pendingPath)
         try interruption?(.prepared)
 
         var attempted = 0
         do {
             for index in batch.edits.indices {
                 let edit = batch.edits[index]
-                if edit.method != .record {
+                if edit.method != .record && edit.method != .archive {
                     try requireBefore(edit, path: edit.from ?? edit.path)
                 }
                 attempted += 1
@@ -200,10 +275,25 @@ final class Repository {
         }
 
         // Keep the prepared record until an independent, checksummed commit is durable.
-        try tree.writeDocument(try Envelope(batch), at: commitPath(batch.generation))
+        try tree.writeDocument(try envelope(batch), at: commitPath(batch.generation))
         try interruption?(.committed)
-        try catalog.apply(batch, caseSensitive: volume.caseSensitive)
+        let align = try batch.writer == host && batch.takeover != true && catalog.get("aligned.source") != nil
+        try catalog.apply(batch, caseSensitive: volume.caseSensitive, align: align)
         try clearPending()
+    }
+
+    private func envelope(_ batch: DiskBatch) throws -> Envelope {
+        guard batch.version == 2 else { return try Envelope(batch) }
+        var portable = batch
+        for i in portable.edits.indices {
+            portable.edits[i].before = portable.edits[i].before?.portable
+            if var next = batch.edits[i].next {
+                next.source = next.source.portable
+                next.target = next.target?.portable
+                portable.edits[i].next = next
+            }
+        }
+        return try Envelope(portable)
     }
 
     private func rollBackAttempted(_ batch: DiskBatch, count: Int) throws {
@@ -229,7 +319,7 @@ final class Repository {
 
     private func apply(_ edit: inout DiskEdit, patch: PatchData?) throws {
         switch edit.method {
-        case .record:
+        case .record, .archive:
             return
         case .install:
             guard let staging = edit.staging else { throw BackupError.message("缺少待发布文件") }
@@ -268,7 +358,7 @@ final class Repository {
 
     private func flushParents(_ edits: [DiskEdit]) throws {
         var paths: Set<String> = [stagePath]
-        for edit in edits where edit.method != .record {
+        for edit in edits where edit.method != .record && edit.method != .archive {
             paths.insert(pathParent(edit.path))
             if let from = edit.from { paths.insert(pathParent(from)) }
         }
@@ -298,10 +388,10 @@ final class Repository {
         }
     }
 
-    private func rollback(_ edit: DiskEdit, chunks: [Data: ChunkLocation]) throws {
+    private func rollback(_ edit: DiskEdit, chunks: [Data: ChunkLocation], portable: Bool = false) throws {
         let current = try tree.entry(edit.path)
         switch edit.method {
-        case .record:
+        case .record, .archive:
             return
         case .move, .caseMove:
             guard let from = edit.from, let staging = edit.staging else {
@@ -316,7 +406,9 @@ final class Repository {
                     try tree.rename(staged(staging), to: from)
                 }
             } else if try tree.entry(from) == nil, let current, let before = edit.before {
-                guard current.matchesTarget(before, format: volume.format) ||
+                let matches = try portable && edit.next.map { try matchesInstalled($0, current: current, at: edit.path) } == true
+                guard matches ||
+                        current.matchesTarget(before, format: volume.format) ||
                         (current.identity == before.identity && current.sameContentIdentity(as: before)) else {
                     throw BackupError.message("移动中的文件已在其他程序中更改：\(edit.path)")
                 }
@@ -324,7 +416,8 @@ final class Repository {
             }
         case .attributes:
             if let current, let attrs = edit.originalAttributes, let before = edit.before, before != current {
-                guard before.kind == current.kind, before.identity == current.identity else {
+                let matches = portable ? try edit.next.map { try matchesInstalled($0, current: current, at: edit.path) } == true : before.identity == current.identity
+                guard before.kind == current.kind, matches else {
                     throw BackupError.message("待恢复的文件已被替换：\(edit.path)")
                 }
                 try setAttributes(attrs, at: edit.path, kind: current.kind)
@@ -336,6 +429,21 @@ final class Repository {
             if let current {
                 guard current.kind == .regular else { throw BackupError.message("恢复位置已被占用：\(edit.path)") }
                 let file = try tree.file(edit.path, writable: true)
+                if portable {
+                    guard (min(before.size, next.source.size)...max(before.size, next.source.size)).contains(current.size) else {
+                        throw BackupError.message("中断后文件已在其他程序中改写：\(edit.path)")
+                    }
+                    var offset: Int64 = 0
+                    while offset < current.size {
+                        let bytes = try file.readExact(at: offset, length: Int(min(Int64(blockSize), current.size - offset)))
+                        let hash = digest(bytes)
+                        let index = Int(offset / Int64(blockSize))
+                        guard hash == version.hashes.blockHash(index) || hash == next.hashes.blockHash(index) else {
+                            throw BackupError.message("待恢复的文件含有未知内容：\(edit.path)")
+                        }
+                        offset += Int64(bytes.count)
+                    }
+                }
                 let trim = next.source.size < before.size ? Int(next.source.size / Int64(blockSize)) : Int.max
                 for index in edit.rollbackBlocks where index < trim {
                     if let hash = version.hashes.blockHash(index) {
@@ -358,6 +466,12 @@ final class Repository {
             if let before = edit.before {
                 if current == before || (before.kind == .directory && current?.identity == before.identity) { return }
                 guard let archive = edit.archive else { throw BackupError.message("缺少旧版恢复记录：\(edit.path)") }
+                if portable, let current, try matchesArchive(archive, current: current, at: edit.path) { return }
+                if portable, let current, edit.method == .install {
+                    guard let next = edit.next, try matchesInstalled(next, current: current) else {
+                        throw BackupError.message("恢复位置已被其他程序改写：\(edit.path)")
+                    }
+                }
                 if current != nil, edit.method == .remove {
                     throw BackupError.message("恢复位置已有其他文件：\(edit.path)")
                 }
@@ -372,19 +486,30 @@ final class Repository {
         }
     }
 
-    private func matchesInstalled(_ record: FileRecord, current: FileStamp) throws -> Bool {
+    private func matchesInstalled(_ record: FileRecord, current: FileStamp, at path: String? = nil) throws -> Bool {
         guard record.source.kind == current.kind else { return false }
         if rich, record.target?.identity == current.identity { return true }
         switch current.kind {
         case .regular:
             guard record.source.size == current.size else { return false }
-            return try tree.file(record.path).fileHashes(size: current.size) == record.hashes
+            return try tree.file(path ?? record.path).fileHashes(size: current.size) == record.hashes
         case .symlink:
-            return try tree.readLink(record.path) == record.link
+            return try tree.readLink(path ?? record.path) == record.link
         case .directory:
-            return try tree.names(in: record.path).isEmpty
+            return try tree.names(in: path ?? record.path).isEmpty
         case .unsupported:
             return false
+        }
+    }
+
+    private func matchesArchive(_ version: ArchivedVersion, current: FileStamp, at path: String) throws -> Bool {
+        guard version.kind == current.kind else { return false }
+        switch current.kind {
+        case .regular:
+            return try current.size == version.item.size && tree.file(path).fileHashes(size: current.size) == version.hashes
+        case .directory: return true
+        case .symlink: return try tree.readLink(path) == version.link
+        case .unsupported: return false
         }
     }
 
@@ -440,7 +565,7 @@ final class Repository {
             try target.mkdir(path)
             try target.directory(path).apply(version.attributes, rich: rich)
         case .symlink:
-            guard let link = version.link else { throw BackupError.message("历史版本缺少链接") }
+            let link = try macLink(version.link, attributes: version.attributes, at: path)
             try target.createLink(link, at: path)
             try target.applyLinkTime(version.attributes, at: path)
         case .unsupported:

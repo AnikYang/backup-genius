@@ -136,8 +136,13 @@ struct Transfer: Sendable {
     }
 
     private func prepareEntry(_ work: Work, stamp: FileStamp, before: FileStamp?) throws -> Prepared {
-        let attrs = try source.attributes(work.path, stamp: stamp, rich: true)
+        var attrs = try source.attributes(work.path, stamp: stamp, rich: true)
+        attrs.windows = work.old?.attributes.windows
         let link = stamp.kind == .symlink ? try source.readLink(work.path) : nil
+        if let link, work.old?.link == link {
+            attrs.windowsLink = work.old?.attributes.windowsLink
+            attrs.windowsLinkDirectory = work.old?.attributes.windowsLinkDirectory
+        }
         guard try source.entry(work.path) == stamp else { throw BackupError.unstable(work.path) }
         var next = FileRecord(path: work.path, source: stamp, target: before, attributes: attrs, link: link)
         var edit = DiskEdit(method: .record, path: work.path, before: before, next: next)
@@ -188,7 +193,8 @@ struct Transfer: Sendable {
     private func prepareFile(_ work: Work, stamp: FileStamp, before: FileStamp?) throws -> Prepared {
         let input = try source.file(work.path)
         guard try input.stamp() == stamp else { throw BackupError.unstable(work.path) }
-        let attrs = try input.attributes(stamp, rich: true)
+        var attrs = try input.attributes(stamp, rich: true)
+        attrs.windows = work.old?.attributes.windows
         let oldFile = before != nil ? try target.file(work.path) : nil
         var result = Prepared()
         var base = Data()

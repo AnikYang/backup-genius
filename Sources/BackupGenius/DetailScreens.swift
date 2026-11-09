@@ -59,7 +59,7 @@ struct SetupView: View {
                         Toggle("登录时启动", isOn: $login)
                     }
                     if volume?.format == .exfat {
-                        Label("exFAT 备份可在 Windows 打开。同步中断时，正在更新的文件可能需要连接 Mac 恢复。",
+                        Label("exFAT 备份可在 Mac 与 Windows 间接管。切换电脑时请先预览并对齐源文件夹。",
                               systemImage: "info.circle")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -154,10 +154,111 @@ struct SetupView: View {
                     model.job = try await model.engine.openExisting(target: target)
                     model.page = .history
                     model.loadRecords()
+                case .takeover:
+                    return
                 }
                 dismiss()
             } catch {
                 failure = error.localizedDescription
+            }
+        }
+    }
+}
+
+struct TakeoverView: View {
+    @Environment(\.dismiss) private var dismiss
+    let model: AppModel
+    @ViewState private var preview: TakeoverPreview?
+    @ViewState private var choices: [String: TakeoverChoice] = [:]
+    @ViewState private var working = false
+    @ViewState private var error: String?
+
+    private var canConfirm: Bool {
+        guard let preview else { return false }
+        return preview.resuming || preview.changes.allSatisfy {
+            $0.kind != .blocked && ($0.kind != .conflict || choices[$0.path] != nil)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            Label("接管同步", systemImage: "arrow.left.arrow.right.circle").font(.title2.weight(.semibold))
+            Text("首次接管请选择空文件夹。已有源文件夹会先预览两端的差异。")
+                .foregroundStyle(.secondary)
+            Button("选择源文件夹并检查…") { inspect() }.disabled(working)
+            if let preview {
+                if preview.resuming { Text("将继续上次确认的接管操作。") }
+                if preview.changes.isEmpty { Text("两端文件内容一致。") }
+                List(preview.changes) { change in
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text(change.path).lineLimit(1).truncationMode(.middle)
+                            Text(label(change.kind)).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if change.kind == .conflict && !preview.resuming {
+                            Picker("处理冲突", selection: Binding(get: { choices[change.path] }, set: { choices[change.path] = $0 })) {
+                                Text("请选择").tag(nil as TakeoverChoice?)
+                                Text("保留本机").tag(TakeoverChoice.local as TakeoverChoice?)
+                                Text("保留硬盘").tag(TakeoverChoice.disk as TakeoverChoice?)
+                                if change.canKeepBoth { Text("保留两份").tag(TakeoverChoice.both as TakeoverChoice?) }
+                            }
+                            .labelsHidden()
+                            .accessibilityLabel("处理 \(change.path) 的冲突")
+                        }
+                    }
+                }
+                .listStyle(.inset)
+            } else { Spacer() }
+            if let error { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
+            HStack {
+                if working { ProgressView().controlSize(.small).accessibilityLabel("正在检查或对齐文件") }
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction).disabled(working)
+                Button(preview?.resuming == true ? "继续接管" : "对齐并接管") { confirm() }
+                    .buttonStyle(.borderedProminent).disabled(working || !canConfirm)
+            }
+        }
+        .padding(22)
+        .frame(width: 645, height: 445)
+        .interactiveDismissDisabled(working)
+    }
+
+    private func label(_ kind: TakeoverChange.Kind) -> String {
+        switch kind {
+        case .receive: "按硬盘内容对齐本机"
+        case .send: "保留本机变化，接管后备份"
+        case .conflict: "两端都有变化"
+        case .blocked: "请先处理名称或文件类型冲突"
+        }
+    }
+
+    private func inspect() {
+        Task {
+            guard let url = await chooseFolder(title: "选择接管后的源文件夹", prompt: "选择", canCreate: true) else { return }
+            working = true
+            defer { working = false }
+            preview = nil
+            choices = [:]
+            error = nil
+            do { preview = try await model.engine.previewTakeover(source: url) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+
+    private func confirm() {
+        guard let preview else { return }
+        working = true
+        error = nil
+        Task {
+            defer { working = false }
+            do {
+                model.job = try await model.engine.confirmTakeover(preview.id, choices: choices)
+                model.page = .overview
+                dismiss()
+            } catch {
+                self.error = error.localizedDescription
+                self.preview = nil
             }
         }
     }

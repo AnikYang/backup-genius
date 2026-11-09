@@ -73,7 +73,7 @@ final class Lifecycle: NSObject, NSApplicationDelegate {
 }
 
 enum SetupMode: String, Identifiable {
-    case configure, existing
+    case configure, existing, takeover
     var id: Self { self }
 }
 
@@ -149,7 +149,7 @@ final class AppModel {
     }
 
     var canSync: Bool {
-        job?.restoreOnly == false && volume != nil && !progress.state.busy &&
+        job?.restoreOnly == false && volume != nil && !progress.state.busy && progress.state != .takeoverRequired &&
             progress.state != .paused && !restoring && !ejecting
     }
     var canPause: Bool { job?.restoreOnly == false && volume != nil && !restoring && !ejecting }
