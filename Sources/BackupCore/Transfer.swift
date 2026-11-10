@@ -45,7 +45,7 @@ final class PatchData: @unchecked Sendable {
 }
 
 struct Prepared: Sendable {
-    enum Adoption: Sendable { case sharedDirectory, reusedFile, updatedFile }
+    enum Adoption: Sendable { case sharedDirectory, reusedFile, reusedLink, updatedEntry }
 
     var edit: DiskEdit?
     var patch: PatchData?
@@ -78,7 +78,9 @@ struct Transfer: Sendable {
     private var rich: Bool { volume.format == .apfs }
 
     private func activity(_ kind: Activity.Kind, _ path: String, detail: String? = nil, bytes: Int64 = 0) -> Activity {
-        Activity(date: Date(), kind: kind, path: path, detail: detail, bytes: bytes)
+        let nameNote = volume.format == .exfat && windowsNameProblem(path) ? "原名保留，需在 Mac 上打开或恢复" : nil
+        let message = [detail, nameNote].compactMap { $0 }.joined(separator: "。")
+        return Activity(date: Date(), kind: kind, path: path, detail: message.isEmpty ? nil : message, bytes: bytes)
     }
 
     private func prepareRemoval(_ work: Work) throws -> Prepared {
@@ -128,7 +130,7 @@ struct Transfer: Sendable {
         let before = try target.entry(work.path)
         let adopting = before != nil && work.old?.target == nil
         if adopting {
-            guard existingFilesPolicy != .preserve, stamp.kind == .regular || stamp.kind == .directory else {
+            guard existingFilesPolicy != .preserve else {
                 throw BackupError.message("目标位置已有未纳入备份的文件：\(work.path)")
             }
             guard volume.caseSensitive || work.targetNameMatches else {
@@ -158,16 +160,20 @@ struct Transfer: Sendable {
         }
         guard try source.entry(work.path) == stamp else { throw BackupError.unstable(work.path) }
         var next = FileRecord(path: work.path, source: stamp, target: before, attributes: attrs, link: link)
-        if adopting {
+        if adopting && stamp.kind == .directory {
             next.sharedDirectory = true
-            return Prepared(edit: DiskEdit(method: .record, path: work.path, before: before, next: next),
-                            adoption: .sharedDirectory)
+            var edit = DiskEdit(method: .record, path: work.path, before: before, next: next)
+            if volume.format == .exfat && windowsNameProblem(work.path) {
+                edit.activity = activity(.verified, work.path)
+            }
+            return Prepared(edit: edit, adoption: .sharedDirectory)
         }
         var edit = DiskEdit(method: .record, path: work.path, before: before, next: next)
         var version = false
 
-        if let link, !rich {
-            if work.old?.link == link && work.old?.attributes == attrs && work.old?.source == stamp { return Prepared() }
+        if let link, !rich, before == nil {
+            if work.old?.link == link && work.old?.attributes == attrs && work.old?.source == stamp &&
+                work.old?.target == nil { return Prepared() }
             version = work.old != nil && (work.old?.link != link || work.old?.attributes != attrs)
         } else if stamp.kind == .directory, let before {
             if work.old?.source == stamp && work.old?.attributes == attrs && !work.forceHash { return Prepared() }
@@ -180,10 +186,21 @@ struct Transfer: Sendable {
             edit.originalAttributes = try target.attributes(work.path, stamp: before, rich: rich)
             version = rich && work.old?.attributes.extended != attrs.extended
         } else {
-            if let link, let before, try target.readLink(work.path) == link,
-               work.old?.attributes == attrs, work.old?.target == before {
-                if work.old?.source == stamp { return Prepared() }
-                return Prepared(edit: edit)
+            if let link, let before {
+                let matches = try target.readLink(work.path) == link
+                guard try target.entry(work.path) == before else { throw BackupError.unstable(work.path) }
+                if matches && adopting {
+                    edit.activity = activity(.verified, work.path, detail: "链接指向一致，已沿用硬盘上的链接")
+                    return Prepared(edit: edit, adoption: .reusedLink)
+                }
+                if matches && (!rich || (work.old?.attributes == attrs && work.old?.target == before)) {
+                    if work.old?.source == stamp && work.old?.target == before && work.old?.link == link &&
+                        work.old?.attributes == attrs { return Prepared() }
+                    return Prepared(edit: edit)
+                }
+                if adopting && existingFilesPolicy == .reuseIdentical {
+                    throw BackupError.message("同名链接指向不同，已保留硬盘上的链接：\(work.path)")
+                }
             }
             let staging = UUID()
             let path = staged(staging)
@@ -209,8 +226,8 @@ struct Transfer: Sendable {
             edit.next = next
             version = before != nil
         }
-        edit.activity = activity(work.old == nil ? .added : .updated, work.path)
-        return Prepared(edit: edit, archive: version)
+        edit.activity = activity(work.old == nil && !adopting ? .added : .updated, work.path)
+        return Prepared(edit: edit, archive: version, adoption: adopting ? .updatedEntry : nil)
     }
 
     private func prepareFile(_ work: Work, stamp: FileStamp, before: FileStamp?, adopting: Bool) throws -> Prepared {
@@ -289,7 +306,7 @@ struct Transfer: Sendable {
             guard try oldFile.stamp() == before else { throw BackupError.unstable(work.path) }
             if differs {
                 edit.originalAttributes = try oldFile.attributes(before, rich: true)
-                result.adoption = .updatedFile
+                result.adoption = .updatedEntry
             } else {
                 // The existing file already contains the backup. Register its
                 // observed stamp without rewriting its data or metadata.

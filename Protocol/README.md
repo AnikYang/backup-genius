@@ -27,6 +27,7 @@ v2 的日期是 seconds 和 nanoseconds 两个整数，Unix 时间原点，纳�
 - 复用目标中已有的目录时，next 可包含 sharedDirectory 为 true。源目录移除后，仅移除该目录的索引记录，保留硬盘上的目录。
 - hashes 将每个 65,536 字节块的 32 字节 SHA-256 按文件顺序拼接后编码为 Base64。最后一块长度由文件大小决定，空文件没有块。归档 chunk 由 hash、pack UUID、字节 offset 和 length 定位。恢复时对每块重新校验。
 - attributes 保存通用修改和创建时间，以及 Mac mode、extended、acl、可选 Windows 文件属性 windows 和链接字段 windowsLink、windowsLinkDirectory。link 是以 Base64 编码的链接目标。平台特有内容与该文件版本一同保存。
+- Mac 上的 exFAT 可保留 macOS 名称以及已有的实际符号链接。Windows 回放并保留这些记录，将无法在 Windows 表示的项目列为待处理。若未提交的事务需要写入此类名称或实际的 Mac 链接，需在 Mac 上恢复。
 - 持有文件锁后验证代次和当前提交。先落盘归档包与准备记录，再应用编辑、落盘并发布提交记录。匹配已提交代次和 ID 的准备记录可清除。下一代未提交的记录逆序回滚。块的内容与预期的旧块或新块均不符时，保留记录并停止写入。
 - 历史清理先提交过期的版本 ID。块包仅在其可用块无保留版本引用，或已提交新包位置后才回收。应用退出、推出或暂停在当前事务边界处理。
 

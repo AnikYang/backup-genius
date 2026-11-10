@@ -921,7 +921,7 @@ public final class SyncEngine: @unchecked Sendable {
                 applying.append(item)
                 if let adoption = prepared.adoption {
                     adoptedEntries += 1
-                    if adoption == .reusedFile { reusedFiles += 1 }
+                    if adoption == .reusedFile || adoption == .reusedLink { reusedFiles += 1 }
                 }
             } catch {
                 try note(error, for: item.path, problems: &problems)

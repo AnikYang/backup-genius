@@ -88,7 +88,12 @@ extension Repository {
             let actual = try tree.entry(record.path)
             switch record.source.kind {
             case .symlink:
-                guard actual == nil, record.link != nil else { throw BackupError.unstable(record.path) }
+                guard record.link != nil else { throw BackupError.unstable(record.path) }
+                if let actual {
+                    let expected = try macLink(record.link, attributes: record.attributes, at: record.path)
+                    guard actual.kind == .symlink, try tree.readLink(record.path) == expected,
+                          try tree.entry(record.path) == actual else { throw BackupError.unstable(record.path) }
+                }
             case .regular:
                 guard let actual, actual.kind == .regular, actual.size == record.source.size,
                       try tree.file(record.path).fileHashes(size: actual.size) == record.hashes,
@@ -193,7 +198,6 @@ func compareAlignment(local: [String: FileRecord], disk: [String: FileRecord], b
         let key = pathKey(path, caseSensitive: false)
         if let other = names[key], other != path { blocked.formUnion([path, other]) }
         names[key] = path
-        if windowsNameProblem(path) { blocked.insert(path) }
         if let remote = disk[path], remote.source.kind == .symlink,
            (try? macLink(remote.link, attributes: remote.attributes, at: path)) == nil { blocked.insert(path) }
         if let l = local[path], let r = disk[path], l.source.kind != r.source.kind,

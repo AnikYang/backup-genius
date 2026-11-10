@@ -232,10 +232,6 @@ struct Planner {
                     output.problems[path] = "此名称由 Backup Genius 保留"
                     continue
                 }
-                if volume.format == .exfat, windowsNameProblem(path) {
-                    output.problems[path] = "此名称无法在 Windows 使用"
-                    continue
-                }
                 if let old, old.source.kind != stamp.kind {
                     typeChanges.insert(path)
                     removals[path] = Work(kind: .remove, path: path, stamp: stamp, old: old)

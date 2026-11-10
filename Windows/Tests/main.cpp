@@ -251,6 +251,45 @@ void safety(const fs::path& volume) {
     expect(rejected && read(disk, "file") == "original", "corrupt journal fails closed");
 }
 
+void macOnlyNames(const fs::path& volume) {
+    Fixture f(volume);
+    const Tree disk(f.target);
+    const auto host = uuid();
+    const std::string foreign = "review:notes?.txt";
+    const auto foreignRecord = recipe(foreign, Stamp{.kind = Kind::regular}, {});
+    Repository::create(disk, "exfat", host);
+    {
+        Index cache(f.root / "first.sqlite");
+        Repository repo(disk, cache, host);
+        repo.open();
+        auto batch = repo.batch();
+        batch["edits"].push_back({{"method", "record"}, {"path", foreign}, {"next", foreignRecord},
+                                  {"rollbackBlocks", Json::array()}});
+        repo.commit(batch);
+    }
+    {
+        Index cache(f.root / "second.sqlite");
+        Repository repo(disk, cache, uuid());
+        repo.open();
+        expect(cache.get("file", foreign) == foreignRecord, "replay retains a Mac-only name");
+        write(disk, "portable.txt", "already installed");
+        auto pending = repo.batch();
+        const auto ordinary = recipe("portable.txt", disk.entry("portable.txt").value(), sha256("already installed"));
+        for (const auto& record : {foreignRecord, ordinary}) {
+            pending["edits"].push_back({{"method", "install"}, {"path", record.at("path")}, {"next", record},
+                                        {"staging", uuid()}, {"rollbackBlocks", Json::array()}});
+        }
+        const auto body = pending.dump();
+        const Json envelope = {{"body", base64(body)}, {"checksum", base64(sha256(body))}};
+        disk.writeDocument(pendingPath, envelope.dump());
+    }
+    bool deferred = false;
+    try { SyncEngine engine(f.root / "reopen", {}, true); engine.openExisting(f.target); }
+    catch (const std::exception& error) { deferred = std::string_view(error.what()).find("Mac") != std::string_view::npos; }
+    expect(deferred && disk.entry(pendingPath).has_value(), "Mac-only pending edit requires the Mac recovery path");
+    expect(read(disk, "portable.txt") == "already installed", "defer before rolling back any portable edits");
+}
+
 Json metrics(const SyncProgress& p) {
     return {{"checkingSeconds", p.checkingSeconds}, {"elapsedSeconds", p.elapsedSeconds}, {"examined", p.examined},
         {"sourceReadBytes", p.sourceRead}, {"targetReadBytes", p.targetRead}, {"latestWrittenBytes", p.latestWritten},
@@ -374,6 +413,7 @@ int entry(std::vector<std::string> args) {
             std::cout << "Takeover and safety\n" << std::flush;
             ownership(volume);
             safety(volume);
+            macOnlyNames(volume);
             pruning(volume);
 #ifdef _WIN32
             liveEvents(volume);

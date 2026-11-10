@@ -724,8 +724,9 @@ SyncProgress SyncEngine::run(bool verify) {
     }
     for (const auto& [rel, item] : candidates) {
         auto priorSource = item.observed.value("source", Json(nullptr));
-        if (!item.source && link(item.old) && (!item.old.at("attributes").value("windowsLink", false) ||
-            !priorSource.is_object() || priorSource.value("kind", "") != "symlink")) {
+        const bool foreignLink = !item.source && link(item.old) && (!item.old.at("attributes").value("windowsLink", false) ||
+            !priorSource.is_object() || priorSource.value("kind", "") != "symlink");
+        if (foreignLink || (!item.old.is_null() && !representable(rel))) {
             blocked.insert(rel);
             for (auto dir = parent(rel); !dir.empty(); dir = parent(dir)) {
                 auto found = candidates.find(dir);

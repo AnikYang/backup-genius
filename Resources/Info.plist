@@ -8,8 +8,8 @@
     <key>CFBundleExecutable</key><string>BackupGenius</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleShortVersionString</key><string>1.0.2</string>
-    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>1.0.3</string>
+    <key>CFBundleVersion</key><string>4</string>
     <key>CFBundleDevelopmentRegion</key><string>zh-Hans</string>
     <key>CFBundleIconFile</key><string>BackupGenius.icns</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>

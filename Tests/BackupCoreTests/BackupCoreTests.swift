@@ -279,6 +279,72 @@ struct BackupCoreTests {
         await reopened.finishAndClose()
     }
 
+    @Test("Mac exFAT backup keeps the original names and adopts existing links without copying")
+    func exfatMacNamesAndLinks() async throws {
+        let fixture = try Fixture(.exfat)
+        let directory = "Notes. "
+        let document = "\(directory)/draft:review?.txt"
+        let added = "\(directory)/CON.txt"
+        let link = "\(directory)/pointer"
+        let firstLink = files("../missing-original")
+        let nextLink = files("../missing-replacement")
+        try fixture.write(document, files("first"))
+        try fixture.write(document, files("first"), folder: fixture.target)
+        let source = try Tree(fixture.source.resolvingSymlinksInPath())
+        let target = try Tree(fixture.target.resolvingSymlinksInPath())
+        try source.createLink(firstLink, at: link)
+        try target.createLink(firstLink, at: link)
+        let originalLinkStamp = try #require(try target.entry(link))
+
+        let fault = Tripwire()
+        let engine = fixture.engine(fault: fault.trigger)
+        _ = try await engine.configure(source: fixture.source, target: fixture.target, automatic: false,
+                                       existingFiles: .updateFromSource)
+        let initial = try await engine.syncNow()
+        #expect(initial.state == .upToDate, "\(initial.message ?? "")")
+        #expect(initial.reusedFiles == 2)
+        #expect(initial.latestWrittenBytes == 0)
+        #expect(try target.entry(link) == originalLinkStamp)
+        #expect(try await engine.history().isEmpty)
+
+        // Interrupt the first change to a physical link and verify the pending
+        // transaction restores the exact link target on reopen.
+        try source.remove(link)
+        try source.createLink(nextLink, at: link)
+        try await engine.simulate(source: Changes(paths: [link: flagModified]))
+        fault.arm(.applied)
+        await #expect(throws: BackupError.self) { try await engine.syncNow() }
+        await engine.finishAndClose()
+
+        let reopened = fixture.engine()
+        try await reopened.start()
+        #expect(try target.readLink(link) == firstLink)
+        try fixture.write(document, files("revised"))
+        try fixture.write(added, files("new file"))
+        try await reopened.simulate(source: Changes(paths: [document: flagModified, added: flagCreated]))
+        let changed = try await reopened.syncNow()
+        #expect(changed.state == .upToDate, "\(changed.message ?? "")")
+        #expect(try fixture.read(document) == files("revised"))
+        #expect(try fixture.read(added) == files("new file"))
+        #expect(try target.readLink(link) == nextLink)
+
+        let restored = try await reopened.restore(to: fixture.restore)
+        let output = try Tree(restored.resolvingSymlinksInPath())
+        #expect(try fixture.read(document, folder: restored) == files("revised"))
+        #expect(try output.readLink(link) == nextLink)
+        let history = try await reopened.history()
+        let savedLink = try #require(history.first { $0.path == link })
+        let savedDocument = try #require(history.first { $0.path == document })
+        let restoredLink = try await reopened.restore(savedLink.id, to: fixture.restore)
+        let restoredDocument = try await reopened.restore(savedDocument.id, to: fixture.restore)
+        #expect(try Tree(restoredLink.resolvingSymlinksInPath()).readLink("pointer") == firstLink)
+        #expect(try fixture.read("draft:review?.txt", folder: restoredDocument) == files("first"))
+        let verified = try await reopened.verify()
+        #expect(verified.state == .upToDate, "\(verified.message ?? "")")
+        #expect(verified.latestWrittenBytes == 0)
+        await reopened.finishAndClose()
+    }
+
     @Test("APFS copies new files, skips untouched data, and moves existing files without writing contents")
     func apfsIncremental() async throws {
         let fixture = try Fixture()
@@ -451,10 +517,9 @@ struct BackupCoreTests {
         #expect(try fixture.read("ledger", folder: restored) == next)
     }
 
-    @Test("Unsafe paths, unsupported Windows names and case conflicts preserve existing data")
+    @Test("Unsafe paths and case conflicts preserve existing data")
     func safety() async throws {
         let fixture = try Fixture(.exfat)
-        try fixture.write("CON.txt", files("reserved"))
         try fixture.write("Photo.txt", files("new"))
         try fixture.write("photo.txt", files("existing"), folder: fixture.target)
         let engine = fixture.engine()
@@ -465,9 +530,8 @@ struct BackupCoreTests {
                                        existingFiles: .updateFromSource)
         let run = try await engine.syncNow()
         #expect(run.state == .needsAttention)
-        #expect(run.issueCount == 2)
+        #expect(run.issueCount == 1)
         #expect(try fixture.read("photo.txt") == files("existing"))
-        #expect(!FileManager.default.fileExists(atPath: fixture.target.appending(path: "CON.txt").path))
         #expect(throws: BackupError.self) {
             let tree = try Tree(fixture.target.resolvingSymlinksInPath())
             _ = try tree.createFile("../escaped")

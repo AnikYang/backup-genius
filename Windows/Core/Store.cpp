@@ -378,6 +378,15 @@ void Repository::open() {
         const auto g = integer(pending.at("generation"));
         if (g == generation + 1) {
             require(pending.value("takeover", false) || stringValue(pending, "writer") == owner, "恢复记录写入者不符");
+            for (const auto& edit : pending.at("edits")) {
+                const auto method = stringValue(edit, "method");
+                if (method == "record" || method == "archive") continue;
+                const auto from = stringValue(edit, "from");
+                const bool nativeLink = (exists(edit, "before") && edit.at("before").at("kind") == "symlink") ||
+                    (exists(edit, "next") && edit.at("next").at("source").at("kind") == "symlink");
+                require(!nativeLink && representable(stringValue(edit, "path")) && (from.empty() || representable(from)),
+                        "未完成的更新包含 Mac 专用名称或链接，请在 Mac 上恢复后重连");
+            }
             for (auto i = pending.at("edits").rbegin(); i != pending.at("edits").rend(); ++i) rollback(*i, pending.at("chunks"));
             recovered = true;
         } else require(g == generation && identifier(pending.at("id")) == head, "恢复记录顺序异常");
