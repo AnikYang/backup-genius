@@ -11,6 +11,7 @@ struct SetupView: View {
     @ViewState private var target: URL?
     @ViewState private var volume: VolumeInfo?
     @ViewState private var automatic = true
+    @ViewState private var reuseMatchingFiles = false
     @ViewState private var login = false
     @ViewState private var pending = false
     @ViewState private var checkingDisk = false
@@ -56,7 +57,9 @@ struct SetupView: View {
                         LabeledContent("同步方向", value: "Mac → 外置硬盘")
                         LabeledContent("旧版保留", value: "\(BackupJob.retentionDays) 天")
                         Toggle("连接后自动同步", isOn: $automatic)
+                        Toggle("核对并纳入已有的相同文件", isOn: $reuseMatchingFiles)
                         Toggle("登录时启动", isOn: $login)
+                        if reuseMatchingFiles { ReuseMatchingFilesHelp() }
                     }
                     if volume?.format == .exfat {
                         Label("exFAT 备份可在 Mac 与 Windows 间接管。切换电脑时请先预览并对齐源文件夹。",
@@ -87,11 +90,12 @@ struct SetupView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 17)
         }
-        .frame(width: 565, height: mode == .configure ? 470 : 310)
+        .frame(width: 565, height: mode == .configure ? 540 : 310)
         .interactiveDismissDisabled(pending)
         .onAppear {
             if mode == .configure {
                 source = model.job?.restoreOnly == false ? model.job?.source : nil
+                reuseMatchingFiles = model.job?.reuseMatchingFiles == true
                 if let job = model.job, model.volume != nil {
                     target = job.target
                     volume = model.volume
@@ -147,7 +151,8 @@ struct SetupView: View {
                 switch mode {
                 case .configure:
                     guard let source else { return }
-                    model.job = try await model.engine.configure(source: source, target: target, automatic: automatic)
+                    model.job = try await model.engine.configure(source: source, target: target, automatic: automatic,
+                                                                reuseMatchingFiles: reuseMatchingFiles)
                     if login != model.loginEnabled { model.setLogin(login) }
                     model.page = .overview
                 case .existing:
@@ -162,6 +167,15 @@ struct SetupView: View {
                 failure = error.localizedDescription
             }
         }
+    }
+}
+
+struct ReuseMatchingFilesHelp: View {
+    var body: some View {
+        Text("逐字节核对同名文件。内容一致后按备份任务管理，之后可更新并保留历史。内容不同的文件留在硬盘上。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -398,6 +412,11 @@ struct AppSettings: View {
                         get: { model.job?.automatic ?? false }, set: { model.setAutomatic($0) }
                     ))
                     .disabled(job.restoreOnly)
+                    Toggle("核对并纳入已有的相同文件", isOn: Binding(
+                        get: { model.job?.reuseMatchingFiles == true }, set: { model.setReuseMatchingFiles($0) }
+                    ))
+                    .disabled(job.restoreOnly || model.progress.state.busy)
+                    ReuseMatchingFilesHelp()
                     LabeledContent("历史保留", value: "\(BackupJob.retentionDays) 天")
                 }
                 Button("设置备份…") {
@@ -408,7 +427,7 @@ struct AppSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 270)
+        .frame(width: 500, height: 350)
         .onAppear { model.refreshLoginStatus() }
     }
 }

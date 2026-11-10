@@ -149,7 +149,8 @@ final class AppModel {
     }
 
     var canSync: Bool {
-        job?.restoreOnly == false && volume != nil && !progress.state.busy && progress.state != .takeoverRequired &&
+        job?.restoreOnly == false && (volume != nil || progress.state == .needsAttention) &&
+            !progress.state.busy && progress.state != .takeoverRequired &&
             progress.state != .paused && !restoring && !ejecting
     }
     var canPause: Bool { job?.restoreOnly == false && volume != nil && !restoring && !ejecting }
@@ -233,6 +234,13 @@ final class AppModel {
     func setAutomatic(_ value: Bool) {
         Task {
             do { try await engine.setAutomatic(value) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+
+    func setReuseMatchingFiles(_ value: Bool) {
+        Task {
+            do { try await engine.setReuseMatchingFiles(value) }
             catch { self.error = error.localizedDescription }
         }
     }

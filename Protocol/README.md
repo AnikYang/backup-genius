@@ -24,6 +24,7 @@ v2 的日期是 seconds 和 nanoseconds 两个整数，Unix 时间原点，纳�
 - 内层 JSON 包含 id、generation、edits、chunks、pruned、retiredPacks。v2 添加 version 为 2、当前 writer UUID 以及可选 takeover。
 - 每条编辑包含 method、path 和 rollbackBlocks，可含 from、before、originalAttributes、archive、next、staging、activity。操作包括 record、install、patch、attributes、remove、move、caseMove，以及 v2 的 archive。archive 只归档历史，保留当前文件记录。
 - next 含 path、source、可选 target、attributes、hashes、可选 link、可选 portableID。两个 stamp 包含 kind、size、modified。v2 将 inode、birth、changed、flags、links 和 mode 等身份字段清零。本机的原生身份、观察时间及事件游标留在 SQLite。
+- 复用目标中已有的目录时，next 可包含 sharedDirectory 为 true。源目录移除后，仅移除该目录的索引记录，保留硬盘上的目录。
 - hashes 将每个 65,536 字节块的 32 字节 SHA-256 按文件顺序拼接后编码为 Base64。最后一块长度由文件大小决定，空文件没有块。归档 chunk 由 hash、pack UUID、字节 offset 和 length 定位。恢复时对每块重新校验。
 - attributes 保存通用修改和创建时间，以及 Mac mode、extended、acl、可选 Windows 文件属性 windows 和链接字段 windowsLink、windowsLinkDirectory。link 是以 Base64 编码的链接目标。平台特有内容与该文件版本一同保存。
 - 持有文件锁后验证代次和当前提交。先落盘归档包与准备记录，再应用编辑、落盘并发布提交记录。匹配已提交代次和 ID 的准备记录可清除。下一代未提交的记录逆序回滚。块的内容与预期的旧块或新块均不符时，保留记录并停止写入。

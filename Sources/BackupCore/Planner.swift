@@ -27,6 +27,40 @@ struct WorkPlan {
     var existingWork = 0
 }
 
+// SwiftPM's .build directory is reproducible. A same-named ordinary hidden
+// file or a directory outside a Swift package remains part of the backup.
+final class SourceExclusions {
+    private let source: Tree
+    private var caches: [String: Bool] = [:]
+
+    init(source: Tree) { self.source = source }
+
+    func contains(_ path: String) -> Bool {
+        guard path.contains(".build") else { return false }
+        var prefix = ""
+        for component in path.split(separator: "/") {
+            let parent = prefix
+            prefix = pathJoin(prefix, String(component))
+            guard component == ".build" else { continue }
+            if let excluded = caches[prefix] {
+                if excluded { return true }
+                continue
+            }
+            let excluded: Bool
+            do {
+                let entry = try source.entry(prefix)
+                let manifest = try source.entry(pathJoin(parent, "Package.swift"))
+                excluded = (entry == nil || entry?.kind == .directory) && manifest?.kind == .regular
+            } catch {
+                excluded = false
+            }
+            caches[prefix] = excluded
+            if excluded { return true }
+        }
+        return false
+    }
+}
+
 struct Planner {
     let source: Tree
     let target: Tree
@@ -43,6 +77,7 @@ struct Planner {
         var targetDrift = Set<String>()
         var actualNames: [String: Set<String>] = [:]
         var scanRoots: [String] = []
+        let exclusions = SourceExclusions(source: source)
 
         func checked() throws {
             output.examined += 1
@@ -51,6 +86,7 @@ struct Planner {
 
         func oldBelow(_ path: String) throws {
             try catalog.visitFiles(below: path) {
+                guard !exclusions.contains($0.path) else { return }
                 previous[$0.path] = $0
                 selected.insert($0.path)
             }
@@ -75,10 +111,10 @@ struct Planner {
         }
 
         if sourceChanges.fullScan || verify {
-            try source.scan(visit: capture)
+            try source.scan(excluding: exclusions.contains, visit: capture)
             try oldBelow("")
         } else {
-            for (path, flags) in sourceChanges.paths {
+            for (path, flags) in sourceChanges.paths where !exclusions.contains(path) {
                 let stamp = try exactSource(path)
                 let wasDirectory = stamp == nil ? try catalog.file(path)?.source.kind == .directory : false
                 let isSubtree = flags & flagSubtree != 0 ||
@@ -95,7 +131,7 @@ struct Planner {
             for root in scanRoots.sorted(by: { $0.count < $1.count }) {
                 if hasAncestor(root, in: scanned) { continue }
                 scanned.insert(root)
-                if try exactSource(root) != nil { try source.scan(at: root, visit: capture) }
+                if try exactSource(root) != nil { try source.scan(at: root, excluding: exclusions.contains, visit: capture) }
                 try oldBelow(root)
             }
         }
@@ -103,11 +139,12 @@ struct Planner {
         if targetChanges.fullScan || verify {
             var actual: [String: FileStamp] = [:]
             var managed = Set<String>()
-            try target.scan(excludingControl: true) { path, stamp in
+            try target.scan(excludingControl: true, excluding: exclusions.contains) { path, stamp in
                 actual[path] = stamp
                 try checked()
             }
             try catalog.visitFiles { record in
+                guard !exclusions.contains(record.path) else { return }
                 managed.insert(record.path)
                 let disk = actual.removeValue(forKey: record.path)
                 if verify || !matches(record.target, disk) {
@@ -124,9 +161,10 @@ struct Planner {
                 return companion != controlName && !managed.contains(companion) && actual[companion] == nil
             }.count
         } else {
-            for (path, flags) in targetChanges.paths {
+            for (path, flags) in targetChanges.paths where !exclusions.contains(path) {
                 if flags & (flagDirectory | flagSubtree) != 0 {
                     try catalog.visitFiles(below: path) { record in
+                        guard !exclusions.contains(record.path) else { return }
                         if !matches(record.target, try target.entry(record.path)) {
                             targetDrift.insert(record.path)
                             previous[record.path] = record

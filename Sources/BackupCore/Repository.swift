@@ -257,7 +257,7 @@ final class Repository {
         do {
             for index in batch.edits.indices {
                 let edit = batch.edits[index]
-                if edit.method != .record && edit.method != .archive {
+                if edit.method != .archive && (edit.method != .record || edit.before != nil) {
                     try requireBefore(edit, path: edit.from ?? edit.path)
                 }
                 attempted += 1
@@ -300,7 +300,7 @@ final class Repository {
         try tree.checkRoot()
         let chunks = Dictionary(batch.chunks.map { ($0.hash, $0) }, uniquingKeysWith: { first, _ in first })
         let edits = Array(batch.edits.prefix(count))
-        for edit in edits.reversed() { try rollback(edit, chunks: chunks) }
+        for edit in edits.reversed() { try rollback(edit, chunks: chunks, portable: batch.version == 2) }
         try flushParents(edits)
         try clearPending()
     }
@@ -389,6 +389,7 @@ final class Repository {
     }
 
     private func rollback(_ edit: DiskEdit, chunks: [Data: ChunkLocation], portable: Bool = false) throws {
+        if edit.method == .record || edit.method == .archive { return }
         let current = try tree.entry(edit.path)
         switch edit.method {
         case .record, .archive:
@@ -428,22 +429,34 @@ final class Repository {
             }
             if let current {
                 guard current.kind == .regular else { throw BackupError.message("恢复位置已被占用：\(edit.path)") }
-                let file = try tree.file(edit.path, writable: true)
                 if portable {
                     guard (min(before.size, next.source.size)...max(before.size, next.source.size)).contains(current.size) else {
                         throw BackupError.message("中断后文件已在其他程序中改写：\(edit.path)")
                     }
+                    // A prepared edit may never have started. Verify the
+                    // preimage before requiring write access to an intact file.
+                    let input = try tree.file(edit.path)
+                    guard try input.stamp() == current else { throw BackupError.unstable(edit.path) }
+                    var intact = current.size == before.size && current.modified == before.modified
                     var offset: Int64 = 0
                     while offset < current.size {
-                        let bytes = try file.readExact(at: offset, length: Int(min(Int64(blockSize), current.size - offset)))
+                        let bytes = try input.readExact(at: offset, length: Int(min(Int64(blockSize), current.size - offset)))
                         let hash = digest(bytes)
                         let index = Int(offset / Int64(blockSize))
-                        guard hash == version.hashes.blockHash(index) || hash == next.hashes.blockHash(index) else {
+                        let oldHash = version.hashes.blockHash(index)
+                        guard hash == oldHash || hash == next.hashes.blockHash(index) else {
                             throw BackupError.message("待恢复的文件含有未知内容：\(edit.path)")
                         }
+                        intact = intact && hash == oldHash
                         offset += Int64(bytes.count)
                     }
+                    guard try input.stamp() == current, try tree.entry(edit.path) == current else {
+                        throw BackupError.unstable(edit.path)
+                    }
+                    if intact { return }
                 }
+                let file = try tree.file(edit.path, writable: true)
+                guard try file.stamp() == current else { throw BackupError.unstable(edit.path) }
                 let trim = next.source.size < before.size ? Int(next.source.size / Int64(blockSize)) : Int.max
                 for index in edit.rollbackBlocks where index < trim {
                     if let hash = version.hashes.blockHash(index) {

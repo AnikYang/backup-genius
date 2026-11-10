@@ -11,7 +11,7 @@ private final class Fixture {
     let state: URL
     let simulatedFormat: DiskFormat?
 
-    init(_ format: DiskFormat = .apfs, liveEvents: Bool = false) throws {
+    init(_ format: DiskFormat = .apfs, liveEvents: Bool = false, useMountedVolume: Bool = true) throws {
         let token = "BackupGenius-test-\(UUID().uuidString)"
         let parent = liveEvents
             ? URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appending(path: ".build/event-tests")
@@ -20,7 +20,8 @@ private final class Fixture {
         source = root.appending(path: "Source")
         restore = root.appending(path: "Restore")
         state = root.appending(path: "State")
-        if let mount = ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_\(format.rawValue.uppercased())"] {
+        if useMountedVolume,
+           let mount = ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_\(format.rawValue.uppercased())"] {
             target = URL(fileURLWithPath: mount).appending(path: token)
             simulatedFormat = nil
         } else {
@@ -84,6 +85,109 @@ private final class Tripwire: @unchecked Sendable {
 
 @Suite(.serialized)
 struct BackupCoreTests {
+    @Test("An unapplied exFAT patch recovers without writing to a read-only file")
+    func readOnlyRecovery() async throws {
+        let fixture = try Fixture(.exfat, useMountedVolume: false)
+        let tripwire = Tripwire()
+        let original = files("old")
+        try fixture.write("protected.txt", original)
+        let first = fixture.engine(fault: tripwire.trigger)
+        _ = try await baseline(first, fixture)
+        try fixture.write("protected.txt", files("new"))
+        try await first.simulate(source: Changes(paths: ["protected.txt": flagModified]))
+        tripwire.arm(.prepared)
+        await #expect(throws: BackupError.self) { try await first.syncNow() }
+        await first.finishAndClose()
+
+        let target = try Tree(fixture.target.resolvingSymlinksInPath())
+        let destination = fixture.target.appending(path: "protected.txt")
+        try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: destination.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path) }
+        #expect(throws: BackupError.self) { _ = try target.file("protected.txt", writable: true) }
+        #expect(try target.entry("\(journalPath)/pending.json") != nil)
+
+        let retry = fixture.engine()
+        try await retry.start()
+        #expect(try target.entry("\(journalPath)/pending.json") == nil)
+        #expect(try fixture.read("protected.txt") == original)
+        try fixture.write("other.txt", files("continue"))
+        try await retry.simulate(source: Changes(paths: ["protected.txt": flagModified, "other.txt": flagCreated]))
+        let result = try await retry.syncNow()
+        #expect(result.issueCount == 1)
+        #expect(try target.entry("\(journalPath)/pending.json") == nil)
+        #expect(try fixture.read("protected.txt") == original)
+        #expect(try fixture.read("other.txt") == files("continue"))
+        await retry.finishAndClose()
+    }
+
+    @Test("Swift build caches stay outside scan and reconciliation, including previously backed-up caches")
+    func excludesSwiftBuildCache() async throws {
+        let fixture = try Fixture(.exfat)
+        try fixture.write("Project/.build/old.bin", files("keep on disk"))
+        try fixture.write("Notes/.build/.hidden", files("ordinary user file"))
+        let engine = fixture.engine()
+        _ = try await baseline(engine, fixture)
+        try fixture.write("Project/Package.swift", files("// Swift package"))
+        try FileManager.default.removeItem(at: fixture.source.appending(path: "Project/.build/old.bin"))
+        try fixture.write("Project/.build/fixture/._data", files("cache sidecar"))
+        try fixture.write("Project/report.txt", files("actual source data"))
+        try fixture.write("Another/Package.swift", files("// Swift package"))
+        try fixture.write("Another/.build", files("ordinary hidden file"))
+        let result = try await engine.verify()
+        #expect(result.state == .upToDate)
+        #expect(try fixture.read("Project/.build/old.bin") == files("keep on disk"))
+        #expect(!FileManager.default.fileExists(atPath: fixture.target.appending(path: "Project/.build/fixture/._data").path))
+        #expect(try fixture.read("Notes/.build/.hidden") == files("ordinary user file"))
+        #expect(try fixture.read("Another/.build") == files("ordinary hidden file"))
+        #expect(try fixture.read("Project/report.txt") == files("actual source data"))
+
+        try fixture.write("Project/.build/later", files("cache event"))
+        try await engine.simulate(source: Changes(paths: ["Project/.build/later": flagCreated]))
+        let idle = try await engine.syncNow()
+        #expect(idle.examined == 0)
+        #expect(idle.latestWrittenBytes == 0)
+        await engine.finishAndClose()
+    }
+
+    @Test("Opt-in reuse verifies bytes and protects different files and shared directories")
+    func reuseExistingMatchingFiles() async throws {
+        let fixture = try Fixture(.exfat)
+        try fixture.write("Manual/equal.txt", files("equal"))
+        try fixture.write("Manual/conflict.txt", files("source"))
+        try fixture.write("Manual/equal.txt", files("equal"), folder: fixture.target)
+        try fixture.write("Manual/conflict.txt", files("target"), folder: fixture.target)
+        try fixture.write("Manual/extra.txt", files("unrelated"), folder: fixture.target)
+        for folder in [fixture.source, fixture.target] {
+            try FileManager.default.createDirectory(at: folder.appending(path: "shared-empty"), withIntermediateDirectories: false)
+        }
+        let engine = fixture.engine()
+        _ = try await engine.configure(source: fixture.source, target: fixture.target, automatic: false)
+        let before = try await engine.syncNow()
+        #expect(before.reusedFiles == nil)
+        #expect(before.issueCount > 1)
+
+        try await engine.setReuseMatchingFiles(true)
+        let reused = try await engine.syncNow()
+        #expect(reused.reusedFiles == 1)
+        #expect(reused.issueCount == 1)
+        #expect(reused.latestWrittenBytes == 0)
+        #expect(try fixture.read("Manual/conflict.txt") == files("target"))
+        #expect(try fixture.read("Manual/extra.txt") == files("unrelated"))
+        await engine.finishAndClose()
+
+        let reopened = fixture.engine()
+        try await reopened.start()
+        try fixture.write("Manual/equal.txt", files("updated"))
+        try FileManager.default.removeItem(at: fixture.source.appending(path: "shared-empty"))
+        try await reopened.simulate(source: Changes(paths: ["Manual/equal.txt": flagModified, "shared-empty": flagRemoved]))
+        let updated = try await reopened.syncNow()
+        #expect(updated.issueCount == 1)
+        #expect(try fixture.read("Manual/equal.txt") == files("updated"))
+        #expect(try await reopened.history().contains { $0.path == "Manual/equal.txt" })
+        #expect(FileManager.default.fileExists(atPath: fixture.target.appending(path: "shared-empty").path))
+        await reopened.finishAndClose()
+    }
+
     @Test("APFS copies new files, skips untouched data, and moves existing files without writing contents")
     func apfsIncremental() async throws {
         let fixture = try Fixture()

@@ -32,6 +32,7 @@ public struct BackupJob: Codable, Sendable, Identifiable {
     public let targetRelativePath: String
     public var automatic: Bool
     public let restoreOnly: Bool
+    public var reuseMatchingFiles: Bool? = nil
 
     public static let retentionDays = 30
 }
@@ -66,6 +67,7 @@ public struct SyncProgress: Codable, Sendable {
     public var currentPath: String?
     public var message: String?
     public var issueCount = 0
+    public var reusedFiles: Int? = nil
 
     public init(state: SyncState = .unconfigured, trackedFiles: Int = 0, unmanaged: Int = 0,
                 lastSuccess: Date? = nil) {
@@ -224,6 +226,7 @@ struct FileRecord: Codable, Sendable {
     var hashes = Data()
     var link: Data?
     var portableID: UUID? = nil
+    var sharedDirectory: Bool? = nil
 }
 
 struct ChunkLocation: Codable, Hashable, Sendable {

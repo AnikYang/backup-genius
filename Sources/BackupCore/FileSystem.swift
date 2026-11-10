@@ -367,7 +367,9 @@ final class Tree: @unchecked Sendable {
         }
     }
 
-    func scan(at path: String = "", excludingControl: Bool = false, visit: (String, FileStamp) throws -> Void) throws {
+    func scan(at path: String = "", excludingControl: Bool = false, excluding: (String) -> Bool = { _ in false },
+              visit: (String, FileStamp) throws -> Void) throws {
+        guard !excluding(path) else { return }
         if !path.isEmpty {
             guard let stamp = try entry(path) else { return }
             try visit(path, stamp)
@@ -377,6 +379,7 @@ final class Tree: @unchecked Sendable {
             for name in try names(dir) {
                 if excludingControl && prefix.isEmpty && name.lowercased() == controlName { continue }
                 let child = pathJoin(prefix, name)
+                if excluding(child) { continue }
                 guard let stamp = try entry(in: dir, name: name, path: child) else { continue }
                 try visit(child, stamp)
                 if stamp.kind == .directory {

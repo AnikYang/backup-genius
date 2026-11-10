@@ -128,6 +128,10 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
         return result;
     }
     if (!work.source) {
+        if (!work.old.is_null() && work.old.value("sharedDirectory", false)) {
+            result.edit = makeEdit("record", rel, {});
+            return result;
+        }
         if (link(work.old)) {
             if (work.old.at("attributes").value("windowsLink", false) && observeSource.is_object() &&
                 observeSource.value("kind", "") == "symlink" && !actual) {
@@ -173,6 +177,7 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
     }
     if (stamp.kind == Kind::directory) {
         auto next = recipe(rel, stamp, {}, work.old);
+        if (actual && !work.old.is_null() && work.old.value("sharedDirectory", false)) next["sharedDirectory"] = true;
         if (actual && stable(observeSource, stamp) && stable(observeTarget, *actual)) return result;
         if (!actual) {
             const auto stage = uuid();
