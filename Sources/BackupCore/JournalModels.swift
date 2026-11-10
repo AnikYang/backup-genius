@@ -40,6 +40,12 @@ struct DiskBatch: Codable {
     var version: Int? = nil
     var writer: UUID? = nil
     var takeover: Bool? = nil
+    var run: BackupRunTag? = nil
+}
+
+struct BackupRunTag: Codable, Sendable {
+    let id: UUID
+    let started: Date
 }
 
 struct Envelope: Codable {

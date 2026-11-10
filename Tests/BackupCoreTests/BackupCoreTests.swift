@@ -34,9 +34,9 @@ private final class Fixture {
     }
 
     func engine(watch: Bool = false, fault: (@Sendable (InterruptionPoint) throws -> Void)? = nil,
-                storage: URL? = nil) -> SyncEngine {
+                storage: URL? = nil, prepareEjection: @escaping @Sendable (URL) throws -> DiskEjectAction = BackupDisk.prepare) -> SyncEngine {
         SyncEngine(storage: storage ?? state, allowInternal: true, monitor: watch, testFormat: simulatedFormat,
-                   interruption: fault)
+                   interruption: fault, prepareEjection: prepareEjection)
     }
 
     func write(_ name: String, _ data: Data, folder: URL? = nil) throws {
@@ -83,8 +83,134 @@ private final class Tripwire: @unchecked Sendable {
     }
 }
 
+private actor EjectionCount {
+    private(set) var value = 0
+    func increment() { value += 1 }
+}
+
+private func waitForProgress(_ engine: SyncEngine, matching: (SyncProgress) -> Bool) async throws {
+    for _ in 0..<150 {
+        if matching(engine.presentation.progress) { return }
+        try await Task.sleep(for: .milliseconds(50))
+    }
+    throw BackupError.message("Timed out waiting for the backup state")
+}
+
 @Suite(.serialized)
 struct BackupCoreTests {
+    @Test("Backup history keeps complete per-run changes and filters them by type and path")
+    func backupRunHistory() async throws {
+        let fixture = try Fixture()
+        let initialCount = 510
+        for number in 0..<initialCount {
+            try fixture.write("Docs/\(number).txt", files("first"))
+        }
+        let engine = fixture.engine()
+        _ = try await baseline(engine, fixture)
+        let first = try #require(try await engine.backupRuns().first)
+        #expect(first.outcome == .completed)
+        #expect(first.added == initialCount && first.updated == 0)
+        let tail = try await engine.backupChanges(in: first.id, kind: .added, limit: 100, offset: 500)
+        #expect(tail.total == initialCount && tail.items.count == 10)
+
+        try fixture.write("Docs/0.txt", files("changed"))
+        try fixture.write("Notes/New.txt", files("new"))
+        try await engine.simulate(source: Changes(paths: ["Docs/0.txt": flagModified, "Notes": flagDirectory | flagCreated]))
+        let result = try await engine.syncNow()
+        #expect(result.state == .upToDate)
+        let second = try #require(try await engine.backupRuns().first)
+        #expect(second.id != first.id && second.added == 1 && second.updated == 1)
+        #expect(try await engine.backupChanges(in: second.id, kind: .added).items.map(\.path) == ["Notes/New.txt"])
+        #expect(try await engine.backupChanges(in: second.id, kind: .updated, query: "DOCS/0").items.map(\.path) == ["Docs/0.txt"])
+        #expect(try await engine.backupChanges(in: second.id, kind: .added, query: "Docs").total == 0)
+
+        let idle = try await engine.syncNow()
+        #expect(idle.sourceReadBytes == 0 && idle.latestWrittenBytes == 0)
+        await engine.finishAndClose()
+
+        let reopened = fixture.engine()
+        try await reopened.start()
+        let runs = try await reopened.backupRuns()
+        #expect(runs.count == 3)
+        #expect(runs.first?.outcome == .completed && runs.first?.added == 0 && runs.first?.updated == 0)
+        #expect(try await reopened.backupChanges(in: first.id).total == initialCount)
+        await reopened.finishAndClose()
+    }
+
+    @Test("A detected backup disk syncs and releases its lease before automatic ejection")
+    func autoSyncAndEjectOnConnection() async throws {
+        let fixture = try Fixture(.exfat, useMountedVolume: false)
+        let connected = fixture.target
+        let detached = fixture.root.appending(path: "Detached")
+        let count = EjectionCount()
+        let engine = fixture.engine(prepareEjection: { _ in
+            return {
+                let disk = try Tree(connected.resolvingSymlinksInPath())
+                let lock = try disk.file("\(controlName)/lock", writable: true)
+                guard flock(lock.value, LOCK_EX | LOCK_NB) == 0,
+                      try disk.entry("\(journalPath)/pending.json") == nil else {
+                    throw BackupError.message("Disk was still in use when ejection began")
+                }
+                try FileManager.default.moveItem(at: connected, to: detached)
+                await count.increment()
+            }
+        })
+        try fixture.write("note.txt", files("one"))
+        _ = try await engine.configure(source: fixture.source, target: connected, automatic: false,
+                                       existingFiles: .preserve, ejectAfterBackup: true)
+        try FileManager.default.moveItem(at: connected, to: detached)
+        engine.volumesDidChange()
+        try await waitForProgress(engine) { $0.state == .disconnected }
+        try await engine.setAutomatic(true)
+        try FileManager.default.moveItem(at: detached, to: connected)
+        engine.volumesDidChange()
+        try await waitForProgress(engine) { $0.state == .ejected }
+        let first = try #require(try await engine.backupRuns().first)
+        #expect(try fixture.read("note.txt", folder: detached) == files("one"))
+        #expect(engine.presentation.volume == nil)
+        #expect(first.outcome == .completed && first.added == 1)
+
+        try fixture.write("note.txt", files("two"))
+        try await engine.simulate(source: Changes(paths: ["note.txt": flagModified]))
+        try FileManager.default.moveItem(at: detached, to: connected)
+        engine.volumesDidChange()
+        try await waitForProgress(engine) { $0.state == .ejected && $0.lastRunID != first.id }
+        #expect(await count.value == 2)
+        #expect(try fixture.read("note.txt", folder: detached) == files("two"))
+        let second = try #require(try await engine.backupRuns().first)
+        #expect(second.outcome == .completed && second.updated == 1)
+        #expect(try await engine.backupChanges(in: second.id, kind: .updated).items.map(\.path) == ["note.txt"])
+        await engine.finishAndClose()
+    }
+
+    @Test("Unresolved work keeps the disk attached and a failed eject preserves a completed backup")
+    func autoEjectRequiresSuccess() async throws {
+        let fixture = try Fixture(.exfat, useMountedVolume: false)
+        let count = EjectionCount()
+        let engine = fixture.engine(prepareEjection: { _ in
+            return {
+                await count.increment()
+                throw BackupError.message("无法推出硬盘：测试占用")
+            }
+        })
+        try fixture.write("note.txt", files("source"))
+        try fixture.write("note.txt", files("existing"), folder: fixture.target)
+        _ = try await engine.configure(source: fixture.source, target: fixture.target, automatic: false,
+                                       existingFiles: .preserve, ejectAfterBackup: true)
+        #expect(try await engine.syncNow().state == .needsAttention)
+        #expect(await count.value == 0)
+        #expect(engine.presentation.volume != nil)
+        try await engine.setExistingFilesPolicy(.updateFromSource)
+        #expect(try await engine.syncNow().state == .upToDate)
+        try await waitForProgress(engine) { $0.state == .upToDate && $0.message?.contains("测试占用") == true }
+        #expect(await count.value == 1)
+        #expect(engine.presentation.volume != nil)
+        #expect(try fixture.read("note.txt") == files("source"))
+        let runs = try await engine.backupRuns()
+        #expect(runs.map(\.outcome) == [.completed, .needsAttention])
+        await engine.finishAndClose()
+    }
+
     @Test("An unapplied exFAT patch recovers without writing to a read-only file")
     func readOnlyRecovery() async throws {
         let fixture = try Fixture(.exfat, useMountedVolume: false)
@@ -408,6 +534,9 @@ struct BackupCoreTests {
         }
         let restart = fixture.engine()
         try await restart.start()
+        let interrupted = try #require(try await restart.backupRuns().first)
+        #expect(interrupted.outcome == .interrupted)
+        #expect(interrupted.updated == (point == .committed ? 1 : 0))
         let prior = try fixture.read("document.bin")
         #expect(prior == (point == .committed ? new : old))
         let result = try await restart.syncNow()

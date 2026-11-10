@@ -85,7 +85,7 @@ enum Page: String, CaseIterable, Identifiable {
         switch self {
         case .overview: "备份"
         case .activity: "活动记录"
-        case .history: "历史版本"
+        case .history: "备份历史"
         }
     }
 
@@ -107,11 +107,12 @@ final class AppModel {
     var progress = SyncProgress()
     var activities: [Activity] = []
     var versions: [HistoryItem] = []
+    var backupRuns: [BackupRun] = []
     var setup: SetupMode?
     var page: Page = .overview
     var error: String?
     var restoring = false
-    var ejecting = false
+    private var ejectRequested = false
     var loginEnabled = false
     var loginNeedsApproval = false
 
@@ -132,14 +133,16 @@ final class AppModel {
         }
         refreshLoginStatus()
         observer = Task { [weak self] in
-            for await update in engine.updates() {
+            for await _ in engine.updates() {
                 guard let self else { return }
                 let wasBusy = self.progress.state.busy
                 let snapshot = engine.presentation
-                self.progress = update
+                let finishedRun = self.progress.lastRunID != snapshot.progress.lastRunID
+                let changedJob = self.job?.id != snapshot.job?.id
+                self.progress = snapshot.progress
                 self.job = snapshot.job
                 self.volume = snapshot.volume
-                if wasBusy && !update.state.busy { self.loadRecords() }
+                if changedJob || finishedRun || (wasBusy && !snapshot.progress.state.busy) { self.loadRecords() }
             }
         }
         Task { [weak self] in
@@ -154,6 +157,7 @@ final class AppModel {
             progress.state != .paused && !restoring && !ejecting
     }
     var canPause: Bool { job?.restoreOnly == false && volume != nil && !restoring && !ejecting }
+    var ejecting: Bool { ejectRequested || progress.state == .ejecting }
     var canEject: Bool { volume != nil && !restoring && !ejecting }
     var canRestore: Bool { volume != nil && !progress.state.busy && !restoring && !ejecting }
 
@@ -174,22 +178,11 @@ final class AppModel {
 
     func eject() {
         guard canEject else { return }
-        ejecting = true
+        ejectRequested = true
         Task {
-            defer { ejecting = false }
-            let mount: URL
-            do {
-                mount = try await engine.prepareToEject()
-            } catch {
-                engine.volumesDidChange()
-                self.error = error.localizedDescription
-                return
-            }
-            do {
-                try await BackupDisk.eject(mount)
-            } catch {
-                self.error = "已释放备份硬盘，可从 Finder 推出。\n\(error.localizedDescription)"
-            }
+            defer { ejectRequested = false }
+            do { try await engine.eject() }
+            catch { self.error = error.localizedDescription }
         }
     }
 
@@ -209,8 +202,12 @@ final class AppModel {
                     let values = try await engine.activity()
                     if !Task.isCancelled { activities = values }
                 } else {
+                    let runs = try await engine.backupRuns()
                     let values = try await engine.history()
-                    if !Task.isCancelled { versions = values }
+                    if !Task.isCancelled {
+                        backupRuns = runs
+                        versions = values
+                    }
                 }
             } catch { self.error = error.localizedDescription }
         }
@@ -219,7 +216,8 @@ final class AppModel {
     func restore(_ id: UUID?) {
         guard canRestore else { return }
         Task {
-            guard let folder = await chooseFolder(title: "选择恢复位置", prompt: "恢复到此处", canCreate: true) else { return }
+            guard let folder = await chooseFolder(title: "选择恢复位置", prompt: "恢复到此处", canCreate: true),
+                  canRestore else { return }
             restoring = true
             defer { restoring = false }
             do {
@@ -234,6 +232,13 @@ final class AppModel {
     func setAutomatic(_ value: Bool) {
         Task {
             do { try await engine.setAutomatic(value) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+
+    func setEjectAfterBackup(_ value: Bool) {
+        Task {
+            do { try await engine.setEjectAfterBackup(value) }
             catch { self.error = error.localizedDescription }
         }
     }

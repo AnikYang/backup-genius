@@ -16,6 +16,8 @@ extension SyncState {
         case .paused: "备份已暂停"
         case .needsAttention: "需要处理"
         case .takeoverRequired: "等待接管"
+        case .ejecting: "正在安全推出"
+        case .ejected: "硬盘已推出"
         }
     }
 
@@ -29,12 +31,13 @@ extension SyncState {
         case .paused: "pause.circle"
         case .needsAttention: "exclamationmark.triangle"
         case .takeoverRequired: "arrow.left.arrow.right.circle"
+        case .ejecting, .ejected: "eject"
         }
     }
 
     var color: Color {
         switch self {
-        case .upToDate: .green
+        case .upToDate, .ejected: .green
         case .needsAttention, .takeoverRequired: .orange
         case .disconnected, .paused, .unconfigured: .secondary
         default: .accentColor
@@ -87,7 +90,7 @@ struct MainWindow: View {
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 180, ideal: 216, max: 260)
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                SidebarDisk(job: model.job, volume: model.volume)
+                SidebarDisk(job: model.job, volume: model.volume, state: model.progress.state)
             }
         } detail: {
             Group {
@@ -115,7 +118,7 @@ struct MainWindow: View {
                             .help("安全推出")
                             .disabled(!model.canEject)
                         Menu {
-                            Button("在 Finder 中打开", action: model.openFolder).disabled(model.volume == nil)
+                            Button("在 Finder 中打开", action: model.openFolder).disabled(model.volume == nil || model.ejecting)
                             Button("完整校验", action: model.verify).disabled(!model.canSync)
                             if model.job?.format == .exfat {
                                 Button("接管同步…") { model.setup = .takeover }
@@ -150,6 +153,7 @@ struct MainWindow: View {
 private struct SidebarDisk: View {
     let job: BackupJob?
     let volume: VolumeInfo?
+    let state: SyncState
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -159,7 +163,7 @@ private struct SidebarDisk: View {
                     Text(volume?.name ?? job?.volumeName ?? "备份硬盘")
                         .font(.subheadline.weight(.semibold))
                         .lineLimit(1)
-                    Text(volume.map { "\($0.format.name) · 已连接" } ?? (job == nil ? "尚未选择" : "未连接"))
+                    Text(connectionStatus)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -178,6 +182,13 @@ private struct SidebarDisk: View {
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 14)
+    }
+
+    private var connectionStatus: String {
+        if let volume { return "\(volume.format.name) · 已连接" }
+        if state == .ejected { return "已推出" }
+        if state == .ejecting { return "正在推出" }
+        return job == nil ? "尚未选择" : "未连接"
     }
 }
 
@@ -331,6 +342,8 @@ struct Overview: View {
         case .paused: return "随时可以继续检查和同步。"
         case .needsAttention: return "打开活动记录查看需要处理的项目。"
         case .takeoverRequired: return "先对齐本机文件夹与备份内容，再继续自动同步。"
+        case .ejecting: return "正在安全卸载备份硬盘。"
+        case .ejected: return "重新连接硬盘即可继续备份。"
         case .unconfigured: return "选择要备份的文件夹。"
         }
     }

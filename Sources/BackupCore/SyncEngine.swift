@@ -47,6 +47,7 @@ public final class SyncEngine: @unchecked Sendable {
     private let monitor: Bool
     private let testFormat: DiskFormat?
     private let interruption: (@Sendable (InterruptionPoint) throws -> Void)?
+    private let prepareEjection: @Sendable (URL) throws -> DiskEjectAction
     private var started = false
     private var job: BackupJob?
     private var catalog: Catalog?
@@ -63,6 +64,8 @@ public final class SyncEngine: @unchecked Sendable {
     private var unstableThisRun = false
     private var timer: DispatchSourceTimer?
     private var suppressConnection = false
+    private var ejectionTask: Task<Void, Never>?
+    private var volumeChangedWhileEjecting = false
     private var progress = SyncProgress()
     private var lastPublished: Double = 0
     private var host = UUID()
@@ -77,12 +80,14 @@ public final class SyncEngine: @unchecked Sendable {
     }
 
     init(storage: URL, allowInternal: Bool, monitor: Bool, testFormat: DiskFormat? = nil,
-         interruption: (@Sendable (InterruptionPoint) throws -> Void)? = nil) {
+         interruption: (@Sendable (InterruptionPoint) throws -> Void)? = nil,
+         prepareEjection: @escaping @Sendable (URL) throws -> DiskEjectAction = BackupDisk.prepare) {
         self.storage = storage
         self.allowInternal = allowInternal
         self.monitor = monitor
         self.testFormat = testFormat
         self.interruption = interruption
+        self.prepareEjection = prepareEjection
     }
 
     public var presentation: BackupPresentation {
@@ -186,9 +191,10 @@ public final class SyncEngine: @unchecked Sendable {
     }
 
     public func configure(source: URL, target: URL, automatic: Bool = true,
-                          existingFiles: ExistingFilesPolicy) async throws -> BackupJob {
+                          existingFiles: ExistingFilesPolicy, ejectAfterBackup: Bool = false) async throws -> BackupJob {
         try await perform { engine in
             try engine.load()
+            guard engine.ejectionTask == nil else { throw BackupError.message("正在推出硬盘，请稍候") }
             let sourceAccess = Scope(source)
             let targetAccess = Scope(target)
             return try withExtendedLifetime((sourceAccess, targetAccess)) {
@@ -206,7 +212,7 @@ public final class SyncEngine: @unchecked Sendable {
                     targetBookmark: engine.bookmark(target, readOnly: false), sourceIdentity: identity,
                     targetRelativePath: try VolumeLocation(output.root).relative(output.url),
                     automatic: automatic, restoreOnly: false, reuseMatchingFiles: existingFiles == .reuseIdentical,
-                    existingFiles: existingFiles)
+                    existingFiles: existingFiles, ejectAfterBackup: ejectAfterBackup)
                 try engine.activate(configured, sourceAccess: sourceAccess, targetAccess: targetAccess)
                 return configured
             }
@@ -216,6 +222,7 @@ public final class SyncEngine: @unchecked Sendable {
     public func openExisting(target: URL) async throws -> BackupJob {
         try await perform { engine in
             try engine.load()
+            guard engine.ejectionTask == nil else { throw BackupError.message("正在推出硬盘，请稍候") }
             let access = Scope(target)
             return try withExtendedLifetime(access) {
                 let output = try Tree(target.resolvingSymlinksInPath())
@@ -258,6 +265,7 @@ public final class SyncEngine: @unchecked Sendable {
         progress = SyncProgress()
         progress.trackedFiles = try index.fileCount()
         progress.lastSuccess = try date("lastSuccess", catalog: index)
+        progress.lastRunID = try index.latestRunID()
         publish()
     }
 
@@ -269,6 +277,16 @@ public final class SyncEngine: @unchecked Sendable {
             engine.job = job
             engine.publish()
             if automatic { engine.schedule(force: true) }
+        }
+    }
+
+    public func setEjectAfterBackup(_ enabled: Bool) async throws {
+        try await perform { engine in
+            guard var job = engine.job, !job.restoreOnly else { return }
+            job.ejectAfterBackup = enabled
+            try JSONEncoder().encode(job).write(to: engine.configURL, options: .atomic)
+            engine.job = job
+            engine.publish()
         }
     }
 
@@ -394,27 +412,33 @@ public final class SyncEngine: @unchecked Sendable {
     public func volumesDidChange() {
         queue.async { [weak self] in
             guard let self, self.started else { return }
+            if self.ejectionTask != nil {
+                self.volumeChangedWhileEjecting = true
+                return
+            }
             self.suppressConnection = false
             do {
-                let existing = self.repository?.tree.url
-                try self.refresh()
-                if existing != self.repository?.tree.url { self.schedule(force: true) }
+                if try self.refresh() { self.schedule(force: true) }
             } catch { self.fail(error) }
         }
     }
 
-    private func refresh() throws {
-        guard let job, let catalog else { publish(); return }
+    @discardableResult
+    private func refresh() throws -> Bool {
+        guard ejectionTask == nil, !suppressConnection else { return false }
+        guard let job, let catalog else { publish(); return false }
         if !job.restoreOnly, let source = try? sourceTree(job) { try startSourceMonitor(source, catalog: catalog) }
-        if let repository, (try? repository.tree.checkRoot()) != nil { return }
+        if let repository, (try? repository.tree.checkRoot()) != nil { return false }
         repository = nil
         targetMonitor = nil
-        guard !suppressConnection, let (tree, volume) = try findTarget(job) else {
+        guard let (tree, volume) = try findTarget(job) else {
             targetScope = nil
-            progress.state = .disconnected
-            progress.message = nil
-            publish()
-            return
+            if progress.state != .ejected {
+                progress.state = .disconnected
+                progress.message = nil
+                publish()
+            }
+            return false
         }
         let next = try Repository(tree: tree, volume: volume, job: job, catalog: catalog, host: host, interruption: interruption)
         repository = next
@@ -440,9 +464,11 @@ public final class SyncEngine: @unchecked Sendable {
             try catalog.recordChanges(Changes(fullScan: true), side: "target")
             startTargetMonitor(tree)
             progress.trackedFiles = try catalog.fileCount()
+            progress.lastRunID = try catalog.latestRunID()
             progress.state = try requiresTakeover(next, job: job) ? .takeoverRequired : (isPaused ? .paused : .ready)
             progress.message = nil
             publish()
+            return true
         } catch {
             repository = nil
             throw error
@@ -585,31 +611,70 @@ public final class SyncEngine: @unchecked Sendable {
         }
     }
 
-    public func prepareToEject() async throws -> URL {
+    public func eject() async throws {
         setPaused(true)
-        return try await perform { engine in
+        try await perform { engine in
+            defer { engine.setPaused(false) }
+            guard engine.ejectionTask == nil else { return }
             guard let repository = engine.repository else { throw BackupError.disconnected }
             if try repository.needsRecovery() {
                 engine.progress.state = .recovering
                 engine.publish()
                 try repository.open()
             }
-            try repository.tree.root.flush(directory: true)
-            let mount = repository.volume.mount
-            engine.repository = nil
-            engine.targetMonitor = nil
-            engine.targetScope = nil
-            engine.suppressConnection = true
-            engine.setPaused(false)
-            engine.progress.state = .disconnected
-            engine.progress.message = nil
-            engine.publish()
-            return mount
+            try engine.beginEjection(repository, afterBackup: false)
         }
+    }
+
+    private func beginEjection(_ repository: Repository, afterBackup: Bool) throws {
+        try repository.tree.checkRoot()
+        try repository.tree.root.flush(directory: true)
+        let eject = try prepareEjection(repository.volume.mount)
+        self.repository = nil
+        targetMonitor = nil
+        targetScope = nil
+        suppressConnection = true
+        scheduled?.cancel()
+        forceAutomatic = false
+        progress.state = .ejecting
+        progress.message = nil
+        ejectionTask = Task { [weak self] in
+            guard let self else { return }
+            var failure: String?
+            do {
+                // Wait for the sync or eject call to release its last repository reference.
+                try await perform { _ in () }
+                try await eject()
+            } catch {
+                failure = error.localizedDescription
+            }
+            let message = failure
+            try? await perform { $0.completeEjection(failure: message, afterBackup: afterBackup) }
+        }
+        publish()
+    }
+
+    private func completeEjection(failure: String?, afterBackup: Bool) {
+        ejectionTask = nil
+        let recheck = volumeChangedWhileEjecting
+        volumeChangedWhileEjecting = false
+        if let failure {
+            suppressConnection = false
+            do { try refresh() } catch { fail(error) }
+            if afterBackup && progress.state == .ready { progress.state = .upToDate }
+            progress.message = afterBackup ? "备份已完成。\(failure)" : failure
+        } else {
+            progress.state = .ejected
+            progress.message = afterBackup ? "备份已完成，可以安全拔下硬盘。" : "可以安全拔下硬盘。"
+        }
+        publish()
+        if recheck && failure == nil { volumesDidChange() }
     }
 
     public func finishAndClose() async {
         setPaused(true)
+        let eject = try? await perform { $0.ejectionTask }
+        await eject?.value
         _ = try? await perform { engine in
             engine.scheduled?.cancel()
             engine.timer?.cancel()
@@ -623,6 +688,16 @@ public final class SyncEngine: @unchecked Sendable {
 
     public func activity() async throws -> [Activity] { try await perform { try $0.catalog?.activities() ?? [] } }
     public func history() async throws -> [HistoryItem] { try await perform { try $0.catalog?.versions().map(\.item) ?? [] } }
+    public func backupRuns() async throws -> [BackupRun] { try await perform { try $0.catalog?.backupRuns() ?? [] } }
+
+    public func backupChanges(in run: UUID, kind: Activity.Kind? = nil, query: String = "",
+                              limit: Int = 200, offset: Int = 0) async throws -> BackupRunChangePage {
+        try await perform { engine in
+            try engine.catalog?.backupChanges(in: run, kind: kind, query: query.trimmingCharacters(in: .whitespacesAndNewlines),
+                                              limit: min(500, max(1, limit)), offset: max(0, offset)) ??
+                BackupRunChangePage(items: [], total: 0)
+        }
+    }
 
     private func alignmentURL(_ job: BackupJob) -> URL {
         storage.appending(path: "alignment-\(job.id.uuidString).json")
@@ -643,7 +718,8 @@ public final class SyncEngine: @unchecked Sendable {
                                        sourceBookmark: engine.bookmark(folder, readOnly: false), targetBookmark: job.targetBookmark,
                                        sourceIdentity: identity, targetRelativePath: job.targetRelativePath,
                                        automatic: job.restoreOnly || job.automatic, restoreOnly: false,
-                                       reuseMatchingFiles: job.reuseMatchingFiles, existingFiles: job.existingFiles)
+                                       reuseMatchingFiles: job.reuseMatchingFiles, existingFiles: job.existingFiles,
+                                       ejectAfterBackup: job.ejectAfterBackup)
             let checkpoint = engine.alignmentURL(job)
             if FileManager.default.fileExists(atPath: checkpoint.path) {
                 var saved = try JSONDecoder().decode(AlignmentCheckpoint.self, from: Data(contentsOf: checkpoint))
@@ -797,6 +873,7 @@ public final class SyncEngine: @unchecked Sendable {
 
     private func run(verify: Bool) throws -> SyncProgress {
         guard !isPaused else { throw BackupError.paused }
+        guard ejectionTask == nil else { throw BackupError.message("正在推出硬盘，请稍候") }
         try load()
         try refresh()
         guard let job, !job.restoreOnly else { throw BackupError.message("请先设置备份任务") }
@@ -813,8 +890,19 @@ public final class SyncEngine: @unchecked Sendable {
         let lastSuccess = try date("lastSuccess", catalog: catalog)
         let initial = try catalog.get("source.baseline") != "1"
         let oldCount = progress.trackedFiles
+        let previousRun = progress.lastRunID
+        let run = BackupRunTag(id: UUID(), started: .now)
+        try catalog.beginRun(run)
+        var finishedRun = false
+        defer {
+            if !finishedRun {
+                try? catalog.finishRun(run.id, outcome: .interrupted, at: .now, issues: 0)
+                progress.lastRunID = run.id
+            }
+        }
         progress = SyncProgress(state: verify ? .verifying : .checking, trackedFiles: oldCount,
                                 unmanaged: progress.unmanaged, lastSuccess: lastSuccess)
+        progress.lastRunID = previousRun
         unstableThisRun = false
         publish()
 
@@ -844,7 +932,8 @@ public final class SyncEngine: @unchecked Sendable {
                 if isPaused { throw BackupError.paused }
                 let items = Array(wave[start..<min(start + 128, wave.count)])
                 progress.currentPath = items.first?.path
-                try runBatch(items, transfer: transfer, repository: repository, problems: &problems, targetRetry: &targetRetry)
+                try runBatch(items, run: run, transfer: transfer, repository: repository,
+                             problems: &problems, targetRetry: &targetRetry)
                 progress.processed += items.count
                 publish(force: false)
             }
@@ -864,7 +953,12 @@ public final class SyncEngine: @unchecked Sendable {
         }
         try pruneIfDue(repository)
         repository.refreshCapacity()
+        let autoEject = job.ejectAfterBackup == true && success
+        let newerChanges = try persistEvents(flush: autoEject)
         progress.trackedFiles = try catalog.fileCount()
+        try catalog.finishRun(run.id, outcome: success ? .completed : .needsAttention, at: .now, issues: problems.count)
+        finishedRun = true
+        progress.lastRunID = run.id
         progress.issueCount = problems.count
         progress.lastSuccess = success ? now : lastSuccess
         progress.elapsedSeconds = ProcessInfo.processInfo.systemUptime - begin
@@ -872,11 +966,20 @@ public final class SyncEngine: @unchecked Sendable {
         progress.message = issues.first?.detail
         progress.currentPath = nil
         publish()
-        if try persistEvents(flush: false) { schedule(force: true) }
-        return progress
+        let completed = progress
+        if newerChanges {
+            schedule(force: true)
+        } else if autoEject && !isPaused {
+            do { try beginEjection(repository, afterBackup: true) }
+            catch {
+                progress.message = "备份已完成。\(error.localizedDescription)"
+                publish()
+            }
+        }
+        return completed
     }
 
-    private func runBatch(_ items: [Work], transfer: Transfer, repository: Repository,
+    private func runBatch(_ items: [Work], run: BackupRunTag, transfer: Transfer, repository: Repository,
                           problems: inout [String: String], targetRetry: inout Set<String>) throws {
         let results = PreparationResults(count: items.count)
         let workers = min(items.count, repository.volume.isSolidState ? 4 : 1)
@@ -887,6 +990,7 @@ public final class SyncEngine: @unchecked Sendable {
         }
 
         var batch = try repository.newBatch()
+        batch.run = run
         let writer = PackWriter(repository: repository, id: batch.id)
         var patches: [String: PatchData] = [:]
         var applying: [Work] = []

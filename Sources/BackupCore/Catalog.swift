@@ -46,6 +46,17 @@ final class Catalog {
                 CREATE INDEX IF NOT EXISTS chunks_by_pack ON chunks(pack);
                 CREATE TABLE IF NOT EXISTS activity (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS backup_runs (
+                    id TEXT PRIMARY KEY, started REAL NOT NULL, finished REAL, outcome TEXT NOT NULL,
+                    added INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0, issues INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS backup_runs_by_date ON backup_runs(started DESC, id DESC);
+                CREATE TABLE IF NOT EXISTS backup_run_changes (
+                    sequence INTEGER PRIMARY KEY, run TEXT NOT NULL, kind TEXT NOT NULL,
+                    search_path TEXT NOT NULL, payload BLOB NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS backup_run_changes_by_run ON backup_run_changes(run, sequence DESC);
+                CREATE INDEX IF NOT EXISTS backup_run_changes_by_kind ON backup_run_changes(run, kind, sequence DESC);
                 """)
         } catch {
             sqlite3_close(handle)
@@ -231,6 +242,67 @@ final class Catalog {
         return result
     }
 
+    func beginRun(_ tag: BackupRunTag) throws {
+        // A run without a recorded finish may have only partially committed.
+        try execute("INSERT OR IGNORE INTO backup_runs(id,started,outcome) VALUES (?,?,?)", [
+            .text(tag.id.uuidString), .real(tag.started.timeIntervalSinceReferenceDate),
+            .text(BackupRun.Outcome.unconfirmed.rawValue),
+        ])
+    }
+
+    func finishRun(_ id: UUID, outcome: BackupRun.Outcome, at date: Date, issues: Int) throws {
+        try execute("UPDATE backup_runs SET finished=?,outcome=?,issues=? WHERE id=?", [
+            .real(date.timeIntervalSinceReferenceDate), .text(outcome.rawValue), .int(Int64(issues)), .text(id.uuidString),
+        ])
+    }
+
+    func latestRunID() throws -> UUID? {
+        var result: UUID?
+        try run("SELECT id FROM backup_runs ORDER BY started DESC,id DESC LIMIT 1", []) {
+            result = UUID(uuidString: string($0, 0))
+        }
+        return result
+    }
+
+    func backupRuns() throws -> [BackupRun] {
+        var result: [BackupRun] = []
+        try run("SELECT id,started,finished,outcome,added,updated,issues FROM backup_runs ORDER BY started DESC,id DESC", []) {
+            guard let id = UUID(uuidString: string($0, 0)), let outcome = BackupRun.Outcome(rawValue: string($0, 3)) else {
+                throw BackupError.message("备份历史记录无效")
+            }
+            let started = Date(timeIntervalSinceReferenceDate: sqlite3_column_double($0, 1))
+            let finished = sqlite3_column_type($0, 2) == SQLITE_NULL ? nil :
+                Date(timeIntervalSinceReferenceDate: sqlite3_column_double($0, 2))
+            result.append(BackupRun(id: id, started: started, finished: finished, outcome: outcome,
+                                    added: Int(sqlite3_column_int64($0, 4)), updated: Int(sqlite3_column_int64($0, 5)),
+                                    issueCount: Int(sqlite3_column_int64($0, 6))))
+        }
+        return result
+    }
+
+    func backupChanges(in id: UUID, kind: Activity.Kind?, query: String, limit: Int, offset: Int) throws -> BackupRunChangePage {
+        var whereClause = "WHERE run=?"
+        var fields: [Field] = [.text(id.uuidString)]
+        if let kind {
+            whereClause += " AND kind=?"
+            fields.append(.text(kind.rawValue))
+        }
+        if !query.isEmpty {
+            whereClause += " AND instr(search_path,?)>0"
+            fields.append(.text(pathKey(query, caseSensitive: false)))
+        }
+        var total = 0
+        try run("SELECT count(*) FROM backup_run_changes \(whereClause)", fields) {
+            total = Int(sqlite3_column_int64($0, 0))
+        }
+        var items: [Activity] = []
+        try run("SELECT payload FROM backup_run_changes \(whereClause) ORDER BY sequence DESC LIMIT ? OFFSET ?",
+                fields + [.int(Int64(limit)), .int(Int64(offset))]) {
+            items.append(try JSONDecoder().decode(Activity.self, from: data($0, 0)))
+        }
+        return BackupRunChangePage(items: items, total: total)
+    }
+
     func versions() throws -> [ArchivedVersion] {
         var result: [ArchivedVersion] = []
         try run("SELECT payload FROM versions ORDER BY time DESC", []) {
@@ -323,6 +395,9 @@ final class Catalog {
     func apply(_ batch: DiskBatch, caseSensitive: Bool, align: Bool = false) throws {
         try transaction {
             guard try generation + 1 == batch.generation else { throw BackupError.message("备份记录顺序异常") }
+            if let tag = batch.run { try beginRun(tag) }
+            var added: Int64 = 0
+            var updated: Int64 = 0
             for chunk in batch.chunks {
                 try execute("INSERT OR REPLACE INTO chunks VALUES (?,?,?,?)",
                             [.blob(chunk.hash), .text(chunk.pack.uuidString), .int(chunk.offset), .int(Int64(chunk.length))])
@@ -359,8 +434,21 @@ final class Catalog {
                     }
                 }
                 if let activity = edit.activity {
-                    try execute("INSERT INTO activity(payload) VALUES (?)", [.blob(try JSONEncoder().encode(activity))])
+                    let payload = try JSONEncoder().encode(activity)
+                    try execute("INSERT INTO activity(payload) VALUES (?)", [.blob(payload)])
+                    if let tag = batch.run, let entry = edit.next, entry.source.kind != .directory,
+                       activity.kind == .added || activity.kind == .updated {
+                        try execute("INSERT INTO backup_run_changes(run,kind,search_path,payload) VALUES (?,?,?,?)", [
+                            .text(tag.id.uuidString), .text(activity.kind.rawValue),
+                            .text(pathKey(activity.path, caseSensitive: false)), .blob(payload),
+                        ])
+                        if activity.kind == .added { added += 1 } else { updated += 1 }
+                    }
                 }
+            }
+            if let tag = batch.run, added + updated > 0 {
+                try execute("UPDATE backup_runs SET added=added+?,updated=updated+? WHERE id=?",
+                            [.int(added), .int(updated), .text(tag.id.uuidString)])
             }
             if !batch.edits.isEmpty {
                 try execute("DELETE FROM activity WHERE sequence <= (SELECT max(sequence)-2000 FROM activity)")

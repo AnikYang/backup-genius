@@ -38,6 +38,7 @@ public struct BackupJob: Codable, Sendable, Identifiable {
     public let restoreOnly: Bool
     public var reuseMatchingFiles: Bool? = nil
     var existingFiles: ExistingFilesPolicy? = nil
+    public var ejectAfterBackup: Bool? = nil
 
     public var existingFilesPolicy: ExistingFilesPolicy {
         existingFiles ?? (reuseMatchingFiles == true ? .reuseIdentical : .preserve)
@@ -48,11 +49,11 @@ public struct BackupJob: Codable, Sendable, Identifiable {
 
 public enum SyncState: String, Codable, Sendable {
     case unconfigured, disconnected, ready, checking, syncing, recovering, verifying
-    case upToDate, paused, needsAttention, takeoverRequired
+    case upToDate, paused, needsAttention, takeoverRequired, ejecting, ejected
 
     public var busy: Bool {
         switch self {
-        case .checking, .syncing, .recovering, .verifying: true
+        case .checking, .syncing, .recovering, .verifying, .ejecting: true
         default: false
         }
     }
@@ -77,6 +78,7 @@ public struct SyncProgress: Codable, Sendable {
     public var message: String?
     public var issueCount = 0
     public var reusedFiles: Int? = nil
+    public var lastRunID: UUID? = nil
 
     public init(state: SyncState = .unconfigured, trackedFiles: Int = 0, unmanaged: Int = 0,
                 lastSuccess: Date? = nil) {
@@ -103,6 +105,25 @@ public struct Activity: Codable, Identifiable, Sendable {
     public let path: String
     public let detail: String?
     public let bytes: Int64
+}
+
+public struct BackupRun: Identifiable, Sendable {
+    public enum Outcome: String, Sendable {
+        case completed, needsAttention, interrupted, unconfirmed
+    }
+
+    public let id: UUID
+    public let started: Date
+    public let finished: Date?
+    public let outcome: Outcome
+    public let added: Int
+    public let updated: Int
+    public let issueCount: Int
+}
+
+public struct BackupRunChangePage: Sendable {
+    public let items: [Activity]
+    public let total: Int
 }
 
 public struct HistoryItem: Codable, Identifiable, Sendable {

@@ -11,6 +11,7 @@ struct SetupView: View {
     @ViewState private var target: URL?
     @ViewState private var volume: VolumeInfo?
     @ViewState private var automatic = true
+    @ViewState private var ejectAfterBackup = false
     @ViewState private var existingFiles = ExistingFilesPolicy.preserve
     @ViewState private var login = false
     @ViewState private var pending = false
@@ -57,6 +58,7 @@ struct SetupView: View {
                         LabeledContent("同步方向", value: "Mac → 外置硬盘")
                         LabeledContent("旧版保留", value: "\(BackupJob.retentionDays) 天")
                         Toggle("连接后自动同步", isOn: $automatic)
+                        Toggle("备份完成后自动推出硬盘", isOn: $ejectAfterBackup)
                         ExistingFilesOptions(policy: $existingFiles)
                         Toggle("登录时启动", isOn: $login)
                     }
@@ -89,12 +91,13 @@ struct SetupView: View {
             .padding(.horizontal, 20)
             .padding(.bottom, 17)
         }
-        .frame(width: 565, height: mode == .configure ? 540 : 310)
+        .frame(width: 565, height: mode == .configure ? 565 : 310)
         .interactiveDismissDisabled(pending)
         .onAppear {
             if mode == .configure {
                 source = model.job?.restoreOnly == false ? model.job?.source : nil
                 existingFiles = model.job?.existingFilesPolicy ?? .preserve
+                ejectAfterBackup = model.job?.ejectAfterBackup == true
                 if let job = model.job, model.volume != nil {
                     target = job.target
                     volume = model.volume
@@ -151,7 +154,7 @@ struct SetupView: View {
                 case .configure:
                     guard let source else { return }
                     model.job = try await model.engine.configure(source: source, target: target, automatic: automatic,
-                                                                existingFiles: existingFiles)
+                                                                existingFiles: existingFiles, ejectAfterBackup: ejectAfterBackup)
                     if login != model.loginEnabled { model.setLogin(login) }
                     model.page = .overview
                 case .existing:
@@ -341,7 +344,7 @@ struct ActivityScreen: View {
     }
 }
 
-struct HistoryScreen: View {
+struct VersionHistoryScreen: View {
     let model: AppModel
     @ViewState private var query = ""
     @ViewState private var selection: UUID?
@@ -426,6 +429,10 @@ struct AppSettings: View {
                         get: { model.job?.automatic ?? false }, set: { model.setAutomatic($0) }
                     ))
                     .disabled(job.restoreOnly)
+                    Toggle("备份完成后自动推出硬盘", isOn: Binding(
+                        get: { model.job?.ejectAfterBackup == true }, set: { model.setEjectAfterBackup($0) }
+                    ))
+                    .disabled(job.restoreOnly || model.progress.state.busy || model.ejecting)
                     ExistingFilesOptions(policy: Binding(
                         get: { model.job?.existingFilesPolicy ?? .preserve }, set: { model.setExistingFilesPolicy($0) }
                     ))
@@ -440,7 +447,7 @@ struct AppSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 350)
+        .frame(width: 500, height: 385)
         .onAppear { model.refreshLoginStatus() }
     }
 }

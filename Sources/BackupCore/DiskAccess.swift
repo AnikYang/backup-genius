@@ -1,16 +1,31 @@
 import Foundation
 import DiskArbitration
 
+typealias DiskEjectAction = @Sendable () async throws -> Void
+
 public enum BackupDisk {
     public static func eject(_ mount: URL) async throws {
+        let eject = try prepare(mount)
+        try await eject()
+    }
+
+    static func prepare(_ mount: URL) throws -> DiskEjectAction {
+        guard let session = DASessionCreate(kCFAllocatorDefault),
+              let disk = DADiskCreateFromVolumePath(kCFAllocatorDefault, session, mount as CFURL) else {
+            throw BackupError.disconnected
+        }
+        let target = EjectTarget(session: session, disk: disk)
+        return { try await target.eject() }
+    }
+}
+
+private struct EjectTarget: @unchecked Sendable {
+    let session: DASession
+    let disk: DADisk
+
+    func eject() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            guard let session = DASessionCreate(kCFAllocatorDefault),
-                  let disk = DADiskCreateFromVolumePath(kCFAllocatorDefault, session, mount as CFURL) else {
-                continuation.resume(throwing: BackupError.disconnected)
-                return
-            }
-            let operation = Ejection(session: session, continuation: continuation)
-            operation.begin(disk)
+            Ejection(session: session, continuation: continuation).begin(disk)
         }
     }
 }

@@ -22,6 +22,7 @@ v2 的日期是 seconds 和 nanoseconds 两个整数，Unix 时间原点，纳�
 ## 提交和恢复
 
 - 内层 JSON 包含 id、generation、edits、chunks、pruned、retiredPacks。v2 添加 version 为 2、当前 writer UUID 以及可选 takeover。
+- Mac 提交可附带 run，其中 id 和 started 标记所属备份轮次。读取端可用它重建已提交的文件清单，轮次的完成状态存于本机索引。
 - 每条编辑包含 method、path 和 rollbackBlocks，可含 from、before、originalAttributes、archive、next、staging、activity。操作包括 record、install、patch、attributes、remove、move、caseMove，以及 v2 的 archive。archive 只归档历史，保留当前文件记录。
 - next 含 path、source、可选 target、attributes、hashes、可选 link、可选 portableID。两个 stamp 包含 kind、size、modified。v2 将 inode、birth、changed、flags、links 和 mode 等身份字段清零。本机的原生身份、观察时间及事件游标留在 SQLite。
 - 复用目标中已有的目录时，next 可包含 sharedDirectory 为 true。源目录移除后，仅移除该目录的索引记录，保留硬盘上的目录。
