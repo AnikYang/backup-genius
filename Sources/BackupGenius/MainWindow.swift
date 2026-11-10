@@ -364,7 +364,7 @@ struct Overview: View {
             .background(.background.secondary, in: .rect(cornerRadius: 12))
             .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.separator) }
             if let reused = model.progress.reusedFiles, reused > 0 {
-                Label("已核对并纳入 \(reused.formatted()) 个已有文件", systemImage: "checkmark.circle")
+                Label("已沿用 \(reused.formatted()) 个内容一致的文件", systemImage: "checkmark.circle")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }

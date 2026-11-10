@@ -45,6 +45,8 @@ final class PatchData: @unchecked Sendable {
 }
 
 struct Prepared: Sendable {
+    enum Adoption: Sendable { case sharedDirectory, reusedFile, updatedFile }
+
     var edit: DiskEdit?
     var patch: PatchData?
     var archive = false
@@ -52,7 +54,7 @@ struct Prepared: Sendable {
     var sourceBytes: Int64 = 0
     var targetBytes: Int64 = 0
     var latestBytes: Int64 = 0
-    var reusedExisting = false
+    var adoption: Adoption?
 }
 
 struct Transfer: Sendable {
@@ -60,7 +62,7 @@ struct Transfer: Sendable {
     let target: Tree
     let scratch: Tree
     let volume: VolumeInfo
-    var reuseMatchingFiles = false
+    let existingFilesPolicy: ExistingFilesPolicy
 
     func prepare(_ work: Work) throws -> Prepared {
         switch work.kind {
@@ -124,63 +126,29 @@ struct Transfer: Sendable {
         guard let stamp = work.stamp, try source.entry(work.path) == stamp else { throw BackupError.unstable(work.path) }
         _ = try target.directory(pathParent(work.path))
         let before = try target.entry(work.path)
-        if let before, work.old?.target == nil {
-            if reuseMatchingFiles {
-                return try prepareReuse(work.path, stamp: stamp, before: before)
+        let adopting = before != nil && work.old?.target == nil
+        if adopting {
+            guard existingFilesPolicy != .preserve, stamp.kind == .regular || stamp.kind == .directory else {
+                throw BackupError.message("目标位置已有未纳入备份的文件：\(work.path)")
             }
-            throw BackupError.message("目标位置已有未纳入备份的文件：\(work.path)")
+            guard volume.caseSensitive || work.targetNameMatches else {
+                throw BackupError.message("无法确认目标文件名一致，请重新检查：\(work.path)")
+            }
         }
         if let before, before.kind != stamp.kind {
             throw BackupError.message("目标的文件类型已改变：\(work.path)")
         }
         switch stamp.kind {
         case .regular:
-            return try prepareFile(work, stamp: stamp, before: before)
+            return try prepareFile(work, stamp: stamp, before: before, adopting: adopting)
         case .directory, .symlink:
-            return try prepareEntry(work, stamp: stamp, before: before)
+            return try prepareEntry(work, stamp: stamp, before: before, adopting: adopting)
         case .unsupported:
             throw BackupError.message("不支持的文件类型：\(work.path)")
         }
     }
 
-    private func prepareReuse(_ path: String, stamp: FileStamp, before: FileStamp) throws -> Prepared {
-        let conflict = BackupError.message("同名项目与源文件不同，已保留硬盘上的副本：\(path)")
-        guard before.kind == stamp.kind else { throw conflict }
-        let attrs = try source.attributes(path, stamp: stamp, rich: true)
-        var next = FileRecord(path: path, source: stamp, target: before, attributes: attrs)
-        var result = Prepared(reusedExisting: true)
-        switch stamp.kind {
-        case .directory:
-            next.sharedDirectory = true
-        case .regular:
-            guard before.size == stamp.size else { throw conflict }
-            let input = try source.file(path)
-            let existing = try target.file(path)
-            guard try input.stamp() == stamp, try existing.stamp() == before else { throw BackupError.unstable(path) }
-            var offset: Int64 = 0
-            while offset < stamp.size {
-                let amount = Int(min(Int64(blockSize), stamp.size - offset))
-                let bytes = try input.readExact(at: offset, length: amount)
-                guard try existing.readExact(at: offset, length: amount) == bytes else { throw conflict }
-                next.hashes.append(digest(bytes))
-                offset += Int64(amount)
-            }
-            guard try input.stamp() == stamp, try existing.stamp() == before else { throw BackupError.unstable(path) }
-            result.sourceBytes = offset
-            result.targetBytes = offset
-        case .symlink, .unsupported:
-            throw conflict
-        }
-        guard try source.entry(path) == stamp, try target.entry(path) == before else { throw BackupError.unstable(path) }
-        var edit = DiskEdit(method: .record, path: path, before: before, next: next)
-        if stamp.kind == .regular {
-            edit.activity = activity(.verified, path, detail: "内容一致，已纳入备份")
-        }
-        result.edit = edit
-        return result
-    }
-
-    private func prepareEntry(_ work: Work, stamp: FileStamp, before: FileStamp?) throws -> Prepared {
+    private func prepareEntry(_ work: Work, stamp: FileStamp, before: FileStamp?, adopting: Bool) throws -> Prepared {
         var attrs = try source.attributes(work.path, stamp: stamp, rich: true)
         attrs.windows = work.old?.attributes.windows
         let link = stamp.kind == .symlink ? try source.readLink(work.path) : nil
@@ -190,6 +158,11 @@ struct Transfer: Sendable {
         }
         guard try source.entry(work.path) == stamp else { throw BackupError.unstable(work.path) }
         var next = FileRecord(path: work.path, source: stamp, target: before, attributes: attrs, link: link)
+        if adopting {
+            next.sharedDirectory = true
+            return Prepared(edit: DiskEdit(method: .record, path: work.path, before: before, next: next),
+                            adoption: .sharedDirectory)
+        }
         var edit = DiskEdit(method: .record, path: work.path, before: before, next: next)
         var version = false
 
@@ -240,7 +213,10 @@ struct Transfer: Sendable {
         return Prepared(edit: edit, archive: version)
     }
 
-    private func prepareFile(_ work: Work, stamp: FileStamp, before: FileStamp?) throws -> Prepared {
+    private func prepareFile(_ work: Work, stamp: FileStamp, before: FileStamp?, adopting: Bool) throws -> Prepared {
+        let requireIdentical = adopting && existingFilesPolicy == .reuseIdentical
+        let conflict = BackupError.message("同名文件内容不同，已保留硬盘上的副本：\(work.path)")
+        if requireIdentical && before?.size != stamp.size { throw conflict }
         let input = try source.file(work.path)
         guard try input.stamp() == stamp else { throw BackupError.unstable(work.path) }
         var attrs = try input.attributes(stamp, rich: true)
@@ -257,10 +233,12 @@ struct Transfer: Sendable {
                 originalAttrs = old.attributes
             } else {
                 base = try oldFile.fileHashes(size: before.size) { result.targetBytes += Int64($0) }
-                originalAttrs = try oldFile.attributes(before, rich: rich)
-                if !rich, var stored = work.old?.attributes {
-                    stored.modified = before.modified
-                    originalAttrs = stored
+                if !adopting {
+                    originalAttrs = try oldFile.attributes(before, rich: rich)
+                    if !rich, var stored = work.old?.attributes {
+                        stored.modified = before.modified
+                        originalAttrs = stored
+                    }
                 }
             }
             guard try oldFile.stamp() == before else { throw BackupError.unstable(work.path) }
@@ -295,6 +273,7 @@ struct Transfer: Sendable {
                 try newFile.write(data, at: offset)
                 result.latestBytes += Int64(amount)
             } else if base.blockHash(index) != hash {
+                if requireIdentical { throw conflict }
                 try patch.add(data, block: index)
             }
             offset += Int64(amount)
@@ -306,6 +285,18 @@ struct Transfer: Sendable {
 
         var edit = DiskEdit(method: .record, path: work.path, before: before, originalAttributes: originalAttrs, next: next)
         let differs = before.map { $0.size != stamp.size } == true || patch.bytes > 0
+        if adopting, let oldFile, let before {
+            guard try oldFile.stamp() == before else { throw BackupError.unstable(work.path) }
+            if differs {
+                edit.originalAttributes = try oldFile.attributes(before, rich: true)
+                result.adoption = .updatedFile
+            } else {
+                // The existing file already contains the backup. Register its
+                // observed stamp without rewriting its data or metadata.
+                edit.activity = activity(.verified, work.path, detail: "内容一致，已沿用硬盘上的文件")
+                result.adoption = .reusedFile
+            }
+        }
         if let newFile {
             try newFile.apply(attrs, rich: rich)
             try newFile.flush()
@@ -353,7 +344,7 @@ struct Transfer: Sendable {
         }
 
         if edit.method != .record {
-            edit.activity = activity(work.old == nil ? .added : .updated, work.path, bytes: result.latestBytes)
+            edit.activity = activity(work.old == nil && !adopting ? .added : .updated, work.path, bytes: result.latestBytes)
         }
         edit.next = next
         result.edit = edit

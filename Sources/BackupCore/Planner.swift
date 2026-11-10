@@ -17,6 +17,7 @@ struct Work: Sendable {
     var forceHash = false
     var from: String?
     var caseOnly = false
+    var targetNameMatches = false
 }
 
 struct WorkPlan {
@@ -66,6 +67,7 @@ struct Planner {
     let target: Tree
     let catalog: Catalog
     let volume: VolumeInfo
+    let existingFilesPolicy: ExistingFilesPolicy
 
     func plan(sourceChanges: Changes, targetChanges: Changes, verify: Bool,
               checkpoint: (Int) throws -> Void) throws -> WorkPlan {
@@ -76,6 +78,8 @@ struct Planner {
         let renameRoots = Set(sourceChanges.paths.compactMap { $0.value & flagRenamed == 0 ? nil : $0.key })
         var targetDrift = Set<String>()
         var actualNames: [String: Set<String>] = [:]
+        var scannedTargetNames: [String: String]?
+        var targetNamesByDirectory: [String: [String: String]] = [:]
         var scanRoots: [String] = []
         let exclusions = SourceExclusions(source: source)
 
@@ -110,6 +114,23 @@ struct Planner {
             return try source.entry(path)
         }
 
+        func targetSpelling(_ path: String) throws -> String? {
+            if path.isEmpty { return "" }
+            if let scannedTargetNames { return scannedTargetNames[pathKey(path, caseSensitive: false)] }
+            guard let parent = try targetSpelling(pathParent(path)) else { return nil }
+            if targetNamesByDirectory[parent] == nil {
+                do {
+                    let names = try target.names(in: parent)
+                    targetNamesByDirectory[parent] = Dictionary(names.map { (pathKey($0, caseSensitive: false), $0) },
+                                                                uniquingKeysWith: { first, _ in first })
+                } catch BackupError.io(_, _, let code) where code == ENOENT || code == ENOTDIR {
+                    targetNamesByDirectory[parent] = [:]
+                }
+            }
+            let key = pathKey(pathName(path), caseSensitive: false)
+            return targetNamesByDirectory[parent]?[key].map { pathJoin(parent, $0) }
+        }
+
         if sourceChanges.fullScan || verify {
             try source.scan(excluding: exclusions.contains, visit: capture)
             try oldBelow("")
@@ -142,6 +163,10 @@ struct Planner {
             try target.scan(excludingControl: true, excluding: exclusions.contains) { path, stamp in
                 actual[path] = stamp
                 try checked()
+            }
+            if !volume.caseSensitive && existingFilesPolicy != .preserve {
+                scannedTargetNames = Dictionary(actual.keys.map { (pathKey($0, caseSensitive: false), $0) },
+                                                uniquingKeysWith: { first, _ in first })
             }
             try catalog.visitFiles { record in
                 guard !exclusions.contains(record.path) else { return }
@@ -266,6 +291,19 @@ struct Planner {
                 if let other = try catalog.paths(folded: key).first(where: { $0 != path }) {
                     output.problems[path] = "目标文件名与 \(other) 冲突"
                     removals.removeValue(forKey: other)
+                }
+                guard existingFilesPolicy != .preserve, updates[path]?.old?.target == nil else { continue }
+                if let actual = try targetSpelling(path) {
+                    if actual == path {
+                        updates[path]?.targetNameMatches = true
+                    } else {
+                        output.problems[path] = "目标文件名与 \(actual) 冲突"
+                    }
+                } else {
+                    let parent = pathParent(path)
+                    if let actualParent = try targetSpelling(parent), actualParent != parent {
+                        output.problems[path] = "目标文件夹名称与 \(actualParent) 冲突"
+                    }
                 }
             }
         }

@@ -238,9 +238,9 @@ final class AppModel {
         }
     }
 
-    func setReuseMatchingFiles(_ value: Bool) {
+    func setExistingFilesPolicy(_ policy: ExistingFilesPolicy) {
         Task {
-            do { try await engine.setReuseMatchingFiles(value) }
+            do { try await engine.setExistingFilesPolicy(policy) }
             catch { self.error = error.localizedDescription }
         }
     }

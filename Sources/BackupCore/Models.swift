@@ -19,6 +19,10 @@ public struct VolumeInfo: Sendable, Equatable {
     public let isSolidState: Bool
 }
 
+public enum ExistingFilesPolicy: String, Codable, Sendable, CaseIterable {
+    case preserve, reuseIdentical, updateFromSource
+}
+
 public struct BackupJob: Codable, Sendable, Identifiable {
     public let id: UUID
     public let source: URL
@@ -33,6 +37,11 @@ public struct BackupJob: Codable, Sendable, Identifiable {
     public var automatic: Bool
     public let restoreOnly: Bool
     public var reuseMatchingFiles: Bool? = nil
+    var existingFiles: ExistingFilesPolicy? = nil
+
+    public var existingFilesPolicy: ExistingFilesPolicy {
+        existingFiles ?? (reuseMatchingFiles == true ? .reuseIdentical : .preserve)
+    }
 
     public static let retentionDays = 30
 }

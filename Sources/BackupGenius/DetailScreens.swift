@@ -11,7 +11,7 @@ struct SetupView: View {
     @ViewState private var target: URL?
     @ViewState private var volume: VolumeInfo?
     @ViewState private var automatic = true
-    @ViewState private var reuseMatchingFiles = false
+    @ViewState private var existingFiles = ExistingFilesPolicy.preserve
     @ViewState private var login = false
     @ViewState private var pending = false
     @ViewState private var checkingDisk = false
@@ -57,9 +57,8 @@ struct SetupView: View {
                         LabeledContent("同步方向", value: "Mac → 外置硬盘")
                         LabeledContent("旧版保留", value: "\(BackupJob.retentionDays) 天")
                         Toggle("连接后自动同步", isOn: $automatic)
-                        Toggle("核对并纳入已有的相同文件", isOn: $reuseMatchingFiles)
+                        ExistingFilesOptions(policy: $existingFiles)
                         Toggle("登录时启动", isOn: $login)
-                        if reuseMatchingFiles { ReuseMatchingFilesHelp() }
                     }
                     if volume?.format == .exfat {
                         Label("exFAT 备份可在 Mac 与 Windows 间接管。切换电脑时请先预览并对齐源文件夹。",
@@ -95,7 +94,7 @@ struct SetupView: View {
         .onAppear {
             if mode == .configure {
                 source = model.job?.restoreOnly == false ? model.job?.source : nil
-                reuseMatchingFiles = model.job?.reuseMatchingFiles == true
+                existingFiles = model.job?.existingFilesPolicy ?? .preserve
                 if let job = model.job, model.volume != nil {
                     target = job.target
                     volume = model.volume
@@ -152,7 +151,7 @@ struct SetupView: View {
                 case .configure:
                     guard let source else { return }
                     model.job = try await model.engine.configure(source: source, target: target, automatic: automatic,
-                                                                reuseMatchingFiles: reuseMatchingFiles)
+                                                                existingFiles: existingFiles)
                     if login != model.loginEnabled { model.setLogin(login) }
                     model.page = .overview
                 case .existing:
@@ -170,12 +169,27 @@ struct SetupView: View {
     }
 }
 
-struct ReuseMatchingFilesHelp: View {
+private struct ExistingFilesOptions: View {
+    @Binding var policy: ExistingFilesPolicy
+
     var body: some View {
-        Text("逐字节核对同名文件。内容一致后按备份任务管理，之后可更新并保留历史。内容不同的文件留在硬盘上。")
+        Picker("目标中已有同名文件", selection: $policy) {
+            Text("保留硬盘上的文件").tag(ExistingFilesPolicy.preserve)
+            Text("仅沿用内容一致的文件").tag(ExistingFilesPolicy.reuseIdentical)
+            Text("按 Mac 源文件同步").tag(ExistingFilesPolicy.updateFromSource)
+        }
+        Text(detail)
             .font(.caption)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var detail: String {
+        switch policy {
+        case .preserve: "已在硬盘上的同名文件会列为待处理。"
+        case .reuseIdentical: "内容一致的文件直接沿用，内容不同的文件会列为待处理。"
+        case .updateFromSource: "内容一致的文件直接沿用。有差异时按源文件更新，硬盘上的原版保留 \(BackupJob.retentionDays) 天。"
+        }
     }
 }
 
@@ -412,11 +426,10 @@ struct AppSettings: View {
                         get: { model.job?.automatic ?? false }, set: { model.setAutomatic($0) }
                     ))
                     .disabled(job.restoreOnly)
-                    Toggle("核对并纳入已有的相同文件", isOn: Binding(
-                        get: { model.job?.reuseMatchingFiles == true }, set: { model.setReuseMatchingFiles($0) }
+                    ExistingFilesOptions(policy: Binding(
+                        get: { model.job?.existingFilesPolicy ?? .preserve }, set: { model.setExistingFilesPolicy($0) }
                     ))
                     .disabled(job.restoreOnly || model.progress.state.busy)
-                    ReuseMatchingFilesHelp()
                     LabeledContent("历史保留", value: "\(BackupJob.retentionDays) 天")
                 }
                 Button("设置备份…") {

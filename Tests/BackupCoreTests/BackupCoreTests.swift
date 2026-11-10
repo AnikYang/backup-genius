@@ -188,6 +188,97 @@ struct BackupCoreTests {
         await reopened.finishAndClose()
     }
 
+    @Test("Same-name files are compared by content and only changed blocks are written",
+          arguments: [DiskFormat.apfs, .exfat])
+    func updateExistingFiles(format: DiskFormat) async throws {
+        let fixture = try Fixture(format)
+        let original = Data(repeating: 15, count: 3 * blockSize)
+        let changed = amend(original, byte: 90, offset: blockSize + 7)
+        try fixture.write("Manual/changed.bin", changed)
+        try fixture.write("Manual/changed.bin", original, folder: fixture.target)
+        try fixture.write("Manual/equal.txt", files("same content"))
+        try fixture.write("Manual/equal.txt", files("same content"), folder: fixture.target)
+        try fixture.write("Manual/shortened.txt", Data())
+        try fixture.write("Manual/shortened.txt", files("previous contents"), folder: fixture.target)
+        try fixture.write("Manual/extra.txt", files("unrelated"), folder: fixture.target)
+
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        for folder in [fixture.source, fixture.target] {
+            let path = folder.appending(path: "Manual/changed.bin").path
+            try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: path)
+        }
+        let sameTarget = fixture.target.appending(path: "Manual/equal.txt")
+        try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: sameTarget.path)
+        let source = try Tree(fixture.source.resolvingSymlinksInPath())
+        let target = try Tree(fixture.target.resolvingSymlinksInPath())
+        #expect(try source.entry("Manual/changed.bin")?.modified == target.entry("Manual/changed.bin")?.modified)
+        let equalBefore = try #require(try target.entry("Manual/equal.txt"))
+
+        let engine = fixture.engine()
+        _ = try await engine.configure(source: fixture.source, target: fixture.target, automatic: false)
+        try await engine.setExistingFilesPolicy(.updateFromSource)
+        let result = try await engine.syncNow()
+        #expect(result.state == .upToDate, "\(result.message ?? "")")
+        #expect(result.reusedFiles == 1)
+        #expect(result.latestWrittenBytes == blockSize)
+        #expect(result.unmanaged == 1)
+        #expect(try target.entry("Manual/equal.txt") == equalBefore)
+        #expect(try fixture.read("Manual/changed.bin") == changed)
+        #expect(try fixture.read("Manual/shortened.txt").isEmpty)
+        #expect(try fixture.read("Manual/extra.txt") == files("unrelated"))
+
+        let history = try await engine.history()
+        #expect(Set(history.map(\.path)) == ["Manual/changed.bin", "Manual/shortened.txt"])
+        let archive = try #require(history.first { $0.path == "Manual/changed.bin" })
+        let restored = try await engine.restore(archive.id, to: fixture.restore)
+        #expect(try fixture.read("changed.bin", folder: restored) == original)
+        await engine.finishAndClose()
+
+        let reopened = fixture.engine()
+        try await reopened.start()
+        #expect(reopened.presentation.job?.existingFilesPolicy == .updateFromSource)
+        let idle = try await reopened.syncNow()
+        #expect(idle.sourceReadBytes == 0)
+        #expect(idle.targetReadBytes == 0)
+        #expect(idle.latestWrittenBytes == 0)
+        #expect(try await reopened.history().count == 2)
+
+        try fixture.write("Manual/later.txt", files("new"))
+        try fixture.write("Manual/later.txt", files("old"), folder: fixture.target)
+        try await reopened.simulate(source: Changes(paths: ["Manual/later.txt": flagCreated]))
+        #expect(try await reopened.syncNow().state == .upToDate)
+        #expect(try fixture.read("Manual/later.txt") == files("new"))
+        await reopened.finishAndClose()
+    }
+
+    @Test("An interrupted first update restores the untracked disk copy")
+    func recoverFirstExistingFileUpdate() async throws {
+        let fixture = try Fixture(.exfat)
+        let original = Data(repeating: 21, count: 2 * blockSize)
+        let changed = amend(original, byte: 50, offset: 0)
+        try fixture.write("existing.bin", original, folder: fixture.target)
+        try fixture.write("existing.bin", changed)
+
+        let tripwire = Tripwire()
+        let engine = fixture.engine(fault: tripwire.trigger)
+        _ = try await engine.configure(source: fixture.source, target: fixture.target, automatic: false,
+                                       existingFiles: .updateFromSource)
+        tripwire.arm(.firstBlock)
+        await #expect(throws: BackupError.self) { try await engine.syncNow() }
+        await engine.finishAndClose()
+
+        let reopened = fixture.engine()
+        try await reopened.start()
+        #expect(try fixture.read("existing.bin") == original)
+        #expect(try await reopened.history().isEmpty)
+        #expect(try await reopened.syncNow().state == .upToDate)
+        #expect(try fixture.read("existing.bin") == changed)
+        let archive = try #require(try await reopened.history().first)
+        let restored = try await reopened.restore(archive.id, to: fixture.restore)
+        #expect(try fixture.read("existing.bin", folder: restored) == original)
+        await reopened.finishAndClose()
+    }
+
     @Test("APFS copies new files, skips untouched data, and moves existing files without writing contents")
     func apfsIncremental() async throws {
         let fixture = try Fixture()
@@ -360,7 +451,7 @@ struct BackupCoreTests {
         #expect(try fixture.read("ledger", folder: restored) == next)
     }
 
-    @Test("Unsafe paths, unsupported Windows names and unmanaged conflicts preserve existing data")
+    @Test("Unsafe paths, unsupported Windows names and case conflicts preserve existing data")
     func safety() async throws {
         let fixture = try Fixture(.exfat)
         try fixture.write("CON.txt", files("reserved"))
@@ -370,7 +461,8 @@ struct BackupCoreTests {
         await #expect(throws: BackupError.self) {
             try await engine.configure(source: fixture.root, target: fixture.target, automatic: false)
         }
-        _ = try await engine.configure(source: fixture.source, target: fixture.target, automatic: false)
+        _ = try await engine.configure(source: fixture.source, target: fixture.target, automatic: false,
+                                       existingFiles: .updateFromSource)
         let run = try await engine.syncNow()
         #expect(run.state == .needsAttention)
         #expect(run.issueCount == 2)

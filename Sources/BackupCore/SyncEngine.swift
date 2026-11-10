@@ -181,6 +181,12 @@ public final class SyncEngine: @unchecked Sendable {
     }
 
     public func configure(source: URL, target: URL, automatic: Bool = true, reuseMatchingFiles: Bool = false) async throws -> BackupJob {
+        try await configure(source: source, target: target, automatic: automatic,
+                            existingFiles: reuseMatchingFiles ? .reuseIdentical : .preserve)
+    }
+
+    public func configure(source: URL, target: URL, automatic: Bool = true,
+                          existingFiles: ExistingFilesPolicy) async throws -> BackupJob {
         try await perform { engine in
             try engine.load()
             let sourceAccess = Scope(source)
@@ -199,7 +205,8 @@ public final class SyncEngine: @unchecked Sendable {
                     sourceBookmark: engine.bookmark(source, readOnly: true),
                     targetBookmark: engine.bookmark(target, readOnly: false), sourceIdentity: identity,
                     targetRelativePath: try VolumeLocation(output.root).relative(output.url),
-                    automatic: automatic, restoreOnly: false, reuseMatchingFiles: reuseMatchingFiles)
+                    automatic: automatic, restoreOnly: false, reuseMatchingFiles: existingFiles == .reuseIdentical,
+                    existingFiles: existingFiles)
                 try engine.activate(configured, sourceAccess: sourceAccess, targetAccess: targetAccess)
                 return configured
             }
@@ -266,11 +273,16 @@ public final class SyncEngine: @unchecked Sendable {
     }
 
     public func setReuseMatchingFiles(_ enabled: Bool) async throws {
+        try await setExistingFilesPolicy(enabled ? .reuseIdentical : .preserve)
+    }
+
+    public func setExistingFilesPolicy(_ policy: ExistingFilesPolicy) async throws {
         try await perform { engine in
-            guard var job = engine.job, !job.restoreOnly, job.reuseMatchingFiles != enabled else { return }
+            guard var job = engine.job, !job.restoreOnly, job.existingFilesPolicy != policy else { return }
             try engine.catalog?.recordChanges(Changes(fullScan: true), side: "source")
             try engine.catalog?.recordChanges(Changes(fullScan: true), side: "target")
-            job.reuseMatchingFiles = enabled
+            job.existingFiles = policy
+            job.reuseMatchingFiles = policy == .reuseIdentical
             try JSONEncoder().encode(job).write(to: engine.configURL, options: .atomic)
             engine.job = job
             engine.publish()
@@ -631,7 +643,7 @@ public final class SyncEngine: @unchecked Sendable {
                                        sourceBookmark: engine.bookmark(folder, readOnly: false), targetBookmark: job.targetBookmark,
                                        sourceIdentity: identity, targetRelativePath: job.targetRelativePath,
                                        automatic: job.restoreOnly || job.automatic, restoreOnly: false,
-                                       reuseMatchingFiles: job.reuseMatchingFiles)
+                                       reuseMatchingFiles: job.reuseMatchingFiles, existingFiles: job.existingFiles)
             let checkpoint = engine.alignmentURL(job)
             if FileManager.default.fileExists(atPath: checkpoint.path) {
                 var saved = try JSONDecoder().decode(AlignmentCheckpoint.self, from: Data(contentsOf: checkpoint))
@@ -809,7 +821,8 @@ public final class SyncEngine: @unchecked Sendable {
         var sourceChanges = try catalog.pending("source")
         let targetChanges = try catalog.pending("target")
         sourceChanges.fullScan = sourceChanges.fullScan || initial || streamFailure
-        let planner = Planner(source: source, target: repository.tree, catalog: catalog, volume: repository.volume)
+        let planner = Planner(source: source, target: repository.tree, catalog: catalog, volume: repository.volume,
+                              existingFilesPolicy: job.existingFilesPolicy)
         let plan = try planner.plan(sourceChanges: sourceChanges, targetChanges: targetChanges, verify: verify) { count in
             if isPaused { throw BackupError.paused }
             progress.examined = count
@@ -825,7 +838,7 @@ public final class SyncEngine: @unchecked Sendable {
         var problems = plan.problems
         var targetRetry = Set<String>()
         let transfer = Transfer(source: source, target: repository.tree, scratch: scratch, volume: repository.volume,
-                                reuseMatchingFiles: job.reuseMatchingFiles == true)
+                                existingFilesPolicy: job.existingFilesPolicy)
         for wave in plan.waves {
             for start in stride(from: 0, to: wave.count, by: 128) {
                 if isPaused { throw BackupError.paused }
@@ -877,7 +890,7 @@ public final class SyncEngine: @unchecked Sendable {
         let writer = PackWriter(repository: repository, id: batch.id)
         var patches: [String: PatchData] = [:]
         var applying: [Work] = []
-        var reusedEntries = 0
+        var adoptedEntries = 0
         var reusedFiles = 0
         let staging = results.result()
         defer {
@@ -906,9 +919,9 @@ public final class SyncEngine: @unchecked Sendable {
                 if let patch = prepared.patch { patches[edit.path] = patch }
                 batch.edits.append(edit)
                 applying.append(item)
-                if prepared.reusedExisting {
-                    reusedEntries += 1
-                    if item.stamp?.kind == .regular { reusedFiles += 1 }
+                if let adoption = prepared.adoption {
+                    adoptedEntries += 1
+                    if adoption == .reusedFile { reusedFiles += 1 }
                 }
             } catch {
                 try note(error, for: item.path, problems: &problems)
@@ -929,7 +942,8 @@ public final class SyncEngine: @unchecked Sendable {
                 }
             }
             progress.latestWrittenBytes += patches.values.reduce(0) { $0 + $1.bytes }
-            progress.unmanaged = max(0, progress.unmanaged - reusedEntries)
+            progress.unmanaged = max(0, progress.unmanaged - adoptedEntries)
+            progress.skipped += reusedFiles
             if reusedFiles > 0 { progress.reusedFiles = (progress.reusedFiles ?? 0) + reusedFiles }
         } catch BackupError.unstable(let path) {
             for item in applying {
