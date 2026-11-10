@@ -96,8 +96,112 @@ private func waitForProgress(_ engine: SyncEngine, matching: (SyncProgress) -> B
     throw BackupError.message("Timed out waiting for the backup state")
 }
 
+private func diskutil(_ arguments: [String]) throws -> Data {
+    let process = Process()
+    let output = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+    process.arguments = arguments
+    process.standardOutput = output
+    process.standardError = output
+    try process.run()
+    let result = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw BackupError.message(String(decoding: result, as: UTF8.self))
+    }
+    return result
+}
+
 @Suite(.serialized)
 struct BackupCoreTests {
+    @Test("Only Backup Genius distribution builds are skipped and retired from existing copies")
+    func generatedInstallers() async throws {
+        let fixture = try Fixture()
+        let binary = "Project/dist/Backup Genius.app/Contents/MacOS/BackupGenius"
+        let archive = "Project/dist/Backup-Genius-macOS.zip"
+        let unrelated = "Other/dist/Backup-Genius-macOS.zip"
+        for path in [binary, archive, unrelated, "Project/dist/notes.txt"] { try fixture.write(path, files("data")) }
+        try fixture.write("Project/Package.swift", files("// package"))
+        let engine = fixture.engine()
+        _ = try await baseline(engine, fixture)
+        #expect(try fixture.read(binary) == files("data"))
+        #expect(try fixture.read(archive) == files("data"))
+
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "com.backupgenius.mac"],
+                                                       format: .xml, options: 0)
+        try fixture.write("Project/Resources/Info.plist", plist)
+        try fixture.write("Project/dist/Backup Genius.app/foreign.txt", files("unmanaged"), folder: fixture.target)
+        let result = try await engine.verify()
+        #expect(result.state == .upToDate, "\(result.message ?? "")")
+        let target = try Tree(fixture.target.resolvingSymlinksInPath())
+        #expect(try target.entry(binary) == nil)
+        #expect(try target.entry(archive) == nil)
+        #expect(try fixture.read(binary, folder: fixture.source) == files("data"))
+        #expect(try fixture.read(unrelated) == files("data"))
+        #expect(try fixture.read("Project/dist/notes.txt") == files("data"))
+        #expect(try fixture.read("Project/dist/Backup Genius.app/foreign.txt") == files("unmanaged"))
+        #expect(try await engine.history().contains { $0.path == archive })
+        await engine.finishAndClose()
+    }
+
+    @Test("An exFAT volume rename reconnects the same organized backup and preserves its history",
+          .enabled(if: ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_EXFAT"] != nil))
+    func organizedVolumeRename() async throws {
+        let fixture = try Fixture(.exfat)
+        let volume = try VolumeInfo.inspect(fixture.target)
+        try fixture.write("file.txt", files("first"))
+        let engine = fixture.engine()
+        _ = try await baseline(engine, fixture)
+        let job = try #require(engine.presentation.job)
+        try fixture.write("file.txt", files("second"))
+        try await engine.simulate(source: Changes(paths: ["file.txt": flagModified]))
+        #expect(try await engine.syncNow().state == .upToDate)
+        let originalVersion = try #require(try await engine.history().first)
+        let legacy = try Tree(fixture.target.resolvingSymlinksInPath())
+        #expect(try legacy.entry(controlName) != nil)
+
+        try await engine.organizeBackup(on: volume.mount)
+        #expect(engine.presentation.organizedStorage)
+        let controlEntries = try legacy.names(in: "").filter(isBackupControl)
+        #expect(controlEntries == [identityName])
+        let markerURL = fixture.target.appending(path: identityName)
+        #expect(try markerURL.resourceValues(forKeys: [.isHiddenKey]).isHidden == true)
+        #expect(((try legacy.entry(identityName)?.flags) ?? 0) & UInt32(UF_HIDDEN) != 0)
+        let store = try Tree(volume.mount.resolvingSymlinksInPath()).subtree("\(storageName)/\(job.id.uuidString)")
+        #expect(try store.entry("job.json") != nil)
+        #expect(try store.entry("journal")?.kind == .directory)
+        let restored = try await engine.restore(originalVersion.id, to: fixture.restore)
+        #expect(try fixture.read("file.txt", folder: restored) == files("first"))
+
+        let info = try PropertyListSerialization.propertyList(from: diskutil(["info", "-plist", volume.mount.path]), format: nil)
+        let details = try #require(info as? [String: Any])
+        let partition = try #require(details["DeviceIdentifier"] as? String)
+        let changedName = "BGR" + UUID().uuidString.prefix(7)
+        let previousRun = engine.presentation.progress.lastRunID
+        _ = try diskutil(["rename", partition, changedName])
+        defer { _ = try? diskutil(["rename", partition, volume.name]) }
+
+        try fixture.write("file.txt", files("third"))
+        try await engine.simulate(source: Changes(paths: ["file.txt": flagModified]))
+        engine.volumesDidChange()
+        try await engine.setAutomatic(true)
+        try await waitForProgress(engine) { $0.state == .upToDate && $0.lastRunID != previousRun }
+        let updated = try #require(engine.presentation.job)
+        #expect(updated.id == job.id && updated.volumeID == job.volumeID)
+        #expect(updated.volumeName == changedName && updated.target.path != job.target.path)
+        #expect(try fixture.read("file.txt", folder: updated.target) == files("third"))
+        #expect(engine.presentation.organizedStorage)
+        try await engine.setAutomatic(false)
+        await engine.finishAndClose()
+
+        let reopened = fixture.engine()
+        try await reopened.start()
+        #expect(reopened.presentation.organizedStorage)
+        #expect(reopened.presentation.job?.volumeName == changedName)
+        #expect(try await reopened.history().contains { $0.id == originalVersion.id })
+        await reopened.finishAndClose()
+    }
+
     @Test("Backup history keeps complete per-run changes and filters them by type and path")
     func backupRunHistory() async throws {
         let fixture = try Fixture()

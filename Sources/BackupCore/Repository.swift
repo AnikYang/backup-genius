@@ -14,7 +14,7 @@ func packed(_ id: UUID) -> String { pathJoin(packPath, id.uuidString) }
 func cloned(_ id: UUID) -> String { pathJoin(clonePath, id.uuidString) }
 
 final class Repository {
-    let tree: Tree
+    private(set) var tree: Tree
     private(set) var volume: VolumeInfo
     let catalog: Catalog
     private let lock: FD
@@ -22,24 +22,124 @@ final class Repository {
     let host: UUID
     private let interruption: (@Sendable (InterruptionPoint) throws -> Void)?
 
-    static func enroll(_ tree: Tree, volume: VolumeInfo, sourceIdentity: String, source: URL, host: UUID) throws -> Marker {
-        if try tree.entry(controlName) != nil {
-            let marker = try tree.readDocument(Marker.self, from: markerPath)
-            try check(marker, volume: volume)
+    static func enroll(_ tree: Tree, volume: VolumeInfo, sourceIdentity: String, source: URL, host: UUID,
+                       disk: Tree? = nil) throws -> Marker {
+        if try tree.entry(controlName) != nil || tree.entry(identityName) != nil {
+            let folder = try locatedTree(tree, volume: volume, disk: disk)
+            let marker = try Self.marker(folder, volume: volume)
             guard marker.portable || marker.sourceIdentity == sourceIdentity else {
                 throw BackupError.message("此备份绑定了另一源文件夹。可以打开已有备份进行恢复。")
             }
             return marker
         }
-        try tree.mkdir(controlName)
-        for dir in [journalPath, stagePath, packPath, clonePath] { try tree.mkdir(dir) }
         let marker = volume.format == .exfat
             ? Marker(version: 2, job: UUID(), format: volume.format, initialWriter: host, legacyGeneration: 0)
             : Marker(version: 1, job: UUID(), volume: volume.identifier, format: volume.format,
                      sourceIdentity: sourceIdentity, sourcePath: source.path)
+        if let disk {
+            _ = try relativeLocation(tree, on: disk)
+            let store = storagePath(marker.job)
+            try disk.mkdir(storageName, existing: true)
+            try disk.mkdir(store)
+            do {
+                let control = try disk.subtree(store)
+                let located = try Tree(tree.url, controlTree: control)
+                try initialize(located, marker: marker)
+                try disk.directory(storageName).flush(directory: true)
+                try disk.root.flush(directory: true)
+                try publishIdentity(marker, on: located)
+            } catch {
+                if (try? tree.entry(identityName)) == nil { try? disk.removeOwnedTree(store) }
+                throw error
+            }
+        } else {
+            try tree.mkdir(controlName)
+            try initialize(tree, marker: marker)
+        }
+        return marker
+    }
+
+    private static func initialize(_ tree: Tree, marker: Marker) throws {
+        for dir in [journalPath, stagePath, packPath, clonePath] { try tree.mkdir(dir) }
         try tree.writeDocument(marker, at: markerPath)
         try tree.root.flush(directory: true)
-        return marker
+    }
+
+    static func jobID(_ tree: Tree, volume: VolumeInfo) throws -> UUID {
+        if try tree.entry(controlName) != nil { return try marker(tree, volume: volume).job }
+        return try readIdentity(tree, format: volume.format).job
+    }
+
+    static func locatedTree(_ tree: Tree, volume: VolumeInfo, disk: Tree?) throws -> Tree {
+        let legacy = try tree.entry(controlName) != nil
+        guard try tree.entry(identityName) != nil else { return tree }
+        let identity: BackupIdentity
+        do { identity = try readIdentity(tree, format: volume.format) }
+        catch {
+            // A legacy backup may contain a user file with this newer name.
+            if legacy { return tree }
+            throw error
+        }
+        guard let disk else { throw BackupError.message("请在设置中选择备份硬盘根目录，授权访问备份记录") }
+        _ = try relativeLocation(tree, on: disk)
+        let path = storagePath(identity.job)
+        if try disk.entry(path) == nil, legacy {
+            guard try marker(tree, volume: volume).job == identity.job else {
+                throw BackupError.message("备份识别文件与原有记录不符")
+            }
+            return tree
+        }
+        guard !legacy else { throw BackupError.message("发现两套备份记录，请检查硬盘") }
+        let control = try disk.subtree(path)
+        let located = try Tree(tree.url, controlTree: control)
+        guard try marker(located, volume: volume).job == identity.job else {
+            throw BackupError.message("备份识别文件与原有记录不符")
+        }
+        return located
+    }
+
+    private static func readIdentity(_ tree: Tree, format: DiskFormat) throws -> BackupIdentity {
+        let identity = try tree.readDocument(BackupIdentity.self, from: identityName)
+        let relative = try VolumeLocation(tree.root).relative(tree.url)
+        let sameFolder = format == .exfat
+            ? pathKey(identity.folder, caseSensitive: false) == pathKey(relative, caseSensitive: false)
+            : identity.folder == relative
+        guard identity.layout == 1, identity.format == format, sameFolder else {
+            throw BackupError.message("备份识别文件格式无效")
+        }
+        return identity
+    }
+
+    static func checkIdentitySlot(_ tree: Tree, job: UUID, format: DiskFormat) throws {
+        if try tree.entry(identityName) != nil {
+            guard (try? readIdentity(tree, format: format).job) == job else {
+                throw BackupError.message("备份目录已包含同名文件 \(identityName)")
+            }
+        } else if try tree.entry(identitySidecarName) != nil {
+            throw BackupError.message("备份目录已包含同名文件 \(identitySidecarName)")
+        }
+    }
+
+    private static func publishIdentity(_ marker: Marker, on tree: Tree) throws {
+        try checkIdentitySlot(tree, job: marker.job, format: marker.format)
+        guard try tree.entry(identityName) == nil else { return }
+        let relative = try VolumeLocation(tree.root).relative(tree.url)
+        let identity = BackupIdentity(layout: 1, job: marker.job, format: marker.format, folder: relative)
+        try tree.writeDocument(identity, at: identityName, stagingIn: stagePath, hidden: true)
+    }
+
+    private static func storagePath(_ id: UUID) -> String { pathJoin(storageName, id.uuidString) }
+
+    private static func relativeLocation(_ tree: Tree, on disk: Tree) throws -> String {
+        let location = try VolumeLocation(tree.root)
+        guard disk.device == tree.device, disk.url.path == location.mount.resolvingSymlinksInPath().path else {
+            throw BackupError.message("请选择此备份硬盘的根目录")
+        }
+        let relative = try location.relative(tree.url)
+        guard !relative.isEmpty, relative.split(separator: "/").first?.lowercased() != storageName else {
+            throw BackupError.message("请选择硬盘内的一个普通文件夹作为备份位置")
+        }
+        return relative
     }
 
     static func marker(_ tree: Tree, volume: VolumeInfo) throws -> Marker {
@@ -77,6 +177,27 @@ final class Repository {
     }
 
     var rich: Bool { volume.format == .apfs }
+
+    func updateVolume(_ info: VolumeInfo) { volume = info }
+
+    func organize(on disk: Tree) throws {
+        guard tree.controlTree == nil else { return }
+        try tree.checkRoot()
+        try disk.checkRoot()
+        guard try !needsRecovery() else { throw BackupError.message("请先恢复未完成的备份") }
+        let relative = try Self.relativeLocation(tree, on: disk)
+        let store = Self.storagePath(descriptor.job)
+        try disk.mkdir(storageName, existing: true)
+        guard try disk.entry(store) == nil else { throw BackupError.message("备份记录位置已被占用") }
+        // Publish the pointer first. Until the rename succeeds, the same job can
+        // still be read from its original directory with the same file lock.
+        try Self.publishIdentity(descriptor, on: tree)
+        try disk.rename(pathJoin(relative, controlName), to: store)
+        try disk.directory(storageName).flush(directory: true)
+        try disk.root.flush(directory: true)
+        try tree.root.flush(directory: true)
+        tree = try Self.locatedTree(tree, volume: volume, disk: disk)
+    }
 
     var owner: UUID? {
         get throws { try catalog.get("writer").flatMap(UUID.init(uuidString:)) ?? descriptor.initialWriter }
@@ -184,7 +305,7 @@ final class Repository {
             try catalog.apply(batch, caseSensitive: volume.caseSensitive, align: align)
         }
         let recovered = try recover()
-        for name in try tree.names(in: stagePath) {
+        for name in try tree.names(in: stagePath) where !name.hasPrefix("._") {
             try tree.removeOwnedTree(pathJoin(stagePath, name))
         }
         for name in try tree.names(in: journalPath) where name.hasPrefix(".write-") {
@@ -197,6 +318,7 @@ final class Repository {
     private func recover() throws -> Bool {
         guard try needsRecovery() else { return false }
         let batch = try readBatch(pendingPath)
+        try protectIdentity(in: batch)
         let generation = try catalog.generation
         if batch.generation == generation, batch.id.uuidString == (try catalog.get("lastBatch")) {
             try clearPending()
@@ -227,6 +349,7 @@ final class Repository {
     func commit(_ input: DiskBatch, patches: [String: PatchData], beforeApply: () throws -> Void) throws {
         var batch = input
         guard !batch.edits.isEmpty || !batch.pruned.isEmpty || !batch.retiredPacks.isEmpty || batch.takeover == true else { return }
+        try protectIdentity(in: batch)
         try tree.checkRoot()
         guard try !needsRecovery() else { throw BackupError.message("需要先恢复上一次同步") }
         let generation = try catalog.generation
@@ -280,6 +403,13 @@ final class Repository {
         let align = try batch.writer == host && batch.takeover != true && catalog.get("aligned.source") != nil
         try catalog.apply(batch, caseSensitive: volume.caseSensitive, align: align)
         try clearPending()
+    }
+
+    private func protectIdentity(in batch: DiskBatch) throws {
+        guard tree.controlTree != nil else { return }
+        for edit in batch.edits where isBackupControl(edit.path) || edit.from.map(isBackupControl) == true {
+            throw BackupError.message("备份记录尝试更改保留路径：\(edit.path)")
+        }
     }
 
     private func envelope(_ batch: DiskBatch) throws -> Envelope {

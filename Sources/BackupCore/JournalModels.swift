@@ -13,6 +13,13 @@ struct Marker: Codable {
     var portable: Bool { version == 2 }
 }
 
+struct BackupIdentity: Codable {
+    let layout: Int
+    let job: UUID
+    let format: DiskFormat
+    let folder: String
+}
+
 struct DiskEdit: Codable, Sendable {
     enum Method: String, Codable, Sendable {
         case record, install, patch, attributes, remove, move, caseMove, archive

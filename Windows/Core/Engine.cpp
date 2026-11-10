@@ -343,7 +343,7 @@ void SyncEngine::configure(const fs::path& in, const fs::path& out, bool automat
 #ifndef _WIN32
     if (allowInternal_ && format != "exfat") format = "exfat";
 #endif
-    auto marker = Repository::create(target, format, host_);
+    auto marker = Repository::create(target, format, host_, !allowInternal_);
     auto relative = target.root().lexically_relative(volume.mount);
     setJob({identifier(marker.at("job")), volume.id, format, relative == "." ? "" : utf8(relative),
         source.identity().identity, source.root(), target.root(), automatic, false});
@@ -647,7 +647,7 @@ SyncProgress SyncEngine::run(bool verify) {
         }
     }
     for (const auto& [rel, flags] : targetDirty) {
-        if (!representable(rel)) continue;
+        if (!representable(rel) || backupControl(rel)) continue;
         const auto record = index_->get("file", rel);
         if (record.is_null()) {
             if ((flags.get<uint32_t>() & nameChange) && repo_->tree.entry(rel)) {
@@ -708,7 +708,7 @@ SyncProgress SyncEngine::run(bool verify) {
     for (const auto& rel : moved) candidates.erase(rel);
     std::map<std::string, std::string> names;
     for (const auto& [rel, item] : candidates) {
-        if (!validPath(rel) || !representable(rel) || (item.source && item.source->kind == Kind::unsupported)) {
+        if (!validPath(rel) || backupControl(rel) || !representable(rel) || (item.source && item.source->kind == Kind::unsupported)) {
             blocked.insert(rel);
             continue;
         }

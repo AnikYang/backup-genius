@@ -101,7 +101,7 @@ struct MainWindow: View {
                 }
             }
             .navigationTitle(model.page.title)
-            .navigationSubtitle(model.job.map { $0.restoreOnly ? "已有备份" : $0.volumeName } ?? "Backup Genius")
+            .navigationSubtitle(model.job.map { $0.restoreOnly ? "已有备份" : (model.volume?.name ?? $0.volumeName) } ?? "Backup Genius")
             .toolbar {
                 if model.job != nil {
                     ToolbarItemGroup(placement: .primaryAction) {

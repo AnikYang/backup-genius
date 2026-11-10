@@ -6,6 +6,9 @@ import DiskArbitration
 import IOKit
 
 let controlName = ".backup-genius"
+let identityName = ".backup-genius.json"
+let identitySidecarName = "._\(identityName)"
+let storageName = ".backup-genius-data"
 let blockSize = 64 * 1024
 let digestSize = 32
 
@@ -54,6 +57,11 @@ func userPath(_ path: String) throws {
     guard let first = parts.first, first.lowercased() != controlName else {
         throw BackupError.message("此名称由 Backup Genius 保留：\(path)")
     }
+}
+
+func isBackupControl(_ path: String) -> Bool {
+    guard let first = path.split(separator: "/").first?.lowercased() else { return false }
+    return first == controlName || first == identityName || first == identitySidecarName
 }
 
 func windowsNameProblem(_ path: String) -> Bool {
@@ -235,13 +243,27 @@ final class Tree: @unchecked Sendable {
     let root: FD
     let device: dev_t
     let identity: String
+    let controlTree: Tree?
 
-    init(_ url: URL) throws {
+    convenience init(_ url: URL, controlTree: Tree? = nil) throws {
+        let root = try FD(Darwin.open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), url.path)
+        try self.init(url, root: root, controlTree: controlTree)
+    }
+
+    private init(_ url: URL, root: FD, controlTree: Tree? = nil) throws {
         self.url = url
-        root = try FD(Darwin.open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), url.path)
+        self.root = root
         let info = try root.rawStat()
         device = info.st_dev
         identity = FileStamp(info).identity
+        if let controlTree, controlTree.device != device {
+            throw BackupError.message("备份记录必须位于同一硬盘卷")
+        }
+        self.controlTree = controlTree
+    }
+
+    func subtree(_ path: String) throws -> Tree {
+        try Tree(url.appending(path: path, directoryHint: .isDirectory), root: directory(path))
     }
 
     func checkRoot() throws {
@@ -250,11 +272,16 @@ final class Tree: @unchecked Sendable {
               FileStamp(raw).kind == .directory, FileStamp(raw).identity == identity else {
             throw BackupError.message("文件夹已移动或断开：\(url.path)")
         }
+        try controlTree?.checkRoot()
     }
 
     func directory(_ path: String) throws -> FD {
+        let components = try pathComponents(path)
+        if let controlTree, components.first == Substring(controlName) {
+            return try controlTree.directory(components.dropFirst().joined(separator: "/"))
+        }
         var current = root
-        for component in try pathComponents(path) {
+        for component in components {
             let child = try FD(openat(current.value, String(component), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC), path)
             guard try child.rawStat().st_dev == device else {
                 throw BackupError.message("无法跨入另一卷：\(path)")
@@ -273,6 +300,7 @@ final class Tree: @unchecked Sendable {
 
     func entry(_ path: String) throws -> FileStamp? {
         if path.isEmpty { return try root.stamp() }
+        if path == controlName, let controlTree { return try controlTree.root.stamp() }
         let parts: (FD, String)
         do { parts = try parent(path) } catch BackupError.io(_, _, let code) where code == ENOENT || code == ENOTDIR {
             return nil
@@ -377,7 +405,7 @@ final class Tree: @unchecked Sendable {
         }
         func walk(_ dir: FD, _ prefix: String) throws {
             for name in try names(dir) {
-                if excludingControl && prefix.isEmpty && name.lowercased() == controlName { continue }
+                if excludingControl && prefix.isEmpty && isBackupControl(name) { continue }
                 let child = pathJoin(prefix, name)
                 if excluding(child) { continue }
                 guard let stamp = try entry(in: dir, name: name, path: child) else { continue }
@@ -475,16 +503,31 @@ final class Tree: @unchecked Sendable {
         return try JSONDecoder().decode(type, from: fd.readExact(at: 0, length: Int(size)))
     }
 
-    func writeDocument<T: Encodable>(_ value: T, at path: String, replacing: Bool = false) throws {
+    func writeDocument<T: Encodable>(_ value: T, at path: String, replacing: Bool = false,
+                                     stagingIn: String? = nil, hidden: Bool = false) throws {
         let data = try JSONEncoder().encode(value)
         guard data.count <= 64 * 1024 * 1024 else { throw BackupError.message("备份记录超过大小限制：\(path)") }
-        let temp = pathJoin(pathParent(path), ".write-\(UUID().uuidString)")
+        let temp = pathJoin(stagingIn ?? pathParent(path), ".write-\(UUID().uuidString)")
         let fd = try createFile(temp)
         do {
             try fd.write(data, at: 0)
+            if hidden {
+                let flags = try fd.rawStat().st_flags | UInt32(UF_HIDDEN)
+                if fchflags(fd.value, flags) != 0 && errno != ENOTSUP && errno != EINVAL {
+                    throw BackupError.posix("无法隐藏备份识别文件", path)
+                }
+                // exFAT can create a system sidecar. App Sandbox may prevent
+                // direct access to it even when the marker itself is writable.
+                do {
+                    try remove(pathJoin(pathParent(temp), "._\(pathName(temp))"))
+                } catch BackupError.io(_, _, let code) where code == EPERM || code == EACCES {
+                    // The filesystem handles the sidecar when moving the file.
+                }
+            }
             try fd.flush(full: true)
             try rename(temp, to: path, replacing: replacing)
             try directory(pathParent(path)).flush(directory: true)
+            if let stagingIn { try directory(stagingIn).flush(directory: true) }
             try fd.flush(full: true)
         } catch {
             _ = try? remove(temp)

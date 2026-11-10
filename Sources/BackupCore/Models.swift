@@ -26,12 +26,12 @@ public enum ExistingFilesPolicy: String, Codable, Sendable, CaseIterable {
 public struct BackupJob: Codable, Sendable, Identifiable {
     public let id: UUID
     public let source: URL
-    public let target: URL
-    public let volumeID: String
-    public let volumeName: String
+    public internal(set) var target: URL
+    public internal(set) var volumeID: String
+    public internal(set) var volumeName: String
     public let format: DiskFormat
     public let sourceBookmark: Data?
-    public let targetBookmark: Data?
+    public internal(set) var targetBookmark: Data?
     let sourceIdentity: String
     public let targetRelativePath: String
     public var automatic: Bool
@@ -39,6 +39,7 @@ public struct BackupJob: Codable, Sendable, Identifiable {
     public var reuseMatchingFiles: Bool? = nil
     var existingFiles: ExistingFilesPolicy? = nil
     public var ejectAfterBackup: Bool? = nil
+    var storageBookmark: Data? = nil
 
     public var existingFilesPolicy: ExistingFilesPolicy {
         existingFiles ?? (reuseMatchingFiles == true ? .reuseIdentical : .preserve)

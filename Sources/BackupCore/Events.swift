@@ -59,7 +59,7 @@ final class EventInbox: @unchecked Sendable {
                 } else {
                     continue
                 }
-                if excludeControl && relative.split(separator: "/").first?.lowercased() == controlName { continue }
+                if excludeControl && isBackupControl(relative) { continue }
                 if relative.isEmpty {
                     if flag & (flagSubtree | flagRenamed | flagRemoved) != 0 {
                         pending.fullScan = true

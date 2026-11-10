@@ -104,6 +104,7 @@ final class AppModel {
     let engine: SyncEngine
     var job: BackupJob?
     var volume: VolumeInfo?
+    var organizedStorage = false
     var progress = SyncProgress()
     var activities: [Activity] = []
     var versions: [HistoryItem] = []
@@ -142,6 +143,7 @@ final class AppModel {
                 self.progress = snapshot.progress
                 self.job = snapshot.job
                 self.volume = snapshot.volume
+                self.organizedStorage = snapshot.organizedStorage
                 if changedJob || finishedRun || (wasBusy && !snapshot.progress.state.busy) { self.loadRecords() }
             }
         }
@@ -243,6 +245,15 @@ final class AppModel {
         }
     }
 
+    func organizeBackupDirectory() {
+        Task {
+            guard let disk = await chooseFolder(title: "授权存放备份记录的硬盘根目录", prompt: "授权",
+                                                startingAt: volume?.mount) else { return }
+            do { try await engine.organizeBackup(on: disk) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+
     func setExistingFilesPolicy(_ policy: ExistingFilesPolicy) {
         Task {
             do { try await engine.setExistingFilesPolicy(policy) }
@@ -271,8 +282,9 @@ final class AppModel {
 }
 
 @MainActor
-func chooseFolder(title: String, prompt: String, canCreate: Bool = false) async -> URL? {
+func chooseFolder(title: String, prompt: String, canCreate: Bool = false, startingAt: URL? = nil) async -> URL? {
     let panel = NSOpenPanel()
+    panel.directoryURL = startingAt
     panel.title = title
     panel.prompt = prompt
     panel.canChooseFiles = false

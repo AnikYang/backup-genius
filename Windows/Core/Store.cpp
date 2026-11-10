@@ -234,8 +234,39 @@ void Index::transaction(const std::function<void()>& run) {
     catch (...) { sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr); throw; }
 }
 
+Tree Repository::locate(const Tree& folder) {
+    if (folder.separateControl() || !folder.entry(identityFile)) return folder;
+    const bool legacy = folder.entry(control).has_value();
+    const Tree volume(inspect(folder.root()).mount);
+    const auto relative = utf8(folder.root().lexically_relative(volume.root()));
+    Json pointer;
+    std::string job;
+    try {
+        pointer = Json::parse(folder.readDocument(identityFile));
+        require(integer(pointer.at("layout")) == 1, "备份识别文件格式无效");
+        require(folded(pointer.at("folder").get<std::string>()) == folded(relative), "备份识别文件与文件夹不符");
+        const auto format = pointer.at("format").get<std::string>();
+        require(format == "ntfs" || format == "exfat", "备份识别文件格式无效");
+        job = identifier(pointer.at("job"));
+    } catch (...) {
+        if (legacy) return folder;
+        throw;
+    }
+    const auto store = join(storageFolder, job);
+    if (legacy) {
+        require(!volume.entry(store), "发现两套备份记录，请检查硬盘");
+        require(identifier(Json::parse(folder.readDocument(markerPath)).at("job")) == job,
+                "备份识别文件与原有记录不符");
+        return folder;
+    }
+    auto located = folder.withControl(volume.checked(store));
+    const auto saved = Json::parse(located.readDocument(markerPath));
+    require(identifier(saved.at("job")) == job && saved.at("format") == pointer.at("format"),
+            "备份识别文件与原有记录不符");
+    return located;
+}
 Json Repository::readMarker(const Tree& tree) {
-    auto value = Json::parse(tree.readDocument(markerPath));
+    auto value = Json::parse(locate(tree).readDocument(markerPath));
     auto version = integer(value.at("version"));
     identifier(value.at("job"));
     const auto format = value.at("format").get<std::string>();
@@ -247,18 +278,50 @@ Json Repository::readMarker(const Tree& tree) {
     }
     return value;
 }
-Json Repository::create(const Tree& tree, std::string format, std::string writer) {
+Json Repository::create(const Tree& tree, std::string format, std::string writer, bool organized) {
     require(format == "ntfs" || format == "exfat", "目标必须为 NTFS 或 exFAT");
-    if (tree.entry(control)) return readMarker(tree);
-    tree.mkdir(control);
-    for (const auto& dir : {journalPath, packPath, stagePath, versionsPath}) tree.mkdir(dir);
+    if (tree.entry(control) || tree.entry(identityFile)) return readMarker(tree);
     Json marker = {{"version", 2}, {"job", uuid()}, {"format", std::move(format)}, {"initialWriter", writer}, {"legacyGeneration", 0}};
-    tree.writeDocument(markerPath, marker.dump());
-    tree.flushDirectory();
+    auto initialize = [&](const Tree& folder) {
+        for (const auto& dir : {journalPath, packPath, stagePath, versionsPath}) folder.mkdir(dir);
+        folder.writeDocument(markerPath, marker.dump());
+        folder.flushDirectory(control);
+    };
+    if (organized) {
+        const Tree volume(inspect(tree.root()).mount);
+        const auto relative = utf8(tree.root().lexically_relative(volume.root()));
+        require(!relative.empty() && relative != "." && !inside(folded(relative), storageFolder),
+                "请选择硬盘内的一个普通文件夹作为备份位置");
+        volume.mkdir(storageFolder);
+        volume.hide(storageFolder);
+        const auto store = join(storageFolder, identifier(marker.at("job")));
+        require(!volume.entry(store), "备份记录位置已被占用");
+        volume.mkdir(store);
+        try {
+            const auto located = tree.withControl(volume.checked(store));
+            initialize(located);
+            volume.flushDirectory(storageFolder);
+            const Json pointer = {{"layout", 1}, {"job", marker.at("job")}, {"format", marker.at("format")}, {"folder", relative}};
+            const auto staged = join(stagePath, uuid());
+            located.writeDocument(staged, pointer.dump());
+            located.hide(staged);
+#ifndef _WIN32
+            located.remove(join(stagePath, "._" + name(staged)));
+#endif
+            located.rename(staged, identityFile);
+            located.flushDirectory();
+        } catch (...) {
+            if (!tree.entry(identityFile)) volume.removeOwned(store);
+            throw;
+        }
+    } else {
+        tree.mkdir(control);
+        initialize(tree);
+    }
     return marker;
 }
 Repository::Repository(Tree target, Index& cache, std::string writer, Fault fault)
-    : tree(std::move(target)), index(cache), host(std::move(writer)), fault_(std::move(fault)) {
+    : tree(locate(target)), index(cache), host(std::move(writer)), fault_(std::move(fault)) {
     auto p = tree.checked(join(control, "lock"));
 #ifdef _WIN32
     auto h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -380,11 +443,13 @@ void Repository::open() {
             require(pending.value("takeover", false) || stringValue(pending, "writer") == owner, "恢复记录写入者不符");
             for (const auto& edit : pending.at("edits")) {
                 const auto method = stringValue(edit, "method");
-                if (method == "record" || method == "archive") continue;
+                const auto rel = stringValue(edit, "path");
                 const auto from = stringValue(edit, "from");
+                require(!tree.separateControl() || (!backupControl(rel) && !backupControl(from)), "恢复记录尝试更改保留路径");
+                if (method == "record" || method == "archive") continue;
                 const bool nativeLink = (exists(edit, "before") && edit.at("before").at("kind") == "symlink") ||
                     (exists(edit, "next") && edit.at("next").at("source").at("kind") == "symlink");
-                require(!nativeLink && representable(stringValue(edit, "path")) && (from.empty() || representable(from)),
+                require(!nativeLink && representable(rel) && (from.empty() || representable(from)),
                         "未完成的更新包含 Mac 专用名称或链接，请在 Mac 上恢复后重连");
             }
             for (auto i = pending.at("edits").rbegin(); i != pending.at("edits").rend(); ++i) rollback(*i, pending.at("chunks"));
@@ -420,6 +485,11 @@ void Repository::commit(Json next, const std::unordered_map<std::string, Patch>&
     tree.check();
     const auto takeover = next.value("takeover", false);
     const auto& edits = next.at("edits");
+    if (tree.separateControl()) {
+        for (const auto& edit : edits)
+            require(!backupControl(stringValue(edit, "path")) && !backupControl(stringValue(edit, "from")),
+                    "备份记录尝试更改保留路径");
+    }
     const auto archiveOnly = !edits.empty() && std::all_of(edits.begin(), edits.end(), [](const Json& item) {
         return item.at("method") == "archive";
     });

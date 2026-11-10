@@ -85,10 +85,13 @@ struct Transfer: Sendable {
 
     private func prepareRemoval(_ work: Work) throws -> Prepared {
         guard let old = work.old else { return Prepared() }
-        if old.sharedDirectory == true {
+        if old.sharedDirectory == true && !work.retireInstaller {
             return Prepared(edit: DiskEdit(method: .record, path: work.path))
         }
         let before = try target.entry(work.path)
+        if work.retireInstaller, let before, before.kind != old.source.kind {
+            throw BackupError.message("目标文件已被其他文件替换：\(work.path)")
+        }
         guard old.target != nil || before == nil else {
             throw BackupError.message("目标位置已有未纳入备份的文件：\(work.path)")
         }

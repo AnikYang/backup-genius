@@ -203,6 +203,10 @@ std::string join(std::string_view base, std::string_view child) {
 bool inside(std::string_view value, std::string_view base) {
     return base.empty() || value == base || (value.starts_with(base) && value.size() > base.size() && value[base.size()] == '/');
 }
+bool backupControl(std::string_view value) {
+    auto first = folded(value.substr(0, value.find('/')));
+    return first == control || first == identityFile || first == "._.backup-genius.json";
+}
 bool validPath(std::string_view value, bool user) {
     if (value.empty() || value.size() > 131072 || value.front() == '/' || value.back() == '/' ||
         value.find('\0') != value.npos) return false;
@@ -443,11 +447,25 @@ Tree::Tree(fs::path root) : root_(fs::absolute(root).lexically_normal()) {
         require(item && item->kind == Kind::directory, "文件夹位于链接或重解析点内");
     }
 }
+Tree Tree::withControl(const fs::path& storage) const {
+    require(inspect(root_).id == inspect(storage).id, "备份记录必须位于同一硬盘卷");
+    auto result = *this;
+    result.control_ = std::make_shared<Tree>(storage);
+    return result;
+}
+std::pair<const Tree*, std::string_view> Tree::route(std::string_view relative) const {
+    if (control_ && relative == control) return {control_.get(), {}};
+    if (control_ && inside(relative, control)) return {control_.get(), relative.substr(control.size() + 1)};
+    return {this, relative};
+}
 void Tree::check() const {
     auto actual = probe(longPath(root_));
     require(actual && actual->kind == Kind::directory && actual->identity == identity_.identity, "文件夹已移动、替换或断开");
+    if (control_) control_->check();
 }
 fs::path Tree::checked(std::string_view relative) const {
+    const auto [root, routed] = route(relative);
+    if (root != this) return root->checked(routed);
     if (relative.empty()) return longPath(root_);
     require(representable(relative), "路径无法安全表示");
     auto current = longPath(root_);
@@ -462,8 +480,9 @@ fs::path Tree::checked(std::string_view relative) const {
 }
 std::optional<Stamp> Tree::entry(std::string_view relative) const { return probe(checked(relative)); }
 File Tree::file(std::string_view relative, File::Mode mode) const {
-    require(!relative.empty(), "根目录不可当作文件打开");
-    const PinDirectories pin(root_, identity_, relative);
+    const auto [root, routed] = route(relative);
+    require(!routed.empty(), "根目录不可当作文件打开");
+    const PinDirectories pin(root->root_, root->identity_, routed);
     return File(checked(relative), mode);
 }
 std::vector<std::string> Tree::children(std::string_view relative) const {
@@ -478,7 +497,7 @@ void Tree::walk(std::string_view relative, const std::function<void(const std::s
                 bool skipControl) const {
     auto scan = [&](auto&& recurse, const std::string& prefix) -> void {
         for (const auto& child : children(prefix)) {
-            if (skipControl && prefix.empty() && folded(child) == control) continue;
+            if (skipControl && prefix.empty() && backupControl(child)) continue;
             auto rel = join(prefix, child);
             if (!representable(rel)) { visit(rel, Stamp{Kind::unsupported}); continue; }
             auto s = entry(rel);
@@ -495,7 +514,8 @@ void Tree::walk(std::string_view relative, const std::function<void(const std::s
 }
 void Tree::mkdir(std::string_view relative) const {
     if (relative.empty()) return;
-    const PinDirectories pin(root_, identity_, relative);
+    const auto [root, routed] = route(relative);
+    const PinDirectories pin(root->root_, root->identity_, routed);
     auto p = checked(relative);
     auto s = probe(p);
     if (s) { require(s->kind == Kind::directory, "文件夹位置已被占用"); return; }
@@ -507,8 +527,11 @@ void Tree::parents(std::string_view relative) const {
     for (auto it = parts.rbegin(); it != parts.rend(); ++it) mkdir(*it);
 }
 void Tree::rename(std::string_view from, std::string_view to, bool replace) const {
-    require(!from.empty() && !to.empty(), "根目录不可移动");
-    const PinDirectories source(root_, identity_, from), destination(root_, identity_, to);
+    const auto [fromRoot, routedFrom] = route(from);
+    const auto [toRoot, routedTo] = route(to);
+    require(!routedFrom.empty() && !routedTo.empty(), "根目录不可移动");
+    const PinDirectories source(fromRoot->root_, fromRoot->identity_, routedFrom),
+        destination(toRoot->root_, toRoot->identity_, routedTo);
     const auto a = checked(from), b = checked(to);
 #ifdef _WIN32
     if (!MoveFileExW(a.c_str(), b.c_str(), MOVEFILE_WRITE_THROUGH | (replace ? MOVEFILE_REPLACE_EXISTING : 0))) fail("MoveFileExW");
@@ -521,9 +544,10 @@ void Tree::rename(std::string_view from, std::string_view to, bool replace) cons
 #endif
 }
 void Tree::remove(std::string_view relative, bool keepNonEmpty) const {
-    require(!relative.empty(), "根目录不可移除");
+    const auto [root, routed] = route(relative);
+    require(!routed.empty(), "根目录不可移除");
     if (!entry(relative)) return;
-    const PinDirectories pin(root_, identity_, relative);
+    const PinDirectories pin(root->root_, root->identity_, routed);
     std::error_code error;
     fs::remove(checked(relative), error);
     if (error && !(keepNonEmpty && error == std::errc::directory_not_empty)) throw std::system_error(error, "remove");
@@ -536,7 +560,8 @@ void Tree::removeOwned(std::string_view relative) const {
 }
 void Tree::createLink(std::string_view relative, std::string_view target, bool directory) const {
     require(!target.empty() && target.find('\0') == target.npos, "链接记录无效");
-    const PinDirectories pin(root_, identity_, relative);
+    const auto [root, routed] = route(relative);
+    const PinDirectories pin(root->root_, root->identity_, routed);
     auto at = checked(relative);
     auto linkTarget = path(target).make_preferred();
 #ifdef _WIN32
@@ -569,7 +594,8 @@ void Tree::writeDocument(std::string_view relative, std::string_view data, bool 
     }
 }
 void Tree::metadata(std::string_view relative, Time modified, Time created, uint32_t attributes, bool readOnly) const {
-    const PinDirectories pin(root_, identity_, relative);
+    const auto [root, routed] = route(relative);
+    const PinDirectories pin(root->root_, root->identity_, routed);
     auto p = checked(relative);
 #ifdef _WIN32
     HANDLE h = CreateFileW(p.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -589,6 +615,17 @@ void Tree::metadata(std::string_view relative, Time modified, Time created, uint
     (void)readOnly;
     const timespec values[] = {{0, UTIME_OMIT}, {modified.seconds, modified.nanoseconds}};
     if (utimensat(AT_FDCWD, p.c_str(), values, AT_SYMLINK_NOFOLLOW)) fail("utimensat");
+#endif
+}
+void Tree::hide(std::string_view relative) const {
+    const auto location = checked(relative);
+#ifdef _WIN32
+    const auto flags = GetFileAttributesW(location.c_str());
+    if (flags == INVALID_FILE_ATTRIBUTES ||
+        !SetFileAttributesW(location.c_str(), (flags & ~FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_HIDDEN)) fail("SetFileAttributesW");
+#else
+    struct stat info{};
+    if (lstat(location.c_str(), &info) != 0 || chflags(location.c_str(), info.st_flags | UF_HIDDEN) != 0) fail("chflags");
 #endif
 }
 void Tree::flushDirectory(std::string_view relative) const {

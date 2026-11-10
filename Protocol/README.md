@@ -4,14 +4,18 @@
 
 ## 位置和编码
 
-| 位置（相对备份目录） | 内容 |
+| 记录目录内的路径 | 内容 |
 | --- | --- |
-| .backup-genius/job.json | 任务标记，含 version、job、format、legacyGeneration 和可选 initialWriter |
-| .backup-genius/lock | 进程租约文件，Mac 用 flock，Windows 用 LockFileEx |
-| .backup-genius/journal/00000000000000000001.json | 从 1 开始的 20 位十进制提交代次 |
-| .backup-genius/journal/pending.json | 同一格式的准备记录 |
-| .backup-genius/packs/\<UUID\> | 归档块的原始字节 |
-| .backup-genius/stage/\<UUID\> | 待发布的文件或临时移动位置 |
+| job.json | 任务标记，含 version、job、format、legacyGeneration 和可选 initialWriter |
+| lock | 进程租约文件，Mac 用 flock，Windows 用 LockFileEx |
+| journal/00000000000000000001.json | 从 1 开始的 20 位十进制提交代次 |
+| journal/pending.json | 同一格式的准备记录 |
+| packs/\<UUID\> | 归档块的原始字节 |
+| stage/\<UUID\> | 待发布的文件或临时移动位置 |
+
+原有布局的记录目录为备份文件夹中的 `.backup-genius`。新布局将记录目录放在卷根目录的 `.backup-genius-data/<任务 UUID>`。备份文件夹中的隐藏识别文件 `.backup-genius.json` 记录整数 layout（目前为 1）、任务 UUID job、文件系统 format 及卷内相对路径 folder。识别文件须与记录目录内的任务标记匹配。卷标名称和挂载点不参与匹配。
+
+整理现有备份时，持锁恢复未完成的事务，发布识别文件，然后在同卷移动记录目录。移动前可从原位置读到同一任务，移动后使用新位置。日志内容和代次沿用原值。
 
 文件名和内容中的路径使用 UTF-8，路径相对于任务目录，分隔符为正斜线。禁止空段、点段、NUL 和保留的控制目录。引擎在访问前检查平台文件名约束，并拒绝穿过符号链接或重解析点。应用生成的 UUID 使用大写十六进制。
 

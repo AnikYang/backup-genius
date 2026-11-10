@@ -10,6 +10,7 @@ struct SetupView: View {
     @ViewState private var source: URL?
     @ViewState private var target: URL?
     @ViewState private var volume: VolumeInfo?
+    @ViewState private var organizedTarget = false
     @ViewState private var automatic = true
     @ViewState private var ejectAfterBackup = false
     @ViewState private var existingFiles = ExistingFilesPolicy.preserve
@@ -101,6 +102,7 @@ struct SetupView: View {
                 if let job = model.job, model.volume != nil {
                     target = job.target
                     volume = model.volume
+                    organizedTarget = model.organizedStorage
                     automatic = job.restoreOnly || job.automatic
                 }
                 login = model.loginEnabled
@@ -129,36 +131,49 @@ struct SetupView: View {
         defer { checkingDisk = false }
         target = url
         volume = nil
+        organizedTarget = false
         failure = nil
         do {
             let result = try await Task.detached(priority: .utility) {
                 let accessed = url.startAccessingSecurityScopedResource()
                 defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                return try VolumeInfo.inspect(url)
+                return (try VolumeInfo.inspect(url), FileManager.default.fileExists(atPath: url.appending(path: ".backup-genius.json").path))
             }.value
-            guard result.isExternal else { throw BackupError.message("请选择外置硬盘上的文件夹") }
-            volume = result
+            guard result.0.isExternal else { throw BackupError.message("请选择外置硬盘上的文件夹") }
+            if mode == .configure && url.resolvingSymlinksInPath().path == result.0.mount.resolvingSymlinksInPath().path {
+                throw BackupError.message("请在硬盘内选择一个文件夹，备份记录会放在这个文件夹之外")
+            }
+            volume = result.0
+            organizedTarget = result.1
         } catch {
             failure = error.localizedDescription
         }
     }
 
     private func save() {
-        guard let target else { return }
+        guard let target, let volume else { return }
         pending = true
         failure = nil
         Task {
             defer { pending = false }
             do {
+                let alreadyAuthorized = mode == .configure && model.organizedStorage && model.job?.target.path == target.path
+                var disk: URL?
+                if (mode == .configure && !alreadyAuthorized) || (mode == .existing && organizedTarget) {
+                    guard let selected = await chooseFolder(title: "选择备份硬盘的根目录以存放记录", prompt: "授权",
+                                                           startingAt: volume.mount) else { return }
+                    disk = selected
+                }
                 switch mode {
                 case .configure:
                     guard let source else { return }
                     model.job = try await model.engine.configure(source: source, target: target, automatic: automatic,
-                                                                existingFiles: existingFiles, ejectAfterBackup: ejectAfterBackup)
+                                                                existingFiles: existingFiles, ejectAfterBackup: ejectAfterBackup,
+                                                                volumeRoot: disk)
                     if login != model.loginEnabled { model.setLogin(login) }
                     model.page = .overview
                 case .existing:
-                    model.job = try await model.engine.openExisting(target: target)
+                    model.job = try await model.engine.openExisting(target: target, volumeRoot: disk)
                     model.page = .history
                     model.loadRecords()
                 case .takeover:
@@ -438,6 +453,13 @@ struct AppSettings: View {
                     ))
                     .disabled(job.restoreOnly || model.progress.state.busy)
                     LabeledContent("历史保留", value: "\(BackupJob.retentionDays) 天")
+                    if model.organizedStorage {
+                        Label("备份目录已整理", systemImage: "checkmark.circle")
+                    } else {
+                        Button("整理备份目录…", action: model.organizeBackupDirectory)
+                            .disabled(model.progress.state.busy || model.restoring || model.ejecting ||
+                                      (model.volume == nil && model.progress.state != .needsAttention))
+                    }
                 }
                 Button("设置备份…") {
                     openWindow(id: "main")
@@ -447,7 +469,7 @@ struct AppSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 385)
+        .frame(width: 500, height: 418)
         .onAppear { model.refreshLoginStatus() }
     }
 }

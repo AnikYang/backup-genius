@@ -18,6 +18,7 @@ struct Work: Sendable {
     var from: String?
     var caseOnly = false
     var targetNameMatches = false
+    var retireInstaller = false
 }
 
 struct WorkPlan {
@@ -33,6 +34,10 @@ struct WorkPlan {
 final class SourceExclusions {
     private let source: Tree
     private var caches: [String: Bool] = [:]
+    private var backupGeniusProjects: [String: Bool] = [:]
+    private static let installers: Set<Substring> = [
+        "Backup Genius.app", "Backup-Genius-macOS.zip", "Backup-Genius-Windows-x64.zip", "Backup-Genius-Windows-ARM64.zip",
+    ]
 
     init(source: Tree) { self.source = source }
 
@@ -59,6 +64,29 @@ final class SourceExclusions {
             if excluded { return true }
         }
         return false
+    }
+
+    func installer(_ path: String) -> Bool {
+        guard path.contains("dist/") else { return false }
+        let parts = path.split(separator: "/")
+        for index in parts.indices.dropLast() where parts[index] == "dist" && Self.installers.contains(parts[index + 1]) {
+            let project = parts[..<index].joined(separator: "/")
+            if backupGeniusProjects[project] == nil {
+                backupGeniusProjects[project] = (try? isBackupGeniusProject(project)) == true
+            }
+            if backupGeniusProjects[project] == true { return true }
+        }
+        return false
+    }
+
+    private func isBackupGeniusProject(_ project: String) throws -> Bool {
+        guard try source.entry(pathJoin(project, "Package.swift"))?.kind == .regular else { return false }
+        let plist = try source.file(pathJoin(project, "Resources/Info.plist"))
+        let size = try plist.stamp().size
+        guard size > 0 && size <= 64 * 1024 else { return false }
+        let data = try plist.readExact(at: 0, length: Int(size))
+        let values = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        return values?["CFBundleIdentifier"] as? String == "com.backupgenius.mac"
     }
 }
 
@@ -97,6 +125,7 @@ struct Planner {
         }
 
         func capture(_ path: String, _ stamp: FileStamp) throws {
+            guard !exclusions.installer(path) else { return }
             current[path] = stamp
             selected.insert(path)
             try checked()
@@ -132,10 +161,14 @@ struct Planner {
         }
 
         if sourceChanges.fullScan || verify {
-            try source.scan(excluding: exclusions.contains, visit: capture)
+            try source.scan(excluding: { exclusions.contains($0) || exclusions.installer($0) }, visit: capture)
             try oldBelow("")
         } else {
             for (path, flags) in sourceChanges.paths where !exclusions.contains(path) {
+                if exclusions.installer(path) {
+                    try oldBelow(path)
+                    continue
+                }
                 let stamp = try exactSource(path)
                 let wasDirectory = stamp == nil ? try catalog.file(path)?.source.kind == .directory : false
                 let isSubtree = flags & flagSubtree != 0 ||
@@ -152,7 +185,9 @@ struct Planner {
             for root in scanRoots.sorted(by: { $0.count < $1.count }) {
                 if hasAncestor(root, in: scanned) { continue }
                 scanned.insert(root)
-                if try exactSource(root) != nil { try source.scan(at: root, excluding: exclusions.contains, visit: capture) }
+                if try exactSource(root) != nil {
+                    try source.scan(at: root, excluding: { exclusions.contains($0) || exclusions.installer($0) }, visit: capture)
+                }
                 try oldBelow(root)
             }
         }
@@ -228,7 +263,7 @@ struct Planner {
                     output.problems[path] = "不支持的文件类型或尚未下载到 Mac"
                     continue
                 }
-                if path.split(separator: "/").first?.lowercased() == controlName {
+                if isBackupControl(path) {
                     output.problems[path] = "此名称由 Backup Genius 保留"
                     continue
                 }
@@ -244,12 +279,12 @@ struct Planner {
                     }
                 }
             } else if let old {
-                removals[path] = Work(kind: .remove, path: path, stamp: nil, old: old)
+                removals[path] = Work(kind: .remove, path: path, stamp: nil, old: old, retireInstaller: exclusions.installer(path))
             }
         }
 
         let removedIDs = Dictionary(grouping: removals.values.compactMap { item -> FileRecord? in
-            guard item.stamp == nil, let old = item.old, old.source.kind != .directory,
+            guard item.stamp == nil, !item.retireInstaller, let old = item.old, old.source.kind != .directory,
                   old.source.links == 1, !targetDrift.contains(item.path) else { return nil }
             return old
         }, by: { $0.source.identity })

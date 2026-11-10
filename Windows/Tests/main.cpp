@@ -3,6 +3,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace bg;
 namespace {
@@ -290,6 +293,33 @@ void macOnlyNames(const fs::path& volume) {
     expect(read(disk, "portable.txt") == "already installed", "defer before rolling back any portable edits");
 }
 
+void organizedRepository(const fs::path& volume) {
+    if (volume.empty()) return;
+    Fixture f(volume);
+    const Tree disk(f.target), source(f.source);
+    const auto marker = Repository::create(disk, "exfat", uuid(), true);
+    expect(disk.children() == std::vector<std::string>{std::string(identityFile)}, "backup root only has the identification file");
+#ifdef _WIN32
+    expect(disk.entry(identityFile)->attributes & FILE_ATTRIBUTE_HIDDEN, "identification file is hidden in Explorer");
+#endif
+    const Tree mount(inspect(f.target).mount);
+    expect(mount.entry(join(storageFolder, identifier(marker.at("job")))).has_value(), "store is beside the backup folder");
+    SyncEngine engine(f.state, {}, true);
+    engine.openExisting(f.target);
+    auto preview = engine.previewTakeover(f.source);
+    engine.confirmTakeover(preview.id, {});
+    write(source, "file.txt", "first");
+    engine.recordChanges({{{"file.txt", nameChange}}});
+    expect(engine.sync().state == SyncState::upToDate && read(disk, "file.txt") == "first", "publish files from external staging");
+    write(source, "file.txt", "next");
+    engine.recordChanges({{{"file.txt", contentChange}}});
+    expect(engine.sync().state == SyncState::upToDate && read(disk, "file.txt") == "next", "incremental update with external records");
+    const auto versions = engine.history();
+    expect(versions.size() == 1, "history recorded outside the folder");
+    const Tree restored(engine.restore(f.restore, versions[0].at("id").get<std::string>()));
+    expect(read(restored, "file.txt") == "first", "restore from external history");
+}
+
 Json metrics(const SyncProgress& p) {
     return {{"checkingSeconds", p.checkingSeconds}, {"elapsedSeconds", p.elapsedSeconds}, {"examined", p.examined},
         {"sourceReadBytes", p.sourceRead}, {"targetReadBytes", p.targetRead}, {"latestWrittenBytes", p.latestWritten},
@@ -414,6 +444,7 @@ int entry(std::vector<std::string> args) {
             ownership(volume);
             safety(volume);
             macOnlyNames(volume);
+            organizedRepository(volume);
             pruning(volume);
 #ifdef _WIN32
             liveEvents(volume);

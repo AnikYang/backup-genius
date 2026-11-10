@@ -63,7 +63,7 @@ using Fault = std::function<void(Interruption)>;
 
 class Repository {
 public:
-    static Json create(const Tree&, std::string format, std::string writer);
+    static Json create(const Tree&, std::string format, std::string writer, bool organized = false);
     static Json readMarker(const Tree&);
     Repository(Tree target, Index&, std::string writer, Fault = {});
     ~Repository();
@@ -90,6 +90,7 @@ public:
     std::string head;
     bool recovered{};
 private:
+    static Tree locate(const Tree&);
     Json readBatch(std::string_view path);
     void replay(const Json&, bool align);
     void apply(Json&, const std::unordered_map<std::string, Patch>&);

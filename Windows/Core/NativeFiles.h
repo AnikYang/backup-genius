@@ -3,9 +3,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace bg {
@@ -13,6 +15,8 @@ namespace fs = std::filesystem;
 using Bytes = std::string;
 constexpr int64_t blockSize = 65536;
 constexpr std::string_view control = ".backup-genius";
+constexpr std::string_view identityFile = ".backup-genius.json";
+constexpr std::string_view storageFolder = ".backup-genius-data";
 
 struct Time {
     int64_t seconds{};
@@ -37,6 +41,7 @@ std::string parent(std::string_view value);
 std::string name(std::string_view value);
 std::string join(std::string_view base, std::string_view child);
 bool inside(std::string_view value, std::string_view base);
+bool backupControl(std::string_view value);
 bool validPath(std::string_view value, bool user = true);
 bool representable(std::string_view value);
 std::string uuid();
@@ -66,6 +71,8 @@ private:
 class Tree {
 public:
     explicit Tree(fs::path root);
+    Tree withControl(const fs::path& storage) const;
+    bool separateControl() const { return static_cast<bool>(control_); }
     const fs::path& root() const { return root_; }
     const Stamp& identity() const { return identity_; }
     void check() const;
@@ -85,9 +92,12 @@ public:
     void writeDocument(std::string_view relative, std::string_view data, bool replace = false) const;
     void metadata(std::string_view relative, Time modified, Time created, uint32_t attributes, bool readOnly = false) const;
     void flushDirectory(std::string_view relative = {}) const;
+    void hide(std::string_view relative) const;
 private:
+    std::pair<const Tree*, std::string_view> route(std::string_view relative) const;
     fs::path root_;
     Stamp identity_;
+    std::shared_ptr<const Tree> control_;
 };
 
 struct Volume {
