@@ -46,9 +46,9 @@ struct BackupGeniusApp: App {
         MenuBarExtra {
             MenuControls(model: model)
         } label: {
-            Label("Backup Genius", systemImage: model.progress.state == .needsAttention ?
+            Label("Backup Genius", systemImage: model.displayedProgress.state == .needsAttention ?
                   "externaldrive.badge.exclamationmark" : "externaldrive")
-                .accessibilityLabel("Backup Genius，\(model.progress.state.title)")
+                .accessibilityLabel("Backup Genius，\(model.displayedProgress.state.title)")
         }
         .menuBarExtraStyle(.menu)
 
@@ -377,7 +377,7 @@ struct MenuControls: View {
     let model: AppModel
 
     var body: some View {
-        Text(model.progress.state.title)
+        Text(model.displayedProgress.state.title)
         if let job = model.job {
             Text("\(model.volume?.name ?? job.volumeName) · \(job.format.name)")
         }
