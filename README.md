@@ -46,7 +46,7 @@ Windows 卷测试使用独立的 VHDX。日常备份以普通用户身份运行�
 ## 验证
 
 - [磁盘协议 v2](Protocol/README.md) 描述 Swift 和 C++ 共用的格式和接管规则。
-- [Mac 基线性能](Reports/Performance.md) 记录 APFS 与 exFAT 虚拟卷实测。
+- [Mac 性能报告](Reports/Performance.md) 记录 APFS 与 exFAT 的 10 万小文件虚拟卷实测。
 - [跨平台验证](Reports/Cross-platform.md) 区分本地、GitHub Actions 和实机验证。
 - GitHub Actions 构建三套包，交换两个引擎生成的中断事务。版本标签触发预览包和 SHA-256 校验文件发布。
 
