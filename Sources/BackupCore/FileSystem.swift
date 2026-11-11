@@ -580,6 +580,46 @@ struct VolumeLocation {
 }
 
 public extension VolumeInfo {
+    // Cached mount flags and Disk Arbitration IDs avoid opening unrelated
+    // filesystems, including automounts that may wait for a remote server.
+    internal static func matchingMounts(_ identifier: String, format: DiskFormat? = nil) -> [URL] {
+        let count = getfsstat(nil, 0, MNT_NOWAIT)
+        guard count >= 0, let session = DASessionCreate(kCFAllocatorDefault) else { return [] }
+        var entries = Array<Darwin.statfs>(repeating: Darwin.statfs(), count: Int(count) + 4)
+        let bytes = Int32(clamping: entries.count * MemoryLayout<statfs>.stride)
+        let found = getfsstat(&entries, bytes, MNT_NOWAIT)
+        guard found > 0 else { return [] }
+        var mounts: [URL] = []
+        for var entry in entries.prefix(Int(found)) {
+            guard entry.f_flags & UInt32(MNT_LOCAL) != 0, entry.f_flags & UInt32(MNT_RDONLY) == 0 else { continue }
+            let type = withUnsafeBytes(of: &entry.f_fstypename) {
+                String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            guard let actualFormat = DiskFormat(rawValue: type.lowercased()),
+                  format == nil || actualFormat == format else { continue }
+            let device = withUnsafeBytes(of: &entry.f_mntfromname) {
+                String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            let disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, device)
+            let description = disk.flatMap { DADiskCopyDescription($0) } as? [String: Any]
+            let diskUUID = description?[kDADiskDescriptionVolumeUUIDKey as String]
+            let uuid: String? = diskUUID.flatMap { value in
+                guard CFGetTypeID(value as CFTypeRef) == CFUUIDGetTypeID() else { return nil }
+                return CFUUIDCreateString(kCFAllocatorDefault, (value as! CFUUID)) as String
+            }
+            let mediaUUID = description?[kDADiskDescriptionMediaUUIDKey as String] as? UUID
+            let media = mediaUUID?.uuidString
+            guard identifier.isEmpty || [uuid, media].contains(where: {
+                $0?.caseInsensitiveCompare(identifier) == .orderedSame
+            }) else { continue }
+            let mount = withUnsafeBytes(of: &entry.f_mntonname) {
+                String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            mounts.append(URL(fileURLWithPath: mount, isDirectory: true))
+        }
+        return mounts
+    }
+
     static func inspect(_ folder: URL) throws -> Self {
         let root = try Tree(folder.resolvingSymlinksInPath())
         let location = try VolumeLocation(root.root)

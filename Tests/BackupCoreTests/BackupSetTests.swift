@@ -53,6 +53,18 @@ private final class SetFault: @unchecked Sendable {
 }
 
 extension BackupCoreTests {
+    @Test("Mount discovery matches disk identity before opening a filesystem",
+          .enabled(if: ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_APFS"] != nil &&
+                   ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_EXFAT"] != nil))
+    func mountedDriveLookup() throws {
+        for format in [DiskFormat.apfs, .exfat] {
+            let path = try #require(ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_\(format.rawValue.uppercased())"])
+            let volume = try VolumeInfo.inspect(URL(filePath: path))
+            #expect(VolumeInfo.matchingMounts(volume.identifier, format: format).contains { $0.path == volume.mount.path })
+            #expect(VolumeInfo.matchingMounts(UUID().uuidString, format: format).isEmpty)
+        }
+    }
+
     private func copySetFixture(_ source: URL, to target: URL) throws {
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
         for url in try FileManager.default.contentsOfDirectory(at: source, includingPropertiesForKeys: [.isDirectoryKey])

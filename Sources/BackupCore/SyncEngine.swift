@@ -28,7 +28,7 @@ final class Scope: @unchecked Sendable {
     static func resolving(_ bookmark: Data?, fallback: URL) -> Scope {
         if let bookmark {
             var stale = false
-            for options: URL.BookmarkResolutionOptions in [[.withSecurityScope, .withoutUI], [.withoutUI]] {
+            for options: URL.BookmarkResolutionOptions in [[.withSecurityScope, .withoutUI, .withoutMounting], [.withoutUI, .withoutMounting]] {
                 if let url = try? URL(resolvingBookmarkData: bookmark, options: options, relativeTo: nil,
                                       bookmarkDataIsStale: &stale) { return Scope(url) }
             }
@@ -518,6 +518,8 @@ public final class SyncEngine: @unchecked Sendable {
             let disk = try Tree(volume.mount.resolvingSymlinksInPath())
             return (try Repository.memberTree(on: disk, folder: job.targetRelativePath, job: job.id, volume: volume), volume)
         }
+        let mounts = VolumeInfo.matchingMounts(job.volumeID, format: testFormat == nil ? job.format : nil)
+        guard !mounts.isEmpty else { return nil }
         // The retained scope may still name the old mount point after a volume rename.
         let primary = scoped(job.targetBookmark, fallback: job.target)
         let diskAccess = job.storageBookmark.map { scoped($0, fallback: job.target) }
@@ -525,13 +527,10 @@ public final class SyncEngine: @unchecked Sendable {
         if let retained = targetScope?.url.resolvingSymlinksInPath(), !candidates.contains(retained) {
             candidates.append(retained)
         }
-        if let mounts = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeIsLocalKey], options: []) {
-            for mount in mounts {
-                if (try? mount.resourceValues(forKeys: [.volumeIsLocalKey]).volumeIsLocal) == false { continue }
-                let path = job.targetRelativePath.isEmpty ? mount : mount.appending(path: job.targetRelativePath)
-                let resolved = path.resolvingSymlinksInPath()
-                if !candidates.contains(resolved) { candidates.append(resolved) }
-            }
+        for mount in mounts {
+            let path = job.targetRelativePath.isEmpty ? mount : mount.appending(path: job.targetRelativePath)
+            let resolved = path.resolvingSymlinksInPath()
+            if !candidates.contains(resolved) { candidates.append(resolved) }
         }
         var errorAtKnownLocation: Error?
         for candidate in candidates {

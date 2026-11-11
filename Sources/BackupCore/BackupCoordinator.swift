@@ -255,8 +255,9 @@ public actor BackupCoordinator {
 
     private func resolve(_ binding: Binding) -> (Scope, VolumeInfo)? {
         let access = Scope.resolving(binding.bookmark, fallback: binding.mount)
-        let mounts = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: []) ?? []
-        for path in [access.url] + mounts {
+        let mounts = VolumeInfo.matchingMounts(binding.volumeID, format: sets[binding.id]?.format)
+        guard !mounts.isEmpty else { return nil }
+        for path in mounts {
             if let info = try? VolumeInfo.inspect(path), info.identifier.caseInsensitiveCompare(binding.volumeID) == .orderedSame {
                 return (access, info)
             }
