@@ -24,6 +24,7 @@ public:
     ~DirectoryWatch();
     Changes take();
     bool alive() const;
+    std::optional<fs::path> location() const;
 private:
     struct State;
     std::unique_ptr<State> state_;

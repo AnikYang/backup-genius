@@ -27,5 +27,7 @@
     <ClCompile Include="$(MSBuildThisFileDirectory)Core\Store.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)Core\Watch.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)Core\Engine.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)Core\BackupSet.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)Core\Coordinator.cpp" />
   </ItemGroup>
 </Project>

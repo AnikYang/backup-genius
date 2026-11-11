@@ -19,6 +19,9 @@ struct DirectoryWatch::State {
     std::mutex mutex;
     Changes changes;
     std::atomic_bool active{false};
+#ifdef _WIN32
+    HANDLE folder{INVALID_HANDLE_VALUE};
+#endif
     std::jthread thread;
 };
 DirectoryWatch::DirectoryWatch(const fs::path& root) : state_(std::make_unique<State>()) {
@@ -34,6 +37,10 @@ DirectoryWatch::DirectoryWatch(const fs::path& root) : state_(std::make_unique<S
         if (h == INVALID_HANDLE_VALUE) { firstRead.set_value(); return; }
         auto event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!event) { CloseHandle(h); firstRead.set_value(); return; }
+        {
+            std::lock_guard lock(state->mutex);
+            state->folder = h;
+        }
         alignas(DWORD) std::array<unsigned char, 65536> buffer{};
         bool starting = true;
         while (!stop.stop_requested()) {
@@ -89,6 +96,7 @@ DirectoryWatch::DirectoryWatch(const fs::path& root) : state_(std::make_unique<S
         {
             std::lock_guard lock(state->mutex);
             state->changes.full = true;
+            state->folder = INVALID_HANDLE_VALUE;
         }
         CloseHandle(event);
         CloseHandle(h);
@@ -104,6 +112,22 @@ Changes DirectoryWatch::take() {
     return std::exchange(state_->changes, {});
 }
 bool DirectoryWatch::alive() const { return state_->active; }
+std::optional<fs::path> DirectoryWatch::location() const {
+#ifdef _WIN32
+    std::lock_guard lock(state_->mutex);
+    if (state_->folder != INVALID_HANDLE_VALUE) {
+        std::wstring buffer(32768, L'\0');
+        const auto count = GetFinalPathNameByHandleW(state_->folder, buffer.data(), static_cast<DWORD>(buffer.size()), FILE_NAME_NORMALIZED);
+        if (count && count < buffer.size()) {
+            buffer.resize(count);
+            if (buffer.starts_with(L"\\\\?\\UNC\\")) buffer.replace(0, 8, L"\\\\");
+            else if (buffer.starts_with(L"\\\\?\\")) buffer.erase(0, 4);
+            return fs::path(buffer);
+        }
+    }
+#endif
+    return {};
+}
 
 #ifdef _WIN32
 namespace {

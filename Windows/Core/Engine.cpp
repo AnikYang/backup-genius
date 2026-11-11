@@ -24,6 +24,7 @@ struct Prepared {
     Bytes oldHashes;
     Patch patch;
     int64_t read{}, targetRead{}, written{}, patchBytes{};
+    int64_t sourceRequests{}, targetRequests{}, writeRequests{};
     bool archive{}, retry{};
     std::string issue;
 };
@@ -49,15 +50,19 @@ bool exactName(const Tree& tree, const std::string& rel) {
 void setMeta(const Tree& tree, std::string_view rel, const Json& attrs) {
     tree.metadata(rel, decodeTime(attrs.at("modified")), decodeTime(attrs.at("birth")), attrs.value("windows", uint32_t{}));
 }
+}
 Json jobJSON(const BackupJob& job) {
     return {{"id", job.id}, {"volume", job.volume}, {"format", job.format}, {"relative", job.relative},
         {"sourceId", job.sourceId}, {"source", utf8(job.source)}, {"target", utf8(job.target)},
-        {"automatic", job.automatic}, {"restoreOnly", job.restoreOnly}};
+        {"automatic", job.automatic}, {"restoreOnly", job.restoreOnly}, {"set", job.set},
+        {"ejectAfterBackup", job.ejectAfterBackup}};
 }
 BackupJob loadJob(const Json& j) {
     return {identifier(j.at("id")), j.at("volume"), j.at("format"), j.at("relative"), j.at("sourceId"),
-        path(j.at("source").get<std::string>()), path(j.at("target").get<std::string>()), j.at("automatic"), j.at("restoreOnly")};
+        path(j.at("source").get<std::string>()), path(j.at("target").get<std::string>()), j.at("automatic"), j.at("restoreOnly"),
+        j.value("set", ""), j.value("ejectAfterBackup", false)};
 }
+namespace {
 void validateFolders(const fs::path& source, const fs::path& target, const fs::path& storage) {
     const auto a = folded(utf8(source)), b = folded(utf8(target)), c = folded(utf8(storage));
     require(!inside(a, b) && !inside(b, a) && !inside(a, c) && !inside(c, a) && !inside(b, c) && !inside(c, b),
@@ -105,7 +110,8 @@ Json makeEdit(std::string method, std::string rel, const std::optional<Stamp>& b
     return edit;
 }
 
-Prepared prepare(const Work& work, const Tree& source, const Tree& target, const Tree& scratch) {
+Prepared prepare(const Work& work, const Tree& source, const Tree& target, const Tree& scratch,
+                 const IOProfile& profile, bool adoptExisting) {
     Prepared result;
     const auto& rel = work.path;
     if (!validPath(rel) || !representable(rel) || (work.source && work.source->kind == Kind::unsupported)) {
@@ -155,7 +161,8 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
         return result;
     }
     const auto stamp = *work.source;
-    if (actual && (work.old.is_null() || link(work.old))) {
+    const bool adopting = actual && work.old.is_null();
+    if (actual && (link(work.old) || (adopting && (!adoptExisting || !exactName(target, rel) || stamp.kind == Kind::link)))) {
         result.issue = "目标位置已有未管理文件";
         return result;
     }
@@ -177,7 +184,7 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
     }
     if (stamp.kind == Kind::directory) {
         auto next = recipe(rel, stamp, {}, work.old);
-        if (actual && !work.old.is_null() && work.old.value("sharedDirectory", false)) next["sharedDirectory"] = true;
+        if (adopting || (actual && !work.old.is_null() && work.old.value("sharedDirectory", false))) next["sharedDirectory"] = true;
         if (actual && stable(observeSource, stamp) && stable(observeTarget, *actual)) return result;
         if (!actual) {
             const auto stage = uuid();
@@ -190,19 +197,21 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
             next["target"] = portableStamp(*actual);
             result.edit = makeEdit("record", rel, actual, next);
         }
-        result.edit["activity"] = activity(work.old.is_null() ? "added" : "updated", rel);
+        if (!adopting) result.edit["activity"] = activity(work.old.is_null() ? "added" : "updated", rel);
         return result;
     }
 
-    auto input = source.file(rel);
+    const bool sourceTrusted = !work.old.is_null() && !(work.flags & contentChange) && stable(observeSource, stamp);
+    const bool sequential = !sourceTrusted || !actual;
+    auto input = source.file(rel, File::Mode::read, sequential && stamp.size >= static_cast<int64_t>(profile.sourceWindow));
     require(input.stamp() == stamp, "读取前源文件已变化");
     Bytes targetHashes;
     if (actual) {
-        targetHashes = work.checkTarget || !stable(observeTarget, *actual) ?
-            hashFile(target.file(rel), actual->size, &result.targetRead) : unbase64(work.old.at("hashes").get<std::string>());
+        targetHashes = adopting || work.checkTarget || !stable(observeTarget, *actual) ?
+            hashFile(target.file(rel, File::Mode::read, true), actual->size, &result.targetRead,
+                     profile.targetWindow, &result.targetRequests) : unbase64(work.old.at("hashes").get<std::string>());
         require(target.entry(rel) == actual, "读取时目标文件已变化");
     }
-    const bool sourceTrusted = !work.old.is_null() && !(work.flags & contentChange) && stable(observeSource, stamp);
     const auto cachedHashes = sourceTrusted ? unbase64(work.old.at("hashes").get<std::string>()) : Bytes{};
     Bytes hashes;
     std::optional<File> output;
@@ -210,38 +219,51 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
     const auto location = join(stagePath, stage);
     const auto spool = scratch.checked(stage);
     auto rollbackBlocks = Json::array();
+    result.patch.window = profile.targetWindow;
     try {
         if (!actual) output.emplace(target.file(location, File::Mode::create));
-        for (int64_t offset = 0; offset < stamp.size;) {
-            const auto length = static_cast<size_t>(std::min(blockSize, stamp.size - offset));
+        const auto visit = [&](int64_t offset, size_t length, std::string_view data) {
             const auto i = static_cast<size_t>(offset / blockSize * 32);
-            Bytes data;
-            Bytes hash;
-            if (sourceTrusted) hash = cachedHashes.substr(i, 32);
-            else {
-                data = input.read(offset, length);
-                result.read += static_cast<int64_t>(data.size());
-                hash = sha256(data);
+            const auto hash = data.empty() ? cachedHashes.substr(i, 32) : sha256(data);
+            if (sourceTrusted && !data.empty()) {
+                require(hash == std::string_view(cachedHashes).substr(i, 32), "源文件内容已变化");
             }
             hashes += hash;
-            if (!actual || i >= targetHashes.size() || hash != std::string_view(targetHashes).substr(i, 32)) {
+            if (actual && (i >= targetHashes.size() || hash != std::string_view(targetHashes).substr(i, 32))) {
+                Bytes sparse;
                 if (data.empty()) {
-                    data = input.read(offset, length);
-                    result.read += static_cast<int64_t>(data.size());
+                    sparse = input.read(offset, length);
+                    data = sparse;
+                    result.read += static_cast<int64_t>(length);
+                    ++result.sourceRequests;
                     require(sha256(data) == hash, "源文件内容已变化");
+                }
+                if (!output) output.emplace(spool, File::Mode::create);
+                output->write(result.patchBytes, data);
+                result.patchBytes += static_cast<int64_t>(length);
+                result.patch.blocks.push_back(offset / blockSize);
+                if (offset < actual->size) rollbackBlocks.push_back(offset / blockSize);
+            }
+        };
+        if (sequential) {
+            for (int64_t offset = 0; offset < stamp.size;) {
+                const auto data = input.read(offset, static_cast<size_t>(std::min<int64_t>(profile.sourceWindow, stamp.size - offset)));
+                result.read += static_cast<int64_t>(data.size());
+                ++result.sourceRequests;
+                for (size_t start = 0; start < data.size(); start += blockSize) {
+                    const auto block = std::string_view(data).substr(start, blockSize);
+                    visit(offset + static_cast<int64_t>(start), block.size(), block);
                 }
                 if (!actual) {
                     output->write(offset, data);
-                    result.written += static_cast<int64_t>(length);
-                } else {
-                    if (!output) output.emplace(spool, File::Mode::create);
-                    output->write(result.patchBytes, data);
-                    result.patchBytes += static_cast<int64_t>(length);
-                    result.patch.blocks.push_back(offset / blockSize);
-                    if (offset < actual->size) rollbackBlocks.push_back(offset / blockSize);
+                    result.written += static_cast<int64_t>(data.size());
+                    ++result.writeRequests;
                 }
+                offset += static_cast<int64_t>(data.size());
             }
-            offset += static_cast<int64_t>(length);
+        } else {
+            for (int64_t offset = 0; offset < stamp.size; offset += blockSize)
+                visit(offset, static_cast<size_t>(std::min(blockSize, stamp.size - offset)), {});
         }
         require(input.stamp() == stamp && source.entry(rel) == stamp, "等待文件稳定");
         auto next = recipe(rel, stamp, hashes, work.old);
@@ -257,10 +279,10 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
         next["target"] = portableStamp(*actual);
         auto original = oldRecord(target, work, *actual, targetHashes);
         const bool bytesDiffer = result.patchBytes != 0 || actual->size != stamp.size;
-        const auto expectedTarget = work.old.value("target", Json(nullptr));
-        const bool metadataChanged = work.old.at("attributes") != next.at("attributes") ||
+        const auto expectedTarget = adopting ? Json(nullptr) : work.old.value("target", Json(nullptr));
+        const bool metadataChanged = !adopting && (work.old.at("attributes") != next.at("attributes") ||
             (work.checkTarget && expectedTarget.is_object() &&
-             decodeTime(expectedTarget.at("modified")) != actual->modified);
+             decodeTime(expectedTarget.at("modified")) != actual->modified));
         if (bytesDiffer) {
             output.reset();
             if (result.patchBytes) result.patch.spool = spool;
@@ -269,6 +291,10 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
         } else if (metadataChanged) {
             result.edit = makeEdit("attributes", rel, actual, next);
             result.edit["originalAttributes"] = attributes(*actual);
+        } else if (adopting) {
+            result.edit = makeEdit("record", rel, actual, next);
+            result.edit["activity"] = activity("verified", rel, 0, "内容一致，已沿用硬盘上的文件");
+            return result;
         } else {
             return result;
         }
@@ -293,8 +319,9 @@ struct SyncEngine::Draft {
     Records local, disk;
 };
 
-SyncEngine::SyncEngine(fs::path storage, Progress update, bool allowInternal, Fault fault)
-    : storage_(std::move(storage)), notify_(std::move(update)), fault_(std::move(fault)), allowInternal_(allowInternal) {}
+SyncEngine::SyncEngine(fs::path storage, Progress update, bool allowInternal, Fault fault, std::string host)
+    : storage_(std::move(storage)), notify_(std::move(update)), fault_(std::move(fault)),
+      host_(std::move(host)), allowInternal_(allowInternal) {}
 SyncEngine::~SyncEngine() = default;
 void SyncEngine::publish(bool force) {
     auto time = Clock::now();
@@ -309,7 +336,7 @@ void SyncEngine::start() {
     storage_ = fs::canonical(storage_);
     settings_ = std::make_unique<Index>(storage_ / "settings.sqlite");
     auto savedHost = settings_->get("settings", "host");
-    host_ = savedHost.is_null() ? uuid() : identifier(savedHost);
+    if (host_.empty()) host_ = savedHost.is_null() ? uuid() : identifier(savedHost);
     settings_->put("settings", "host", host_);
     const auto job = settings_->get("settings", "job");
     if (!job.is_null()) {
@@ -330,6 +357,7 @@ void SyncEngine::setJob(BackupJob job) {
     paused_ = false;
     suppress_ = false;
     sourceGap_ = true;
+    sourceDevice_.reset();
     verifyAttempted_ = false;
 }
 void SyncEngine::saveJob() { settings_->put("settings", "job", jobJSON(view_.job)); }
@@ -370,6 +398,69 @@ Tree SyncEngine::sourceTree() const {
     require(tree.identity().identity == view_.job.sourceId, "源文件夹已替换，请重新选择");
     return tree;
 }
+fs::path SyncEngine::memberSource() const {
+    if (!view_.job.set.empty() && !view_.job.source.empty()) {
+        if (sourceWatch_) {
+            if (const auto resolved = sourceWatch_->location()) {
+                const Tree candidate(*resolved);
+                if (candidate.identity().identity == view_.job.sourceId) return candidate.root();
+            }
+        }
+    }
+    try {
+        const auto root = sourceTree().root();
+#ifndef _WIN32
+        return fs::canonical(root);
+#else
+        return root;
+#endif
+    } catch (...) {}
+    if (!view_.job.set.empty() && !view_.job.source.empty()) {
+        const Tree parent(view_.job.source.parent_path());
+        for (const auto& entry : parent.children()) {
+            const auto stamp = parent.entry(entry);
+            if (stamp && stamp->kind == Kind::directory && stamp->identity == view_.job.sourceId)
+                return parent.root() / path(entry);
+        }
+    }
+    throw std::runtime_error("源文件夹已移动、断开或被替换");
+}
+
+void SyncEngine::installMember(BackupJob job) {
+    start();
+    setJob(std::move(job));
+    saveJob();
+    publish(true);
+}
+
+void SyncEngine::bindMember(std::optional<Volume> volume, std::string relative, const fs::path& source) {
+    if (view_.job.set.empty()) return;
+    auto& job = view_.job;
+    const auto old = job.relative;
+    if (!relative.empty()) job.relative = std::move(relative);
+    if (mappedVolume_.has_value() != volume.has_value() ||
+        (mappedVolume_ && volume && mappedVolume_->mount != volume->mount) || old != job.relative) {
+        repo_.reset();
+        targetWatch_.reset();
+        view_.volume.reset();
+    }
+    if (volume && !mappedVolume_) suppress_ = false;
+    mappedVolume_ = std::move(volume);
+    const auto target = mappedVolume_ && representable(job.relative) ? mappedVolume_->mount / path(job.relative) : job.target;
+    if (!source.empty() && job.source != source) {
+        job.source = source;
+        sourceWatch_.reset();
+        sourceDevice_.reset();
+        sourceGap_ = true;
+        saveJob();
+    }
+    if (target != job.target || old != job.relative) {
+        job.target = target;
+        saveJob();
+    }
+    try { refresh(); } catch (const std::exception& e) { fail(e); }
+    publish(true);
+}
 bool SyncEngine::requiresTakeover() {
     return repo_ && !view_.job.restoreOnly && (repo_->marker.at("version") != 2 || repo_->owner != host_ ||
         index_->get("meta", "binding") != view_.job.sourceId || !index_->get("meta", "alignment").is_null());
@@ -395,11 +486,17 @@ void SyncEngine::refresh() {
             return;
         }
     }
+    if (!view_.job.set.empty() && !mappedVolume_) {
+        view_.progress.state = SyncState::disconnected;
+        view_.progress.message.clear();
+        return;
+    }
     if (suppress_) {
         if (findVolume(view_.job.volume)) return;
         suppress_ = false;
     }
-    fs::path target = view_.job.target;
+    if (mappedVolume_) require(representable(view_.job.relative), "备份文件夹名称需在 Mac 上打开");
+    fs::path target = mappedVolume_ ? mappedVolume_->mount / path(view_.job.relative) : view_.job.target;
     auto attached = [&] {
         try { return inspect(target).id == view_.job.volume && fs::is_directory(target); }
         catch (...) { return false; }
@@ -413,8 +510,8 @@ void SyncEngine::refresh() {
         view_.progress.message.clear();
         return;
     }
-    Tree tree(target);
-    auto volume = inspect(target);
+    auto volume = mappedVolume_ ? *mappedVolume_ : inspect(target);
+    Tree tree = mappedVolume_ ? Repository::member(Tree(volume.mount), view_.job.relative, view_.job.id) : Tree(target);
     require(allowInternal_ || (volume.external && volume.format == view_.job.format), "目标卷与登记的硬盘不符");
     require(identifier(Repository::readMarker(tree).at("job")) == view_.job.id, "备份位置属于另一任务");
     auto repo = std::make_unique<Repository>(std::move(tree), *index_, host_, fault_);
@@ -457,7 +554,17 @@ void SyncEngine::setAutomatic(bool value) {
     if (!view_.job.id.empty()) saveJob();
     publish(true);
 }
-void SyncEngine::poll() {
+void SyncEngine::setEjectAfterBackup(bool value) {
+    view_.job.ejectAfterBackup = value;
+    if (!view_.job.id.empty()) saveJob();
+    publish(true);
+}
+bool SyncEngine::hasPendingChanges() {
+    drain();
+    return index_ && (index_->count("sourceDirty") || index_->count("targetDirty") ||
+        index_->get("meta", "sourceFull") == true || index_->get("meta", "targetFull") == true);
+}
+std::optional<bool> SyncEngine::poll(bool automatic) {
     start();
     const auto previous = view_.progress.state;
     try {
@@ -477,6 +584,10 @@ void SyncEngine::poll() {
                 recordChanges({{}, true});
                 lastPollScan_ = time;
             }
+            if (!view_.job.set.empty()) {
+                try { sourceGap_ |= memberSource() != view_.job.source; }
+                catch (...) { if (view_.progress.state != SyncState::needsAttention) sourceGap_ = true; }
+            }
             const auto last = index_->get("meta", "lastVerify");
             const bool verify = !last.is_null() && now().seconds - integer(last) >= 7 * 86400 && !verifyAttempted_;
             if (view_.job.automatic && time - lastAttempt_ >= std::chrono::milliseconds(900) &&
@@ -484,11 +595,13 @@ void SyncEngine::poll() {
                  index_->get("meta", "sourceFull") == true || index_->get("meta", "targetFull") == true)) {
                 lastAttempt_ = time;
                 verifyAttempted_ = verify;
+                if (!automatic) return verify;
                 sync(verify);
             }
         }
         if (previous != view_.progress.state) publish(true);
     } catch (const std::exception& error) { fail(error); }
+    return {};
 }
 void SyncEngine::requestPause() { paused_ = true; }
 void SyncEngine::pause() {
@@ -524,6 +637,21 @@ void SyncEngine::safeEject() {
     suppress_ = true;
     paused_ = false;
     view_.progress.state = SyncState::disconnected;
+    publish(true);
+}
+void SyncEngine::releaseForEjection() {
+    refresh();
+    if (repo_) repo_->tree.flushDirectory();
+    targetWatch_.reset();
+    sourceWatch_.reset();
+    sourceGap_ = true;
+    repo_.reset();
+    mappedVolume_.reset();
+    view_.volume.reset();
+    view_.progress.state = SyncState::disconnected;
+    view_.progress.message.clear();
+    suppress_ = true;
+    paused_ = false;
     publish(true);
 }
 void SyncEngine::fail(const std::exception& error) {
@@ -562,8 +690,21 @@ SyncProgress SyncEngine::run(bool verify) {
     const auto scratch = Tree(storage_ / "scratch");
     const auto begun = Clock::now();
     auto& p = view_.progress;
+    if (!sourceDevice_) {
+        try { sourceDevice_ = inspect(source.root()).device; }
+        catch (...) { sourceDevice_ = StorageDeviceInfo{}; }
+    }
+    const auto medium = [&](const StorageDeviceInfo& device) {
+        const auto setting = media_.find(folded(device.id));
+        return setting == media_.end() ? device.medium : setting->second;
+    };
+    const IOProfile profile(medium(*sourceDevice_), medium(view_.volume->device));
+    repo_->ioProfile = profile;
+    view_.sourceDevice = sourceDevice_;
+    const bool adoptExisting = !view_.job.set.empty();
     const auto priorUnmanaged = p.unmanaged;
     p = {};
+    p.ioBufferBudget = static_cast<int64_t>(profile.bufferBudget());
     p.unmanaged = priorUnmanaged;
     p.state = verify ? SyncState::verifying : SyncState::checking;
     publish(true);
@@ -752,14 +893,14 @@ SyncProgress SyncEngine::run(bool verify) {
     if (p.planned) { p.state = SyncState::syncing; publish(true); }
     std::map<std::string, int> retry;
     for (const auto& [_, items] : waves) {
-        for (size_t offset = 0; offset < items.size(); offset += 128) {
+        for (size_t offset = 0; offset < items.size(); offset += IOProfile::batchSize) {
             if (paused_) throw Paused();
-            const auto count = std::min<size_t>(128, items.size() - offset);
+            const auto count = std::min(IOProfile::batchSize, items.size() - offset);
             std::vector<Prepared> results(count);
-            const auto workers = std::min<size_t>(view_.volume->solidState ? 4 : 1, count);
+            const auto workers = std::min(profile.workers, count);
             auto workStripe = [&](size_t worker) {
                 for (size_t i = worker; i < count; i += workers) {
-                    try { results[i] = prepare(items[offset + i], source, repo_->tree, scratch); }
+                    try { results[i] = prepare(items[offset + i], source, repo_->tree, scratch, profile, adoptExisting); }
                     catch (const std::system_error& e) {
                         results[i].issue = e.what();
                         results[i].retry = e.code().value() == 32 || e.code().value() == 33;
@@ -794,6 +935,9 @@ SyncProgress SyncEngine::run(bool verify) {
                 p.sourceRead += result.read;
                 p.targetRead += result.targetRead;
                 p.latestWritten += result.written;
+                p.sourceReadRequests += result.sourceRequests;
+                p.targetReadRequests += result.targetRequests;
+                p.latestWriteRequests += result.writeRequests;
                 if (!result.issue.empty()) {
                     index_->put("issue", item.path, activity("issue", item.path, 0, result.issue));
                     const auto prior = index_->get("retry", item.path);
@@ -836,6 +980,8 @@ SyncProgress SyncEngine::run(bool verify) {
                     const auto& item = items[offset + i];
                     const auto& result = results[i];
                     p.latestWritten += result.patchBytes;
+                    if (result.patchBytes && item.source)
+                        p.latestWriteRequests += static_cast<int64_t>(result.patch.writes(item.source->size).size());
                     index_->remove("issue", item.path);
                     index_->remove("retry", item.path);
                     if (item.source) {

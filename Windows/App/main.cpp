@@ -18,7 +18,7 @@
 #include <winrt/Microsoft.UI.Xaml.Markup.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 
-#include "../Core/Engine.h"
+#include "../Core/Coordinator.h"
 #include <algorithm>
 #include <condition_variable>
 #include <ctime>
@@ -117,22 +117,34 @@ bg::fs::path localData() {
     CoTaskMemFree(directory);
     return path / L"Backup Genius";
 }
-bg::fs::path selectFolder(HWND hwnd, std::wstring_view title) {
+std::vector<bg::fs::path> selectFolders(HWND hwnd, std::wstring_view title, bool multiple) {
     auto picker = create_instance<IFileOpenDialog>(CLSID_FileOpenDialog);
     check_hresult(picker->SetTitle(hstring(title).c_str()));
     DWORD options{};
     check_hresult(picker->GetOptions(&options));
-    check_hresult(picker->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST));
+    check_hresult(picker->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST |
+                                    (multiple ? FOS_ALLOWMULTISELECT : 0)));
     auto result = picker->Show(hwnd);
     if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) return {};
     check_hresult(result);
-    com_ptr<IShellItem> item;
-    check_hresult(picker->GetResult(item.put()));
-    PWSTR text{};
-    check_hresult(item->GetDisplayName(SIGDN_FILESYSPATH, &text));
-    bg::fs::path path(text);
-    CoTaskMemFree(text);
-    return path;
+    com_ptr<IShellItemArray> items;
+    check_hresult(picker->GetResults(items.put()));
+    DWORD count{};
+    check_hresult(items->GetCount(&count));
+    std::vector<bg::fs::path> paths;
+    for (DWORD i = 0; i < count; ++i) {
+        com_ptr<IShellItem> item;
+        check_hresult(items->GetItemAt(i, item.put()));
+        PWSTR text{};
+        check_hresult(item->GetDisplayName(SIGDN_FILESYSPATH, &text));
+        paths.emplace_back(text);
+        CoTaskMemFree(text);
+    }
+    return paths;
+}
+bg::fs::path selectFolder(HWND hwnd, std::wstring_view title) {
+    auto paths = selectFolders(hwnd, title, false);
+    return paths.empty() ? bg::fs::path{} : std::move(paths.front());
 }
 bool startupEnabled() {
     return RegGetValueW(HKEY_CURRENT_USER, startupPath, windowName, RRF_RT_REG_SZ, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
@@ -159,7 +171,7 @@ void startup(bool value) {
 
 class Worker {
 public:
-    using Task = std::function<void(bg::SyncEngine&)>;
+    using Task = std::function<void(bg::BackupCoordinator&)>;
     Worker(bg::fs::path storage, std::function<void(std::string)> error)
         : error_(std::move(error)), engine_(std::move(storage), [this](const bg::Presentation& value) {
               std::lock_guard lock(mutex_);
@@ -198,7 +210,7 @@ private:
     std::condition_variable wake_;
     std::deque<Task> tasks_;
     std::optional<bg::Presentation> latest_;
-    bg::SyncEngine engine_;
+    bg::BackupCoordinator engine_;
     std::jthread thread_;
 };
 
@@ -221,7 +233,10 @@ public:
         worker_ = std::make_unique<Worker>(localData(), [this](std::string message) {
             dispatcher_.TryEnqueue([this, message = std::move(message)] { error(wide(message)); });
         });
-        worker_->submit([](bg::SyncEngine& engine) { engine.start(); });
+        worker_->submit([this, atLogin](bg::BackupCoordinator& engine) {
+            engine.start();
+            if (!atLogin && engine.offerGuide()) dispatcher_.TryEnqueue([this] { setup(false); });
+        });
         timer_ = dispatcher_.CreateTimer();
         timer_.Interval(200ms);
         timer_.Tick([this](auto&&, auto&&) { if (auto value = worker_->take()) render(*value); });
@@ -254,7 +269,7 @@ private:
             }
             if (message == showMessage) { self->show(); return 0; }
             if (message == self->taskbarCreated_) self->addTray();
-            if (message == WM_DEVICECHANGE && self->worker_) self->worker_->submit([](bg::SyncEngine& engine) { engine.poll(); });
+            if (message == WM_DEVICECHANGE && self->worker_) self->worker_->submit([](auto& engine) { engine.volumesDidChange(); });
             if (message == WM_QUERYENDSESSION && self->worker_) self->worker_->interrupt();
             if (message == WM_GETMINMAXINFO) {
                 auto limits = reinterpret_cast<MINMAXINFO*>(l);
@@ -363,7 +378,7 @@ private:
         sync_ = command(L"立即同步", Symbol::Sync, [this] { worker_->submit([](auto& e) { e.sync(); }); });
         pause_ = command(L"暂停", Symbol::Pause, [this] { pause(); });
         eject_ = command(L"安全推出", Symbol::Upload, [this] { eject(); });
-        setup_ = command(L"设置备份…", Symbol::Setting, [this] { setup(false); }, true);
+        setup_ = command(L"新手引导…", Symbol::Setting, [this] { setup(false); }, true);
         open_ = command(L"打开已有备份…", Symbol::OpenFile, [this] { setup(true); }, true);
         verify_ = command(L"完整校验", Symbol::Find, [this] { worker_->submit([](auto& e) { e.sync(true); }); }, true);
         takeover_ = command(L"预览接管…", Symbol::Switch, [this] { takeover(); }, true);
@@ -372,8 +387,19 @@ private:
         alert_ = InfoBar();
         alert_.IsClosable(true);
         alert_.Margin({24, 0, 24, 0});
-        Grid::SetRow(alert_, 1);
-        page.Children().Append(alert_);
+        StackPanel controls;
+        controls.Children().Append(alert_);
+        folders_ = ComboBox();
+        folders_.Header(box_value(L"所属文件夹"));
+        folders_.Margin({24, 4, 24, 4});
+        folders_.SelectionChanged([this](auto&&, auto&&) {
+            const auto index = folders_.SelectedIndex();
+            if (rendering_ || index < 0 || static_cast<size_t>(index) >= folderIDs_.size()) return;
+            worker_->submit([id = folderIDs_[index]](auto& engine) { engine.select(id); });
+        });
+        controls.Children().Append(folders_);
+        Grid::SetRow(controls, 1);
+        page.Children().Append(controls);
         content_ = Grid();
         Grid::SetRow(content_, 2);
         page.Children().Append(content_);
@@ -402,7 +428,7 @@ private:
         content_.Children().Append(overview_);
         status_ = label(L"尚未设置备份", 32);
         AutomationProperties::SetAutomationId(status_, L"BackupStatus");
-        detail_ = label(L"选择一个文件夹及外置硬盘上的备份位置。");
+        detail_ = label(L"选择要备份的文件夹和外置硬盘。");
         statusProgress_ = ProgressBar();
         statusProgress_.Maximum(100);
         AutomationProperties::SetName(statusProgress_, L"同步进度");
@@ -416,7 +442,7 @@ private:
         StackPanel actions;
         actions.Orientation(Orientation::Horizontal);
         actions.Spacing(10);
-        configureButton_ = button(L"设置备份…", [this] { setup(false); });
+        configureButton_ = button(L"新手引导…", [this] { setup(false); });
         existingButton_ = button(L"打开已有备份…", [this] { setup(true); });
         takeoverButton_ = button(L"预览接管…", [this] { takeover(); });
         explorer_ = button(L"在文件资源管理器中打开", [this] { explore(view_.job.target); });
@@ -434,6 +460,39 @@ private:
             worker_->submit([on](auto& engine) { engine.setAutomatic(on); });
         });
         content.Children().Append(automatic_);
+        automaticEject_ = ToggleSwitch();
+        automaticEject_.Header(box_value(L"全部完成后自动推出硬盘"));
+        automaticEject_.Toggled([this](auto&&, auto&&) {
+            if (rendering_) return;
+            worker_->submit([enabled = automaticEject_.IsOn()](auto& engine) { engine.setEjectAfterBackup(enabled); });
+        });
+        content.Children().Append(automaticEject_);
+        enabled_ = ToggleSwitch();
+        enabled_.Header(box_value(L"启用此备份文件夹"));
+        enabled_.Toggled([this](auto&&, auto&&) {
+            if (rendering_) return;
+            worker_->submit([enabled = enabled_.IsOn()](auto& engine) { engine.setEnabled(enabled); });
+        });
+        content.Children().Append(enabled_);
+        for (const auto source : {false, true}) {
+            ComboBox picker;
+            picker.Header(box_value(source ? L"源硬盘类型" : L"备份硬盘类型"));
+            for (const auto* value : {L"自动", L"HDD", L"SSD"}) picker.Items().Append(box_value(hstring(value)));
+            picker.SelectedIndex(0);
+            picker.SelectionChanged([this, picker, source](auto&&, auto&&) {
+                if (rendering_ || picker.SelectedIndex() < 0) return;
+                worker_->submit([index = picker.SelectedIndex(), source](auto& engine) {
+                    std::optional<bg::StorageMedium> medium;
+                    if (index == 1) medium = bg::StorageMedium::hdd;
+                    if (index == 2) medium = bg::StorageMedium::ssd;
+                    engine.setMedium(medium, source);
+                });
+            });
+            content.Children().Append(picker);
+            if (source) sourceDiskType_ = picker; else diskType_ = picker;
+        }
+        folderStates_ = label(L"");
+        content.Children().Append(folderStates_);
         auto login = ToggleSwitch();
         login.Header(box_value(L"登录时启动"));
         login.IsOn(startupEnabled());
@@ -461,6 +520,13 @@ private:
         AutomationProperties::SetName(search_, L"搜索记录");
         search_.TextChanged([this](auto&&, auto&&) { renderRows(); });
         header.Children().Append(search_);
+        changeKind_ = ComboBox();
+        AutomationProperties::SetName(changeKind_, L"筛选变更类型");
+        for (const auto* value : {L"全部", L"新增", L"修改", L"移动", L"删除", L"失败"})
+            changeKind_.Items().Append(box_value(hstring(value)));
+        changeKind_.SelectedIndex(0);
+        changeKind_.SelectionChanged([this](auto&&, auto&&) { renderRows(); });
+        header.Children().Append(changeKind_);
         StackPanel controls;
         controls.Orientation(Orientation::Horizontal);
         controls.Spacing(10);
@@ -482,9 +548,10 @@ private:
     }
     void render(const bg::Presentation& presentation) {
         const auto previous = view_.progress.state;
+        const auto previousJob = view_.job.id;
         view_ = presentation;
         const auto& p = view_.progress;
-        const bool active = busy(p.state);
+        const bool active = view_.busy || busy(p.state);
         const bool configured = !view_.job.id.empty();
         const bool connected = view_.volume.has_value();
         using S = bg::SyncState;
@@ -497,6 +564,7 @@ private:
         else if (text.empty() && p.state == S::syncing) text = L"剩余 " + std::to_wstring(p.planned - p.processed) + L" 项";
         else if (text.empty() && p.state == S::upToDate) text = L"最新备份可用。";
         if (p.unmanaged) text += L"  硬盘有 " + std::to_wstring(p.unmanaged) + L" 个未管理项目。";
+        if (!view_.runningFolder.empty()) text = wide(view_.runningFolder) + L"  " + text;
         detail_.Text(text);
         statusProgress_.Visibility(active ? Visibility::Visible : Visibility::Collapsed);
         const bool determinate = p.state == S::syncing && p.planned > 0;
@@ -507,7 +575,9 @@ private:
             quantity(p.latestWritten) + L"  ·  历史写入 " + quantity(p.historyWritten) : L"");
         if (connected) {
             auto disk = *view_.volume;
-            disk_.Text(wide(disk.label.empty() ? bg::utf8(disk.mount) : disk.label) + L" · " + wide(view_.job.format));
+            const auto medium = disk.device.medium == bg::StorageMedium::ssd ? L"SSD" :
+                disk.device.medium == bg::StorageMedium::hdd ? L"HDD" : L"类型未知";
+            disk_.Text(wide(disk.label.empty() ? bg::utf8(disk.mount) : disk.label) + L" · " + wide(view_.job.format) + L" · " + medium);
             free_.Text(L"可用 " + quantity(static_cast<int64_t>(disk.free)));
             capacity_.Value(disk.total ? 100.0 * (disk.total - disk.free) / disk.total : 0);
         } else { disk_.Text(configured ? L"硬盘未连接" : L"尚未选择硬盘"); free_.Text(L""); }
@@ -529,19 +599,61 @@ private:
         restoreSelected_.IsEnabled(connected && !active && list_.SelectedIndex() >= 0);
         automatic_.Visibility(configured && !view_.job.restoreOnly ? Visibility::Visible : Visibility::Collapsed);
         rendering_ = true;
+        std::vector<std::string> ids, labels;
+        std::wstring states;
+        std::optional<bg::FolderMapping> selected;
+        for (const auto& folder : view_.folders) {
+            const auto label = folder.mapping ? folder.mapping->folder : bg::utf8(folder.job.target.filename());
+            ids.push_back(folder.job.id);
+            labels.push_back(label);
+            if (folder.job.id == view_.job.id) selected = folder.mapping;
+            if (folder.mapping && folder.job.set == view_.job.set) {
+                if (!states.empty()) states += L"\n";
+                states += wide(label) + L"   " + (folder.mapping->enabled ? std::wstring(title(folder.progress.state)) : L"已停用");
+            }
+        }
+        if (ids != folderIDs_ || labels != folderLabels_) {
+            folderIDs_ = ids;
+            folderLabels_ = labels;
+            std::vector<IInspectable> values;
+            for (const auto& label : labels) values.push_back(box_value(wide(label)));
+            folders_.ItemsSource(single_threaded_observable_vector<IInspectable>(std::move(values)));
+        }
+        const auto selectedIndex = std::find(ids.begin(), ids.end(), view_.job.id);
+        if (selectedIndex != ids.end()) folders_.SelectedIndex(static_cast<int32_t>(selectedIndex - ids.begin()));
+        folders_.Visibility(ids.size() > 1 || selected ? Visibility::Visible : Visibility::Collapsed);
+        folders_.IsEnabled(!active);
+        folderStates_.Text(states);
+        folderStates_.Visibility(states.empty() ? Visibility::Collapsed : Visibility::Visible);
+        automaticEject_.Visibility(configured && !view_.job.restoreOnly ? Visibility::Visible : Visibility::Collapsed);
+        automaticEject_.IsOn(view_.job.ejectAfterBackup);
+        enabled_.Visibility(selected ? Visibility::Visible : Visibility::Collapsed);
+        enabled_.IsOn(selected && selected->enabled);
+        enabled_.IsEnabled(connected && !active && !view_.job.restoreOnly && p.state != S::takeoverRequired);
+        diskType_.Visibility(connected ? Visibility::Visible : Visibility::Collapsed);
+        diskType_.IsEnabled(!active);
+        const auto choice = [](std::optional<bg::StorageMedium> medium) {
+            return medium ? (*medium == bg::StorageMedium::ssd ? 2 : 1) : 0;
+        };
+        diskType_.SelectedIndex(choice(view_.mediumOverride));
+        sourceDiskType_.Visibility(view_.sourceDevice ? Visibility::Visible : Visibility::Collapsed);
+        sourceDiskType_.IsEnabled(!active);
+        sourceDiskType_.SelectedIndex(choice(view_.sourceMediumOverride));
         automatic_.IsOn(configured && view_.job.automatic);
+        if (selected && !selected->enabled) { sync_.IsEnabled(false); verify_.IsEnabled(false); }
         rendering_ = false;
         auto tray = trayData();
         if (trayReady_) Shell_NotifyIconW(NIM_MODIFY, &tray);
-        if (page_ && previous != p.state && !active) loadRows();
+        if (page_ && (previousJob != view_.job.id || previous != p.state) && !active) loadRows();
     }
     void loadRows() {
         if (!worker_) return;
         const auto page = page_;
-        worker_->submit([this, page](auto& engine) {
+        const auto job = view_.job.id;
+        worker_->submit([this, page, job](auto& engine) {
             auto rows = page == 2 ? engine.history() : engine.activities();
-            dispatcher_.TryEnqueue([this, page, rows = std::move(rows)] {
-                if (page_ != page) return;
+            dispatcher_.TryEnqueue([this, page, job, rows = std::move(rows)] {
+                if (page_ != page || view_.job.id != job) return;
                 rows_ = rows;
                 renderRows();
             });
@@ -555,7 +667,11 @@ private:
         for (const auto& row : rows_) {
             auto path = row.value("path", "");
             if (!query.empty() && bg::folded(path).find(query) == std::string::npos) continue;
-            auto category = kind(row.value(page_ == 2 ? "reason" : "kind", ""));
+            const auto rawKind = row.value(page_ == 2 ? "reason" : "kind", "");
+            constexpr const char* kinds[] = {"", "added", "updated", "moved", "deleted", "issue"};
+            const auto filter = changeKind_.SelectedIndex();
+            if (filter > 0 && filter < 6 && rawKind != kinds[filter]) continue;
+            auto category = kind(rawKind);
             auto text = timestamp(row.at("date")) + L"   " + std::wstring(category) + L"   " + wide(path);
             if (page_ == 2) text += L"   " + quantity(row.value("size", int64_t{}));
             if (row.contains("detail")) text += L"\n" + wide(row.at("detail").get<std::string>());
@@ -568,56 +684,153 @@ private:
         if (dialogOpen_) co_return;
         dialogOpen_ = true;
         try {
-            ContentDialog dialog;
-            dialog.XamlRoot(root_.XamlRoot());
-            dialog.Title(box_value(existing ? L"打开已有备份" : L"设置备份"));
-            dialog.PrimaryButtonText(existing ? L"打开" : L"保存任务");
-            dialog.CloseButtonText(L"取消");
-            dialog.DefaultButton(ContentDialogButton::Primary);
-            dialog.IsPrimaryButtonEnabled(false);
-            bg::fs::path source, target;
-            StackPanel form;
-            form.Spacing(11);
-            auto sourceText = label(L"尚未选择源文件夹");
-            auto targetText = label(L"尚未选择硬盘目标文件夹");
-            if (!existing) {
-                form.Children().Append(button(L"选择源文件夹…", [&] {
-                    try {
-                        auto chosen = selectFolder(hwnd_, L"选择源文件夹");
-                        if (chosen.empty()) return;
-                        source = std::move(chosen);
-                        sourceText.Text(source.wstring());
-                        dialog.IsPrimaryButtonEnabled(!target.empty());
-                    } catch (const hresult_error& e) { error(e.message()); }
-                }));
-                form.Children().Append(sourceText);
+            if (existing) {
+                auto target = selectFolder(hwnd_, L"打开 BackupGenius 主目录或旧备份文件夹");
+                if (!target.empty()) worker_->submit([target](auto& engine) { engine.openExisting(target); });
+                dialogOpen_ = false;
+                co_return;
             }
-            form.Children().Append(button(L"选择硬盘目标文件夹…", [&] {
+            bg::fs::path disk;
+            std::vector<bg::fs::path> sources;
+            const wchar_t* steps[] = {L"选择备份硬盘", L"确认备份主目录", L"选择要备份的文件夹"};
+            for (int step = 0; step < 3;) {
+                ContentDialog dialog;
+                dialog.XamlRoot(root_.XamlRoot());
+                dialog.Title(box_value(hstring(steps[step])));
+                dialog.PrimaryButtonText(L"继续");
+                if (step > 0) dialog.SecondaryButtonText(L"上一步");
+                dialog.CloseButtonText(L"取消");
+                dialog.DefaultButton(ContentDialogButton::Primary);
+                StackPanel form;
+                form.Spacing(10);
+                if (step == 0) {
+                    auto selected = label(disk.empty() ? L"选择已连接的硬盘根目录。" : disk.wstring());
+                    dialog.IsPrimaryButtonEnabled(!disk.empty());
+                    form.Children().Append(selected);
+                    form.Children().Append(button(L"选择硬盘…", [&, selected, dialog] {
+                        try {
+                            auto chosen = selectFolder(hwnd_, L"选择外置硬盘根目录");
+                            if (chosen.empty()) return;
+                            disk = std::move(chosen);
+                            selected.Text(disk.wstring());
+                            dialog.IsPrimaryButtonEnabled(true);
+                        } catch (const hresult_error& e) { error(e.message()); }
+                    }));
+                } else if (step == 1) {
+                    form.Children().Append(label((disk / L"BackupGenius").wstring()));
+                    form.Children().Append(label(L"开始备份时，Backup Genius 会创建或打开这个主目录。"));
+                } else {
+                    ListView files;
+                    files.MaxHeight(255);
+                    AutomationProperties::SetName(files, L"选中的源文件夹");
+                    const auto update = [&, files, dialog] {
+                        files.Items().Clear();
+                        for (const auto& folder : sources) files.Items().Append(box_value(hstring(folder.wstring())));
+                        dialog.IsPrimaryButtonEnabled(!sources.empty());
+                    };
+                    update();
+                    form.Children().Append(files);
+                    form.Children().Append(button(L"添加文件夹…", [&, update] {
+                        try {
+                            for (auto folder : selectFolders(hwnd_, L"选择要备份的文件夹", true))
+                                if (std::find(sources.begin(), sources.end(), folder) == sources.end()) sources.push_back(std::move(folder));
+                            update();
+                        } catch (const hresult_error& e) { error(e.message()); }
+                    }));
+                    form.Children().Append(button(L"移除所选文件夹", [&, files, update] {
+                        const auto index = files.SelectedIndex();
+                        if (index >= 0 && static_cast<size_t>(index) < sources.size()) sources.erase(sources.begin() + index);
+                        update();
+                    }));
+                }
+                dialog.Content(form);
+                const auto result = co_await dialog.ShowAsync();
+                dialog.Content(nullptr);
+                if (result == ContentDialogResult::None) { dialogOpen_ = false; co_return; }
+                step += result == ContentDialogResult::Primary ? 1 : -1;
+            }
+            worker_->submit([this, disk, sources](auto& engine) {
                 try {
-                    auto chosen = selectFolder(hwnd_, L"选择外置硬盘上的目标文件夹");
-                    if (chosen.empty()) return;
-                    target = std::move(chosen);
-                    targetText.Text(target.wstring());
-                    dialog.IsPrimaryButtonEnabled(existing || !source.empty());
-                } catch (const hresult_error& e) { error(e.message()); }
-            }));
-            form.Children().Append(targetText);
-            ToggleSwitch automatic;
-            if (!existing) {
-                form.Children().Append(label(L"Windows → 外置硬盘 · 旧版保留 30 天"));
-                automatic.Header(box_value(L"连接后自动同步"));
-                automatic.IsOn(true);
-                form.Children().Append(automatic);
-            }
-            dialog.Content(form);
-            if (co_await dialog.ShowAsync() == ContentDialogResult::Primary) {
-                auto autoSync = automatic.IsOn();
-                worker_->submit([existing, source, target, autoSync](auto& engine) {
-                    if (existing) engine.openExisting(target); else engine.configure(source, target, autoSync);
-                });
-            }
+                    auto preview = engine.previewSetup(disk, sources);
+                    dispatcher_.TryEnqueue([this, preview = std::move(preview)] { reviewSetup(preview); });
+                } catch (const std::exception& e) {
+                    dispatcher_.TryEnqueue([this, message = std::string(e.what())] {
+                        dialogOpen_ = false;
+                        error(wide(message));
+                    });
+                }
+            });
+            co_return;
         } catch (const hresult_error& e) { error(e.message()); }
         dialogOpen_ = false;
+    }
+    fire_and_forget reviewSetup(bg::SetupPreview preview) {
+        try {
+            ContentDialog dialog;
+            dialog.XamlRoot(root_.XamlRoot());
+            dialog.Title(box_value(L"预览备份映射"));
+            dialog.PrimaryButtonText(L"开始备份");
+            dialog.SecondaryButtonText(L"重新选择");
+            dialog.CloseButtonText(L"取消");
+            dialog.DefaultButton(ContentDialogButton::Primary);
+            StackPanel form;
+            form.Spacing(10);
+            const auto medium = preview.volume.device.medium == bg::StorageMedium::ssd ? L"SSD" :
+                preview.volume.device.medium == bg::StorageMedium::hdd ? L"HDD" : L"类型未知";
+            form.Children().Append(label(wide(preview.volume.label) + L" · " + wide(preview.volume.format) + L" · " +
+                medium + L" · 可用 " + quantity(static_cast<int64_t>(preview.volume.free))));
+            std::map<std::string, TextBox> editors;
+            for (const auto& row : preview.rows) {
+                form.Children().Append(label(row.source.empty() ? wide(row.name) : row.source.wstring()));
+                if (!row.group.empty()) {
+                    TextBox group;
+                    group.Header(box_value(L"来源分组"));
+                    group.Text(wide(row.group));
+                    editors.emplace(row.id, group);
+                    form.Children().Append(group);
+                }
+                auto location = label(wide("BackupGenius/" + row.folder()));
+                if (editors.contains(row.id)) {
+                    editors.at(row.id).TextChanged([location, name = row.name](TextBox const& field, auto&&) {
+                        location.Text(wide("BackupGenius/" + bg::join(to_string(field.Text()), name)));
+                    });
+                }
+                form.Children().Append(location);
+                if (!row.previous.empty() && row.previous != row.folder())
+                    form.Children().Append(label(L"原备份位置  " + wide(row.previous)));
+            }
+            ToggleSwitch automatic, eject, login;
+            automatic.Header(box_value(L"连接后自动备份"));
+            automatic.IsOn(true);
+            eject.Header(box_value(L"全部完成后自动推出硬盘"));
+            eject.IsOn(true);
+            login.Header(box_value(L"登录时启动"));
+            login.IsOn(startupEnabled());
+            for (const auto& toggle : {automatic, eject, login}) form.Children().Append(toggle);
+            form.Children().Append(label(L"旧版保留 30 天"));
+            ScrollViewer scroll;
+            scroll.Content(form);
+            scroll.MaxHeight(450);
+            dialog.Content(scroll);
+            const auto result = co_await dialog.ShowAsync();
+            if (result == ContentDialogResult::Primary) {
+                std::map<std::string, std::string> groups;
+                for (const auto& [id, group] : editors) groups[id] = to_string(group.Text());
+                worker_->submit([this, id = preview.id, groups, autoSync = automatic.IsOn(), autoEject = eject.IsOn(),
+                                 loginEnabled = login.IsOn()](auto& engine) {
+                    engine.confirmSetup(id, groups, autoSync, autoEject);
+                    dispatcher_.TryEnqueue([this, loginEnabled] {
+                        try { if (startupEnabled() != loginEnabled) startup(loginEnabled); }
+                        catch (const hresult_error& e) { error(e.message()); }
+                    });
+                });
+            }
+            dialogOpen_ = false;
+            if (result == ContentDialogResult::Secondary) setup(false);
+        } catch (const hresult_error& e) {
+            dialogOpen_ = false;
+            error(e.message());
+        }
     }
     void takeover() {
         try {
@@ -749,18 +962,20 @@ private:
     Grid root_{nullptr}, content_{nullptr}, records_{nullptr};
     ScrollViewer overview_{nullptr};
     TextBlock disk_{nullptr}, free_{nullptr}, status_{nullptr}, detail_{nullptr}, route_{nullptr}, metrics_{nullptr}, recordTitle_{nullptr};
+    TextBlock folderStates_{nullptr};
     ProgressBar capacity_{nullptr}, statusProgress_{nullptr};
     AppBarButton sync_{nullptr}, pause_{nullptr}, eject_{nullptr}, setup_{nullptr}, open_{nullptr}, verify_{nullptr}, takeover_{nullptr};
     Button configureButton_{nullptr}, existingButton_{nullptr}, takeoverButton_{nullptr}, explorer_{nullptr};
     Button restoreCurrent_{nullptr}, restoreSelected_{nullptr};
-    ToggleSwitch automatic_{nullptr};
+    ToggleSwitch automatic_{nullptr}, automaticEject_{nullptr}, enabled_{nullptr};
+    ComboBox folders_{nullptr}, diskType_{nullptr}, sourceDiskType_{nullptr}, changeKind_{nullptr};
     InfoBar alert_{nullptr};
     ListView list_{nullptr};
     TextBox search_{nullptr};
     std::unique_ptr<Worker> worker_;
     bg::Presentation view_;
     bg::Json rows_ = bg::Json::array();
-    std::vector<std::string> visibleIDs_;
+    std::vector<std::string> visibleIDs_, folderIDs_, folderLabels_;
     int page_{};
     bool trayReady_{}, rendering_{}, dialogOpen_{}, quitting_{}, exiting_{};
 };

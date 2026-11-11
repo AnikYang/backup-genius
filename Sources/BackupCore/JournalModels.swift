@@ -59,6 +59,16 @@ struct Envelope: Codable {
     let body: Data
     let checksum: Data
 
+    init<T: Encodable>(document: T) throws {
+        body = try JSONEncoder().encode(document)
+        checksum = digest(body)
+    }
+
+    func document<T: Decodable>(_ type: T.Type) throws -> T {
+        guard digest(body) == checksum else { throw BackupError.message("备份记录校验失败") }
+        return try JSONDecoder().decode(type, from: body)
+    }
+
     init(_ batch: DiskBatch) throws {
         let encoder = JSONEncoder()
         if batch.version == 2 {

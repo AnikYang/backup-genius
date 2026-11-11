@@ -2,6 +2,7 @@
 
 #include "Store.h"
 #include "Watch.h"
+#include "BackupSet.h"
 #include <atomic>
 #include <chrono>
 
@@ -12,6 +13,7 @@ struct SyncProgress {
     SyncState state{SyncState::unconfigured};
     int64_t examined{}, planned{}, processed{}, skipped{}, tracked{}, unmanaged{}, issues{};
     int64_t sourceRead{}, targetRead{}, latestWritten{}, historyWritten{};
+    int64_t sourceReadRequests{}, targetReadRequests{}, latestWriteRequests{}, ioBufferBudget{};
     double checkingSeconds{}, elapsedSeconds{};
     std::string message, currentPath;
 };
@@ -20,12 +22,26 @@ struct BackupJob {
     fs::path source, target;
     bool automatic{true};
     bool restoreOnly{};
+    std::string set;
+    bool ejectAfterBackup{};
+};
+struct FolderStatus {
+    BackupJob job;
+    std::optional<FolderMapping> mapping;
+    SyncProgress progress;
 };
 struct Presentation {
     BackupJob job;
     std::optional<Volume> volume;
     SyncProgress progress;
+    std::vector<FolderStatus> folders;
+    std::string runningFolder;
+    bool busy{};
+    std::optional<StorageDeviceInfo> sourceDevice;
+    std::optional<StorageMedium> mediumOverride, sourceMediumOverride;
 };
+Json jobJSON(const BackupJob&);
+BackupJob loadJob(const Json&);
 enum class AlignmentKind { receive, send, conflict, blocked };
 enum class AlignmentChoice { local, disk, both };
 struct AlignmentChange {
@@ -44,13 +60,13 @@ using Progress = std::function<void(const Presentation&)>;
 // Calls other than requestPause are serialized on the application's worker.
 class SyncEngine {
 public:
-    explicit SyncEngine(fs::path storage, Progress = {}, bool allowInternal = false, Fault = {});
+    explicit SyncEngine(fs::path storage, Progress = {}, bool allowInternal = false, Fault = {}, std::string host = {});
     ~SyncEngine();
     void start();
     void configure(const fs::path& source, const fs::path& target, bool automatic);
     void openExisting(const fs::path& target);
     void setAutomatic(bool value);
-    void poll();
+    std::optional<bool> poll(bool automatic = true);
     SyncProgress sync(bool verify = false);
     void requestPause();
     void pause();
@@ -63,6 +79,16 @@ public:
     Json history();
     const Presentation& presentation() const { return view_; }
     void recordChanges(const Changes&, bool target = false);
+    void installMember(BackupJob);
+    void bindMember(std::optional<Volume>, std::string relative = {}, const fs::path& source = {});
+    fs::path memberSource() const;
+    bool hasPendingChanges();
+    void releaseForEjection();
+    void report(const std::exception& e) { fail(e); }
+    void clearPause() { paused_ = false; }
+    void allowReconnect() { suppress_ = false; }
+    void setEjectAfterBackup(bool value);
+    void setMedia(std::map<std::string, StorageMedium> values) { media_ = std::move(values); }
 private:
     struct Draft;
     void saveJob();
@@ -84,6 +110,9 @@ private:
     Progress notify_;
     Fault fault_;
     std::string host_;
+    std::optional<Volume> mappedVolume_;
+    std::map<std::string, StorageMedium> media_;
+    std::optional<StorageDeviceInfo> sourceDevice_;
     Presentation view_;
     bool allowInternal_, suppress_{}, sourceGap_{}, verifyAttempted_{};
     std::atomic_bool paused_{};

@@ -320,34 +320,37 @@ Json Repository::create(const Tree& tree, std::string format, std::string writer
     }
     return marker;
 }
-Repository::Repository(Tree target, Index& cache, std::string writer, Fault fault)
-    : tree(locate(target)), index(cache), host(std::move(writer)), fault_(std::move(fault)) {
-    auto p = tree.checked(join(control, "lock"));
-#ifdef _WIN32
-    auto h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                         OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (h == INVALID_HANDLE_VALUE) throw std::system_error(GetLastError(), std::system_category(), "打开备份锁");
-    OVERLAPPED range{};
-    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &range)) {
-        CloseHandle(h);
-        throw std::runtime_error("此备份正在另一个进程中使用");
-    }
-    lease_ = reinterpret_cast<intptr_t>(h);
-#else
-    auto fd = ::open(p.c_str(), O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
-    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        if (fd >= 0) close(fd);
-        throw std::runtime_error("此备份正在另一个进程中使用");
-    }
-    lease_ = fd;
-#endif
+Tree Repository::member(const Tree& disk, std::string_view folder, std::string_view job) {
+    (void)disk.checked(folder);
+    return Tree(disk.root() / path(folder)).withControl(disk.checked(join(storageFolder, job)));
 }
-Repository::~Repository() {
-#ifdef _WIN32
-    if (lease_ != -1) CloseHandle(reinterpret_cast<HANDLE>(lease_));
-#else
-    if (lease_ != -1) close(static_cast<int>(lease_));
-#endif
+void Repository::initializeMember(const Tree& disk, std::string_view folder, const Json& marker) {
+    const auto job = identifier(marker.at("job"));
+    disk.mkdir(join(storageFolder, job));
+    const auto tree = member(disk, folder, job);
+    for (const auto& dir : {journalPath, packPath, stagePath, versionsPath}) tree.mkdir(dir);
+    if (!tree.entry(markerPath)) tree.writeDocument(markerPath, marker.dump());
+    require(readMarker(tree).at("job") == job, "备份文件夹与记录不符");
+    tree.flushDirectory(control);
+    disk.flushDirectory(storageFolder);
+}
+Repository::Repository(Tree target, Index& cache, std::string writer, Fault fault)
+    : tree(locate(target)), index(cache), host(std::move(writer)), lease_(tree.checked(join(control, "lock"))), fault_(std::move(fault)) {}
+Repository::~Repository() = default;
+std::vector<std::pair<int64_t, size_t>> Patch::writes(int64_t size, bool splitFirst) const {
+    std::vector<std::pair<int64_t, size_t>> ranges;
+    for (const auto block : blocks) {
+        const auto offset = block * blockSize;
+        const auto length = static_cast<size_t>(std::min(blockSize, size - offset));
+        if (!ranges.empty() && (!splitFirst || ranges.size() > 1) &&
+            ranges.back().first + static_cast<int64_t>(ranges.back().second) == offset &&
+            ranges.back().second + length <= window) {
+            ranges.back().second += length;
+        } else {
+            ranges.emplace_back(offset, length);
+        }
+    }
+    return ranges;
 }
 std::string Repository::commitPath(int64_t gen) const {
     auto number = std::to_string(gen);
@@ -539,9 +542,8 @@ void Repository::apply(Json& edit, const std::unordered_map<std::string, Patch>&
         const auto size = integer(edit.at("next").at("source").at("size"));
         int64_t cursor = 0;
         bool first = true;
-        for (auto block : patch.blocks) {
-            auto offset = block * blockSize;
-            auto bytes = spool->read(cursor, static_cast<size_t>(std::min(blockSize, size - offset)));
+        for (const auto& [offset, length] : patch.writes(size, static_cast<bool>(fault_))) {
+            auto bytes = spool->read(cursor, length);
             dest.write(offset, bytes);
             cursor += static_cast<int64_t>(bytes.size());
             if (first && fault_) fault_(Interruption::firstBlock);
@@ -817,7 +819,9 @@ void PackWriter::add(std::string_view hash, std::string_view bytes) {
     auto key = base64(hash);
     if (locations_.contains(key)) return;
     if (!file_) file_.emplace(repo_.tree.file(join(packPath, id_), File::Mode::create));
-    file_->write(length_, bytes);
+    if (buffered_.size() + bytes.size() > repo_.ioProfile.targetWindow) flushBuffer();
+    if (buffered_.empty()) bufferedOffset_ = length_;
+    buffered_.append(bytes);
     locations_[key] = Json{{"hash", key}, {"pack", id_}, {"offset", length_}, {"length", bytes.size()}};
     length_ += static_cast<int64_t>(bytes.size());
 }
@@ -844,6 +848,7 @@ Json PackWriter::saveFile(const Tree& tree, std::string_view rel, const Stamp& s
     return base64(hashes);
 }
 Json PackWriter::finish() {
+    flushBuffer();
     if (file_) {
         file_->flush();
         file_.reset();
@@ -852,5 +857,11 @@ Json PackWriter::finish() {
     auto result = Json::array();
     for (const auto& [_, loc] : locations_) result.push_back(loc);
     return result;
+}
+void PackWriter::flushBuffer() {
+    if (!buffered_.empty()) {
+        file_->write(bufferedOffset_, buffered_);
+        buffered_.clear();
+    }
 }
 }

@@ -27,8 +27,9 @@ jobs:
         run: |
           mkdir -p dist
           export BACKUP_GENIUS_EXPORT_FIXTURE="$PWD/dist/swift-fixture"
+          export BACKUP_GENIUS_EXPORT_SET_FIXTURE="$PWD/dist/swift-set-fixture"
           Scripts/test-volumes.sh
-          (cd dist && zip -qr swift-fixture.zip swift-fixture)
+          (cd dist && zip -qr swift-fixture.zip swift-fixture swift-set-fixture)
       - name: Package macOS app
         run: |
           Scripts/build-app.sh
@@ -76,8 +77,10 @@ jobs:
           Expand-Archive Windows/out/fixtures/swift-fixture.zip Windows/out/fixtures
           $mac = Resolve-Path Windows/out/fixtures/swift-fixture
           $output = Join-Path (Resolve-Path Windows/out/fixtures) 'cpp-fixture'
-          ./Windows/test-volumes.ps1 -Architecture ${{ matrix.architecture }} -MacFixture $mac.Path -OutputFixture $output -Benchmark:($env:BG_BENCHMARK -eq 'true')
-          tar.exe -a -cf dist/cpp-fixture.zip -C Windows/out/fixtures cpp-fixture
+          $macSet = Resolve-Path Windows/out/fixtures/swift-set-fixture
+          $outputSet = Join-Path (Resolve-Path Windows/out/fixtures) 'cpp-set-fixture'
+          ./Windows/test-volumes.ps1 -Architecture ${{ matrix.architecture }} -MacFixture $mac.Path -OutputFixture $output -MacSetFixture $macSet.Path -OutputSetFixture $outputSet -Benchmark:($env:BG_BENCHMARK -eq 'true')
+          tar.exe -a -cf dist/cpp-fixture.zip -C Windows/out/fixtures cpp-fixture cpp-set-fixture
           if ($LASTEXITCODE -ne 0) { throw 'Could not package the C++ fixture' }
       - name: Launch WinUI on Windows 11
         if: matrix.architecture == 'ARM64'
@@ -116,6 +119,7 @@ jobs:
         run: |
           unzip -q dist/cpp-fixture.zip -d dist
           BACKUP_GENIUS_IMPORT_FIXTURE="$PWD/dist/cpp-fixture" Scripts/test-volumes.sh --filter importInteropFixture
+          BACKUP_GENIUS_IMPORT_SET_FIXTURE="$PWD/dist/cpp-set-fixture" Scripts/test-volumes.sh --filter importSetFixture
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')

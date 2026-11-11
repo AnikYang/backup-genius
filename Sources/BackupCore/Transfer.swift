@@ -20,7 +20,7 @@ final class PatchData: @unchecked Sendable {
     init(scratch: Tree) { self.scratch = scratch }
 
     func add(_ data: Data, block: Int) throws {
-        if spill == nil, bytes + Int64(data.count) > 128 * 1024 {
+        if spill == nil, bytes + Int64(data.count) > IOProfile.retainedPatchLimit {
             let path = UUID().uuidString
             let file = try scratch.createFile(path)
             try scratch.remove(path)
@@ -31,15 +31,46 @@ final class PatchData: @unchecked Sendable {
             spill = file
         }
         if let spill { try spill.write(data, at: bytes) }
-        slices.append(Slice(block: block, length: data.count, offset: bytes, data: spill == nil ? data : nil))
+        let retained = spill == nil ? data.withUnsafeBytes { Data($0) } : nil
+        slices.append(Slice(block: block, length: data.count, offset: bytes, data: retained))
         bytes += Int64(data.count)
     }
 
-    func apply(to file: FD, afterFirstBlock: (() throws -> Void)? = nil) throws {
-        for (index, slice) in slices.enumerated() {
-            let data = try slice.data ?? spill!.readExact(at: slice.offset, length: slice.length)
-            try file.write(data, at: Int64(slice.block) * Int64(blockSize))
-            if index == 0 { try afterFirstBlock?() }
+    private func runs(window: Int, splitFirst: Bool = false) -> [Range<Int>] {
+        var result: [Range<Int>] = []
+        var start = 0
+        while start < slices.count {
+            var end = start + 1
+            var length = slices[start].length
+            if !splitFirst || start > 0 {
+                while end < slices.count, slices[end].block == slices[end - 1].block + 1,
+                      length + slices[end].length <= window {
+                    length += slices[end].length
+                    end += 1
+                }
+            }
+            result.append(start..<end)
+            start = end
+        }
+        return result
+    }
+
+    func writeRequests(window: Int) -> Int { runs(window: window).count }
+
+    func apply(to file: FD, window: Int, afterFirstBlock: (() throws -> Void)? = nil) throws {
+        for range in runs(window: window, splitFirst: afterFirstBlock != nil) {
+            let first = slices[range.lowerBound], last = slices[range.upperBound - 1]
+            let length = Int(last.offset - first.offset) + last.length
+            let data: Data
+            if let spill {
+                data = try spill.readExact(at: first.offset, length: length)
+            } else {
+                var buffer = Data(capacity: length)
+                for slice in slices[range] { buffer.append(slice.data!) }
+                data = buffer
+            }
+            try file.write(data, at: Int64(first.block) * Int64(blockSize))
+            if range.lowerBound == 0 { try afterFirstBlock?() }
         }
     }
 }
@@ -54,6 +85,9 @@ struct Prepared: Sendable {
     var sourceBytes: Int64 = 0
     var targetBytes: Int64 = 0
     var latestBytes: Int64 = 0
+    var sourceReadRequests = 0
+    var targetReadRequests = 0
+    var latestWriteRequests = 0
     var adoption: Adoption?
 }
 
@@ -63,6 +97,7 @@ struct Transfer: Sendable {
     let scratch: Tree
     let volume: VolumeInfo
     let existingFilesPolicy: ExistingFilesPolicy
+    var profile = IOProfile(source: .unknown, target: .unknown)
 
     func prepare(_ work: Work) throws -> Prepared {
         switch work.kind {
@@ -252,7 +287,10 @@ struct Transfer: Sendable {
                 base = old.hashes
                 originalAttrs = old.attributes
             } else {
-                base = try oldFile.fileHashes(size: before.size) { result.targetBytes += Int64($0) }
+                base = try oldFile.fileHashes(size: before.size, window: profile.targetWindow) {
+                    result.targetBytes += Int64($0)
+                    result.targetReadRequests += 1
+                }
                 if !adopting {
                     originalAttrs = try oldFile.attributes(before, rich: rich)
                     if !rich, var stored = work.old?.attributes {
@@ -280,24 +318,29 @@ struct Transfer: Sendable {
 
         let patch = PatchData(scratch: scratch)
         var next = FileRecord(path: work.path, source: stamp, target: before, attributes: attrs)
-        var offset: Int64 = 0
-        var index = 0
-        while offset < stamp.size {
-            let amount = Int(min(Int64(blockSize), stamp.size - offset))
-            let data = try input.read(at: offset, length: amount)
-            guard data.count == amount else { throw BackupError.unstable(work.path) }
-            result.sourceBytes += Int64(amount)
-            let hash = digest(data)
-            next.hashes.append(hash)
-            if let newFile {
-                try newFile.write(data, at: offset)
-                result.latestBytes += Int64(amount)
-            } else if base.blockHash(index) != hash {
-                if requireIdentical { throw conflict }
-                try patch.add(data, block: index)
+        do {
+            try input.readSequentially(size: stamp.size, window: profile.sourceWindow) { offset, data in
+                result.sourceBytes += Int64(data.count)
+                result.sourceReadRequests += 1
+                for start in stride(from: 0, to: data.count, by: blockSize) {
+                    let block = data[start..<min(start + blockSize, data.count)]
+                    let hash = digest(block)
+                    next.hashes.append(hash)
+                    let index = Int(offset / Int64(blockSize)) + start / blockSize
+                    if newFile == nil, base.blockHash(index) != hash {
+                        if requireIdentical { throw conflict }
+                        try patch.add(block, block: index)
+                    }
+                }
+                if let newFile {
+                    try newFile.write(data, at: offset)
+                    result.latestBytes += Int64(data.count)
+                    result.latestWriteRequests += 1
+                }
             }
-            offset += Int64(amount)
-            index += 1
+        } catch {
+            if (try? input.stamp()) != stamp { throw BackupError.unstable(work.path) }
+            throw error
         }
         guard try input.stamp() == stamp, try source.entry(work.path) == stamp else {
             throw BackupError.unstable(work.path)
@@ -331,11 +374,12 @@ struct Transfer: Sendable {
                 throw BackupError.posix("无法准备克隆文件", work.path)
             }
             let clone = try target.file(temp, writable: true)
-            try patch.apply(to: clone)
+            try patch.apply(to: clone, window: profile.targetWindow)
             try clone.resize(stamp.size)
             try clone.apply(attrs, rich: true)
             try clone.flush()
             result.latestBytes += patch.bytes
+            result.latestWriteRequests += patch.writeRequests(window: profile.targetWindow)
             next.target = try clone.stamp()
             edit.method = .install
             edit.staging = stageID

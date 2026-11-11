@@ -11,6 +11,7 @@ struct SetupView: View {
     @ViewState private var target: URL?
     @ViewState private var volume: VolumeInfo?
     @ViewState private var organizedTarget = false
+    @ViewState private var setTarget = false
     @ViewState private var automatic = true
     @ViewState private var ejectAfterBackup = false
     @ViewState private var existingFiles = ExistingFilesPolicy.preserve
@@ -132,12 +133,16 @@ struct SetupView: View {
         target = url
         volume = nil
         organizedTarget = false
+        setTarget = false
         failure = nil
         do {
             let result = try await Task.detached(priority: .utility) {
                 let accessed = url.startAccessingSecurityScopedResource()
                 defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                return (try VolumeInfo.inspect(url), FileManager.default.fileExists(atPath: url.appending(path: ".backup-genius.json").path))
+                let marker = url.appending(path: ".backup-genius.json")
+                let hasMarker = FileManager.default.fileExists(atPath: marker.path)
+                let set = hasMarker && (try? JSONDecoder().decode(BackupSet.self, from: Data(contentsOf: marker)).layout) == 2
+                return (try VolumeInfo.inspect(url), hasMarker, set)
             }.value
             guard result.0.isExternal else { throw BackupError.message("请选择外置硬盘上的文件夹") }
             if mode == .configure && url.resolvingSymlinksInPath().path == result.0.mount.resolvingSymlinksInPath().path {
@@ -145,6 +150,7 @@ struct SetupView: View {
             }
             volume = result.0
             organizedTarget = result.1
+            setTarget = result.2
         } catch {
             failure = error.localizedDescription
         }
@@ -173,10 +179,19 @@ struct SetupView: View {
                     if login != model.loginEnabled { model.setLogin(login) }
                     model.page = .overview
                 case .existing:
-                    model.job = try await model.engine.openExisting(target: target, volumeRoot: disk)
+                    if setTarget, let disk {
+                        try await model.coordinator.openCollection(on: disk)
+                        model.folders = await model.coordinator.presentation.folders
+                        if let id = model.folders.first(where: { $0.job.setID != nil && $0.job.volumeID == volume.identifier })?.id {
+                            model.selectFolder(id)
+                        }
+                    } else {
+                        let job = try await model.coordinator.legacy.openExisting(target: target, volumeRoot: disk)
+                        model.selectedFolder = job.id
+                    }
                     model.page = .history
                     model.loadRecords()
-                case .takeover:
+                case .takeover, .guide:
                     return
                 }
                 dismiss()
@@ -293,13 +308,13 @@ struct TakeoverView: View {
     }
 
     private func confirm() {
-        guard let preview else { return }
+        guard let preview, let job = model.job?.id else { return }
         working = true
         error = nil
         Task {
             defer { working = false }
             do {
-                model.job = try await model.engine.confirmTakeover(preview.id, choices: choices)
+                model.job = try await model.coordinator.confirmTakeover(job: job, preview: preview.id, choices: choices)
                 model.page = .overview
                 dismiss()
             } catch {
@@ -463,13 +478,27 @@ struct AppSettings: View {
                 }
                 Button("设置备份…") {
                     openWindow(id: "main")
-                    model.setup = .configure
+                    model.setup = .guide
                 }
                 .disabled(model.progress.state.busy || model.restoring || model.ejecting)
             }
+            if let device = model.volume?.device { mediumPicker("备份硬盘类型", device) }
+            if let device = model.sourceDevice { mediumPicker("源硬盘类型", device) }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 418)
+        .frame(width: 520, height: 510)
         .onAppear { model.refreshLoginStatus() }
+    }
+
+    private func mediumPicker(_ label: String, _ device: StorageDeviceInfo) -> some View {
+        Picker(label, selection: Binding(
+            get: { model.media[device.identifier.uppercased()] },
+            set: { model.setMedium($0, device: device) }
+        )) {
+            Text("自动（\(device.medium.name)）").tag(Optional<StorageMedium>.none)
+            Text("HDD").tag(Optional(StorageMedium.hdd))
+            Text("SSD").tag(Optional(StorageMedium.ssd))
+        }
+        .disabled(model.busy || device.identifier.isEmpty)
     }
 }

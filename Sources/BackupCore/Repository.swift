@@ -20,6 +20,7 @@ final class Repository {
     private let lock: FD
     private(set) var descriptor: Marker
     let host: UUID
+    var ioProfile = IOProfile(source: .unknown, target: .unknown)
     private let interruption: (@Sendable (InterruptionPoint) throws -> Void)?
 
     static func enroll(_ tree: Tree, volume: VolumeInfo, sourceIdentity: String, source: URL, host: UUID,
@@ -63,6 +64,32 @@ final class Repository {
         for dir in [journalPath, stagePath, packPath, clonePath] { try tree.mkdir(dir) }
         try tree.writeDocument(marker, at: markerPath)
         try tree.root.flush(directory: true)
+    }
+
+    static func initializeMember(on disk: Tree, folder: String, marker: Marker, volume: VolumeInfo) throws {
+        let location = storagePath(marker.job)
+        try disk.mkdir(location, existing: true)
+        let target = try disk.subtree(folder)
+        let tree = try Tree(target.url, controlTree: disk.subtree(location))
+        for dir in [journalPath, stagePath, packPath, clonePath] { try tree.mkdir(dir, existing: true) }
+        if try tree.entry(markerPath) == nil {
+            try tree.writeDocument(marker, at: markerPath)
+        }
+        guard try Self.marker(tree, volume: volume).job == marker.job else {
+            throw BackupError.message("备份文件夹与记录不符")
+        }
+        try tree.directory(controlName).flush(directory: true)
+        try disk.directory(storageName).flush(directory: true)
+    }
+
+    static func memberTree(on disk: Tree, folder: String, job: UUID, volume: VolumeInfo) throws -> Tree {
+        let target = try disk.subtree(folder)
+        let control = try disk.subtree(storagePath(job))
+        let tree = try Tree(target.url, controlTree: control)
+        guard try marker(tree, volume: volume).job == job else {
+            throw BackupError.message("备份文件夹与记录不符")
+        }
+        return tree
     }
 
     static func jobID(_ tree: Tree, volume: VolumeInfo) throws -> UUID {
@@ -225,7 +252,7 @@ final class Repository {
         let block = Int64(info.f_bsize)
         volume = VolumeInfo(name: volume.name, mount: volume.mount, identifier: volume.identifier, format: volume.format,
                             availableBytes: Int64(info.f_bavail) * block, totalBytes: Int64(info.f_blocks) * block,
-                            caseSensitive: volume.caseSensitive, isExternal: volume.isExternal, isSolidState: volume.isSolidState)
+                            caseSensitive: volume.caseSensitive, isExternal: volume.isExternal, device: volume.device)
     }
 
     private func commitPath(_ sequence: Int64) -> String {
@@ -458,7 +485,11 @@ final class Repository {
             guard let next = edit.next, let patch else { throw BackupError.message("缺少增量数据") }
             let file = try tree.file(edit.path, writable: true)
             guard try file.stamp() == edit.before else { throw BackupError.unstable(edit.path) }
-            try patch.apply(to: file) { try self.interruption?(.firstBlock) }
+            if let interruption {
+                try patch.apply(to: file, window: ioProfile.targetWindow) { try interruption(.firstBlock) }
+            } else {
+                try patch.apply(to: file, window: ioProfile.targetWindow)
+            }
             try file.resize(next.source.size)
             try file.apply(next.attributes, rich: false)
             try file.flush()
@@ -773,6 +804,8 @@ final class PackWriter {
     private var file: FD?
     private var positions: [Data: ChunkLocation] = [:]
     private var offset: Int64 = 0
+    private var buffered = Data()
+    private var bufferedOffset: Int64 = 0
     private(set) var bytes: Int64 = 0
 
     init(repository: Repository, id: UUID) {
@@ -789,7 +822,9 @@ final class PackWriter {
         if let previous = positions[hash] { return previous }
         if reuse, let previous = try repository.catalog.chunk(hash) { return previous }
         if file == nil { file = try repository.tree.createFile(packed(id)) }
-        try file!.write(data, at: offset)
+        if buffered.count + data.count > repository.ioProfile.targetWindow { try flushBuffer() }
+        if buffered.isEmpty { bufferedOffset = offset }
+        buffered.append(data)
         let entry = ChunkLocation(hash: hash, pack: id, offset: offset, length: data.count)
         positions[hash] = entry
         offset += Int64(data.count)
@@ -797,7 +832,15 @@ final class PackWriter {
         return entry
     }
 
+    private func flushBuffer() throws {
+        if !buffered.isEmpty {
+            try file!.write(buffered, at: bufferedOffset)
+            buffered.removeAll(keepingCapacity: true)
+        }
+    }
+
     func finish() throws -> [ChunkLocation] {
+        try flushBuffer()
         if let file {
             try file.flush(full: true)
             try repository.tree.directory(packPath).flush(directory: true)
@@ -808,15 +851,13 @@ final class PackWriter {
 }
 
 func copyVerified(_ source: FD, to target: FD, length: Int64, hashes: Data) throws {
-    var offset: Int64 = 0
-    var index = 0
-    while offset < length {
-        let data = try source.readExact(at: offset, length: Int(min(Int64(blockSize), length - offset)))
-        guard digest(data) == hashes.blockHash(index) else {
-            throw BackupError.message("备份文件校验失败：\(source.label)")
+    try source.readSequentially(size: length, window: IOProfile.window(.unknown)) { offset, data in
+        for start in stride(from: 0, to: data.count, by: blockSize) {
+            let block = data[start..<min(start + blockSize, data.count)]
+            guard digest(block) == hashes.blockHash(Int(offset / Int64(blockSize)) + start / blockSize) else {
+                throw BackupError.message("备份文件校验失败：\(source.label)")
+            }
         }
         try target.write(data, at: offset)
-        offset += Int64(data.count)
-        index += 1
     }
 }

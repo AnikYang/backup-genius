@@ -100,6 +100,28 @@ struct MainWindow: View {
                 case .history: HistoryScreen(model: model)
                 }
             }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if model.folders.count > 1 || model.job?.setID != nil {
+                    HStack {
+                        Picker("所属文件夹", selection: Binding(
+                            get: { model.selectedFolder }, set: { if let id = $0 { model.selectFolder(id) } }
+                        )) {
+                            ForEach(model.folders) { folder in
+                                Text(folder.title).tag(Optional(folder.id))
+                            }
+                        }
+                        .frame(maxWidth: 420, alignment: .leading)
+                        Spacer()
+                        if model.page == .overview {
+                            Button("添加备份文件夹…", systemImage: "plus") { model.setup = .guide }
+                                .disabled(model.busy)
+                        }
+                    }
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 8)
+                    Divider()
+                }
+            }
             .navigationTitle(model.page.title)
             .navigationSubtitle(model.job.map { $0.restoreOnly ? "已有备份" : (model.volume?.name ?? $0.volumeName) } ?? "Backup Genius")
             .toolbar {
@@ -125,8 +147,14 @@ struct MainWindow: View {
                                     .disabled(model.volume == nil || model.progress.state.busy || model.ejecting || model.restoring)
                             }
                             Divider()
-                            Button("更改备份…") { model.setup = .configure }
-                                .disabled(model.progress.state.busy || model.restoring || model.ejecting)
+                            Button("新手引导…") { model.setup = .guide }.disabled(model.busy)
+                            if model.job?.setID == nil {
+                                Button("更改备份…") { model.setup = .configure }
+                                    .disabled(model.busy || model.restoring || model.ejecting)
+                            } else if let mapping = model.selectedMapping {
+                                Button(mapping.enabled ? "停用此备份" : "启用此备份") { model.setMappingEnabled(!mapping.enabled) }
+                                    .disabled(model.busy || model.volume == nil || model.job?.restoreOnly == true)
+                            }
                             SettingsLink { Text("设置…") }
                         } label: {
                             Label("更多备份操作", systemImage: "ellipsis.circle")
@@ -138,7 +166,11 @@ struct MainWindow: View {
         .navigationSplitViewStyle(.balanced)
         .onChange(of: model.page) { _, _ in model.loadRecords() }
         .sheet(item: $model.setup) { mode in
-            if mode == .takeover { TakeoverView(model: model) } else { SetupView(model: model, mode: mode) }
+            switch mode {
+            case .guide: BackupGuide(model: model)
+            case .takeover: TakeoverView(model: model)
+            case .configure, .existing: SetupView(model: model, mode: mode)
+            }
         }
         .alert("需要处理", isPresented: Binding(
             get: { model.error != nil }, set: { if !$0 { model.error = nil } }
@@ -200,6 +232,20 @@ struct Overview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     status
+                    if job.setID != nil {
+                        ForEach(model.folders.filter { $0.job.setID == job.setID }) { folder in
+                            Button { model.selectFolder(folder.id) } label: {
+                                HStack {
+                                    Label(folder.title, systemImage: "folder")
+                                    Spacer()
+                                    Text(folder.mapping?.enabled == false ? "已停用" : folder.snapshot.progress.state.title)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
                     if model.progress.state == .takeoverRequired || (job.restoreOnly && job.format == .exfat && model.volume != nil) {
                         Button("预览接管…") { model.setup = .takeover }.buttonStyle(.borderedProminent)
                     }
@@ -249,14 +295,14 @@ struct Overview: View {
             VStack(spacing: 8) {
                 Text("连接硬盘，即可备份")
                     .font(.largeTitle.weight(.semibold))
-                Text("选择一个文件夹和外置硬盘。之后每次连接，\nBackup Genius 都会检查变化并更新备份。")
+                Text("选好外置硬盘和要备份的文件夹。下次连接时，Backup Genius 会检查变化并更新备份。")
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .lineSpacing(3)
             }
             HStack(spacing: 10) {
-                Button("设置备份…") { model.setup = .configure }
+                Button("新手引导…") { model.setup = .guide }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                 Button("打开已有备份…") { model.setup = .existing }
@@ -273,7 +319,7 @@ struct Overview: View {
     }
 
     private var status: some View {
-        let progress = model.progress
+        let progress = model.displayedProgress
         let state = progress.state
         return VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 14) {
@@ -317,7 +363,7 @@ struct Overview: View {
     }
 
     private var statusDetail: String {
-        let progress = model.progress
+        let progress = model.displayedProgress
         if model.ejecting { return "正在等待当前更新完成并释放硬盘。" }
         if let message = progress.message { return message }
         switch progress.state {
@@ -364,19 +410,20 @@ struct Overview: View {
     }
 
     private var metrics: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let progress = model.displayedProgress
+        return VStack(alignment: .leading, spacing: 12) {
             Text("本次同步").font(.headline)
             HStack(spacing: 0) {
-                Metric(name: "已跳过", value: model.progress.skipped.formatted(), unit: "个未变化文件")
+                Metric(name: "已跳过", value: progress.skipped.formatted(), unit: "个未变化文件")
                 Divider().frame(height: 43)
-                Metric(name: "最新副本写入", value: byteCount(model.progress.latestWrittenBytes), unit: "文件数据")
+                Metric(name: "最新副本写入", value: byteCount(progress.latestWrittenBytes), unit: "文件数据")
                 Divider().frame(height: 43)
-                Metric(name: "历史数据写入", value: byteCount(model.progress.historyWrittenBytes), unit: "已归档的数据")
+                Metric(name: "历史数据写入", value: byteCount(progress.historyWrittenBytes), unit: "已归档的数据")
             }
             .padding(.vertical, 14)
             .background(.background.secondary, in: .rect(cornerRadius: 12))
             .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.separator) }
-            if let reused = model.progress.reusedFiles, reused > 0 {
+            if let reused = progress.reusedFiles, reused > 0 {
                 Label("已沿用 \(reused.formatted()) 个一致的文件或链接", systemImage: "checkmark.circle")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)

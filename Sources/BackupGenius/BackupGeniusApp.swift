@@ -14,7 +14,7 @@ struct BackupGeniusApp: App {
     init() {
         let model = AppModel()
         _model = ViewState(wrappedValue: model)
-        lifecycle.engine = model.engine
+        lifecycle.coordinator = model.coordinator
     }
 
     var body: some Scene {
@@ -26,7 +26,7 @@ struct BackupGeniusApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(after: .newItem) {
-                Button("设置备份…") { model.setup = .configure }
+                Button("新手引导…") { model.setup = .guide }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
                 Button("打开已有备份…") { model.setup = .existing }
             }
@@ -60,12 +60,12 @@ struct BackupGeniusApp: App {
 
 @MainActor
 final class Lifecycle: NSObject, NSApplicationDelegate {
-    var engine: SyncEngine?
+    var coordinator: BackupCoordinator?
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let engine else { return .terminateNow }
+        guard let coordinator else { return .terminateNow }
         Task {
-            await engine.finishAndClose()
+            await coordinator.finishAndClose()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -73,7 +73,7 @@ final class Lifecycle: NSObject, NSApplicationDelegate {
 }
 
 enum SetupMode: String, Identifiable {
-    case configure, existing, takeover
+    case guide, configure, existing, takeover
     var id: Self { self }
 }
 
@@ -101,10 +101,18 @@ enum Page: String, CaseIterable, Identifiable {
 @MainActor
 @Observable
 final class AppModel {
-    let engine: SyncEngine
+    let coordinator: BackupCoordinator
+    private(set) var engine: SyncEngine
+    var folders: [BackupFolderStatus] = []
+    var selectedFolder: UUID?
+    var runningFolder: UUID?
+    var diskProgress: [String: SyncProgress] = [:]
+    var media: [String: StorageMedium] = [:]
+    var busy = false
     var job: BackupJob?
     var volume: VolumeInfo?
     var organizedStorage = false
+    var sourceDevice: StorageDeviceInfo?
     var progress = SyncProgress()
     var activities: [Activity] = []
     var versions: [HistoryItem] = []
@@ -123,67 +131,113 @@ final class AppModel {
 
     init() {
         let appSupport = URL.applicationSupportDirectory.appending(path: "Backup Genius", directoryHint: .isDirectory)
-        let engine = SyncEngine(storage: appSupport)
-        self.engine = engine
+        let coordinator = BackupCoordinator(storage: appSupport)
+        self.coordinator = coordinator
+        engine = coordinator.legacy
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification,
                      NSWorkspace.didRenameVolumeNotification, NSWorkspace.didWakeNotification] {
             notifications.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in
-                engine.volumesDidChange()
+                Task { await coordinator.volumesDidChange(connected: name == NSWorkspace.didMountNotification) }
             })
         }
         refreshLoginStatus()
         observer = Task { [weak self] in
-            for await _ in engine.updates() {
+            for await snapshot in await coordinator.updates() {
                 guard let self else { return }
-                let wasBusy = self.progress.state.busy
-                let snapshot = engine.presentation
-                let finishedRun = self.progress.lastRunID != snapshot.progress.lastRunID
-                let changedJob = self.job?.id != snapshot.job?.id
-                self.progress = snapshot.progress
-                self.job = snapshot.job
-                self.volume = snapshot.volume
-                self.organizedStorage = snapshot.organizedStorage
-                if changedJob || finishedRun || (wasBusy && !snapshot.progress.state.busy) { self.loadRecords() }
+                self.folders = snapshot.folders
+                self.runningFolder = snapshot.running
+                self.diskProgress = snapshot.diskProgress
+                self.media = snapshot.media
+                self.busy = snapshot.busy
+                let selected = snapshot.folders.first(where: { $0.id == self.selectedFolder }) ?? snapshot.folders.first
+                await self.show(selected)
             }
         }
         Task { [weak self] in
-            do { try await engine.start() }
+            do {
+                try await coordinator.start()
+                if await coordinator.presentation.folders.isEmpty, !UserDefaults.standard.bool(forKey: "guideOffered") {
+                    UserDefaults.standard.set(true, forKey: "guideOffered")
+                    self?.setup = .guide
+                }
+            }
             catch { self?.error = error.localizedDescription }
         }
     }
 
+    private func show(_ folder: BackupFolderStatus?) async {
+        let changed = job?.id != folder?.id
+        if changed, let folder, let next = await coordinator.engine(for: folder.id) { engine = next }
+        let snapshot = folder?.snapshot ?? coordinator.legacy.presentation
+        let shouldLoad = changed || progress.lastRunID != snapshot.progress.lastRunID ||
+            (progress.state.busy && !snapshot.progress.state.busy)
+        selectedFolder = folder?.id
+        job = snapshot.job
+        volume = snapshot.volume
+        progress = snapshot.progress
+        organizedStorage = snapshot.organizedStorage
+        sourceDevice = snapshot.sourceDevice
+        if changed { activities = []; versions = []; backupRuns = [] }
+        if shouldLoad { loadRecords() }
+    }
+
+    func selectFolder(_ id: UUID) {
+        guard let folder = folders.first(where: { $0.id == id }) else { return }
+        selectedFolder = id
+        Task { await show(folder) }
+    }
+
+    var displayedProgress: SyncProgress {
+        guard let job, job.setID != nil else { return progress }
+        if let runningFolder, let current = folders.first(where: { $0.id == runningFolder }),
+           current.job.volumeID == job.volumeID {
+            var state = current.snapshot.progress
+            state.message = "\(current.title) · \(state.state.title)"
+            if busy, !state.state.busy { state.state = .checking }
+            return state
+        }
+        if progress.state == .ejected, let summary = diskProgress[job.volumeID.uppercased()] { return summary }
+        if volume == nil || progress.state == .paused || progress.state == .takeoverRequired { return progress }
+        return diskProgress[job.volumeID.uppercased()] ?? progress
+    }
+
+    var selectedMapping: FolderMapping? { folders.first(where: { $0.id == selectedFolder })?.mapping }
+
     var canSync: Bool {
-        job?.restoreOnly == false && (volume != nil || progress.state == .needsAttention) &&
+        job?.restoreOnly == false && selectedMapping?.enabled != false && !busy && (volume != nil || progress.state == .needsAttention) &&
             !progress.state.busy && progress.state != .takeoverRequired &&
             progress.state != .paused && !restoring && !ejecting
     }
     var canPause: Bool { job?.restoreOnly == false && volume != nil && !restoring && !ejecting }
     var ejecting: Bool { ejectRequested || progress.state == .ejecting }
     var canEject: Bool { volume != nil && !restoring && !ejecting }
-    var canRestore: Bool { volume != nil && !progress.state.busy && !restoring && !ejecting }
+    var canRestore: Bool { volume != nil && !busy && !progress.state.busy && !restoring && !ejecting }
 
     func sync() {
-        guard canSync else { return }
-        Task { _ = try? await engine.syncNow() }
+        guard canSync, let id = job?.id else { return }
+        Task { await coordinator.sync(id) }
     }
 
     func verify() {
-        guard canSync else { return }
-        Task { _ = try? await engine.verify() }
+        guard canSync, let id = job?.id else { return }
+        Task { await coordinator.sync(id, verify: true) }
     }
 
     func togglePause() {
-        guard canPause else { return }
-        if progress.state == .paused { engine.resume() } else { engine.pause() }
+        guard canPause, let id = job?.id else { return }
+        Task {
+            if progress.state == .paused { await coordinator.resume(id) }
+            else { await coordinator.pause() }
+        }
     }
 
     func eject() {
-        guard canEject else { return }
+        guard canEject, let id = job?.id else { return }
         ejectRequested = true
         Task {
             defer { ejectRequested = false }
-            do { try await engine.eject() }
+            do { try await coordinator.eject(id) }
             catch { self.error = error.localizedDescription }
         }
     }
@@ -198,6 +252,7 @@ final class AppModel {
         guard page != .overview else { return }
         loadRecordsTask?.cancel()
         let page = page
+        let engine = engine
         loadRecordsTask = Task {
             do {
                 if page == .activity {
@@ -216,14 +271,14 @@ final class AppModel {
     }
 
     func restore(_ id: UUID?) {
-        guard canRestore else { return }
+        guard canRestore, let job = job?.id else { return }
         Task {
             guard let folder = await chooseFolder(title: "选择恢复位置", prompt: "恢复到此处", canCreate: true),
                   canRestore else { return }
             restoring = true
             defer { restoring = false }
             do {
-                let result = try await engine.restore(id, to: folder)
+                let result = try await coordinator.restore(job, version: id, to: folder)
                 NSWorkspace.shared.activateFileViewerSelecting([result])
             } catch {
                 self.error = error.localizedDescription
@@ -232,15 +287,32 @@ final class AppModel {
     }
 
     func setAutomatic(_ value: Bool) {
+        guard let id = job?.id else { return }
         Task {
-            do { try await engine.setAutomatic(value) }
+            do { try await coordinator.setAutomatic(value, job: id) }
             catch { self.error = error.localizedDescription }
         }
     }
 
     func setEjectAfterBackup(_ value: Bool) {
+        guard let id = job?.id else { return }
         Task {
-            do { try await engine.setEjectAfterBackup(value) }
+            do { try await coordinator.setEjectAfterBackup(value, job: id) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+
+    func setMappingEnabled(_ enabled: Bool) {
+        guard let id = job?.id else { return }
+        Task {
+            do { try await coordinator.setEnabled(enabled, job: id) }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+
+    func setMedium(_ value: StorageMedium?, device: StorageDeviceInfo) {
+        Task {
+            do { try await coordinator.setMedium(value, device: device) }
             catch { self.error = error.localizedDescription }
         }
     }
@@ -283,15 +355,21 @@ final class AppModel {
 
 @MainActor
 func chooseFolder(title: String, prompt: String, canCreate: Bool = false, startingAt: URL? = nil) async -> URL? {
+    await chooseFolders(title: title, prompt: prompt, canCreate: canCreate, startingAt: startingAt, multiple: false).first
+}
+
+@MainActor
+func chooseFolders(title: String, prompt: String, canCreate: Bool = false, startingAt: URL? = nil,
+                   multiple: Bool = true) async -> [URL] {
     let panel = NSOpenPanel()
-    panel.directoryURL = startingAt
+    if let startingAt { panel.directoryURL = startingAt }
     panel.title = title
     panel.prompt = prompt
     panel.canChooseFiles = false
     panel.canChooseDirectories = true
     panel.canCreateDirectories = canCreate
-    panel.allowsMultipleSelection = false
-    return await panel.begin() == .OK ? panel.url : nil
+    panel.allowsMultipleSelection = multiple
+    return await panel.begin() == .OK ? panel.urls : []
 }
 
 struct MenuControls: View {
@@ -312,6 +390,12 @@ struct MenuControls: View {
         Button(model.progress.state == .paused ? "继续备份" : "暂停备份", action: model.togglePause)
             .disabled(!model.canPause)
         Button("安全推出", action: model.eject).disabled(!model.canEject)
+        Button("新手引导…") {
+            openWindow(id: "main")
+            model.setup = .guide
+            NSApp.activate()
+        }
+        .disabled(model.busy)
         Divider()
         SettingsLink { Text("设置…") }
         Button("退出 Backup Genius") { NSApplication.shared.terminate(nil) }

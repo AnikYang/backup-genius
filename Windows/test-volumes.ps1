@@ -2,6 +2,8 @@ param(
     [ValidateSet('x64', 'ARM64')][string]$Architecture = 'x64',
     [string]$MacFixture,
     [string]$OutputFixture,
+    [string]$MacSetFixture,
+    [string]$OutputSetFixture,
     [switch]$Benchmark
 )
 $ErrorActionPreference = 'Stop'
@@ -42,6 +44,11 @@ try {
         if (!$OutputFixture) { throw 'Specify an output path for the exchanged fixture' }
         & $test --interop $MacFixture $OutputFixture $mount
         if ($LASTEXITCODE -ne 0) { throw "Cross-platform fixture test failed ($LASTEXITCODE)" }
+    }
+    if ($MacSetFixture) {
+        if (!$OutputSetFixture) { throw 'Specify an output path for the collection fixture' }
+        & $test --set-interop $MacSetFixture $OutputSetFixture $mount
+        if ($LASTEXITCODE -ne 0) { throw "Collection fixture test failed ($LASTEXITCODE)" }
     }
     if ($Benchmark) {
         & $test --benchmark 100000 $mount "$PSScriptRoot/../dist/performance-exFAT-$Architecture.json"

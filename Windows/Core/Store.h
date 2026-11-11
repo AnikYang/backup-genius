@@ -57,6 +57,8 @@ private:
 struct Patch {
     fs::path spool;
     std::vector<int64_t> blocks;
+    size_t window{IOProfile::window(StorageMedium::unknown)};
+    std::vector<std::pair<int64_t, size_t>> writes(int64_t size, bool splitFirst = false) const;
 };
 enum class Interruption { prepared, firstBlock, applied, committed, pruning };
 using Fault = std::function<void(Interruption)>;
@@ -64,6 +66,8 @@ using Fault = std::function<void(Interruption)>;
 class Repository {
 public:
     static Json create(const Tree&, std::string format, std::string writer, bool organized = false);
+    static Tree member(const Tree& disk, std::string_view folder, std::string_view job);
+    static void initializeMember(const Tree& disk, std::string_view folder, const Json& marker);
     static Json readMarker(const Tree&);
     Repository(Tree target, Index&, std::string writer, Fault = {});
     ~Repository();
@@ -88,6 +92,7 @@ public:
     std::string owner;
     int64_t generation{};
     std::string head;
+    IOProfile ioProfile;
     bool recovered{};
 private:
     static Tree locate(const Tree&);
@@ -97,7 +102,7 @@ private:
     void rollback(const Json& edit, const Json& additional);
     void clean();
     std::string commitPath(int64_t generation) const;
-    intptr_t lease_{-1};
+    FileLease lease_;
     Fault fault_;
 };
 
@@ -110,10 +115,13 @@ public:
     Json finish();
     int64_t bytes() const { return length_; }
 private:
+    void flushBuffer();
     Repository& repo_;
     std::string id_;
     std::optional<File> file_;
     std::map<std::string, Json> locations_;
     int64_t length_{};
+    Bytes buffered_;
+    int64_t bufferedOffset_{};
 };
 }

@@ -16,7 +16,8 @@ public struct VolumeInfo: Sendable, Equatable {
     public let totalBytes: Int64
     public let caseSensitive: Bool
     public let isExternal: Bool
-    public let isSolidState: Bool
+    public let device: StorageDeviceInfo
+    public var isSolidState: Bool { device.medium == .ssd }
 }
 
 public enum ExistingFilesPolicy: String, Codable, Sendable, CaseIterable {
@@ -25,7 +26,7 @@ public enum ExistingFilesPolicy: String, Codable, Sendable, CaseIterable {
 
 public struct BackupJob: Codable, Sendable, Identifiable {
     public let id: UUID
-    public let source: URL
+    public internal(set) var source: URL
     public internal(set) var target: URL
     public internal(set) var volumeID: String
     public internal(set) var volumeName: String
@@ -33,13 +34,14 @@ public struct BackupJob: Codable, Sendable, Identifiable {
     public let sourceBookmark: Data?
     public internal(set) var targetBookmark: Data?
     let sourceIdentity: String
-    public let targetRelativePath: String
+    public internal(set) var targetRelativePath: String
     public var automatic: Bool
     public let restoreOnly: Bool
     public var reuseMatchingFiles: Bool? = nil
     var existingFiles: ExistingFilesPolicy? = nil
     public var ejectAfterBackup: Bool? = nil
     var storageBookmark: Data? = nil
+    public internal(set) var setID: UUID? = nil
 
     public var existingFilesPolicy: ExistingFilesPolicy {
         existingFiles ?? (reuseMatchingFiles == true ? .reuseIdentical : .preserve)
@@ -72,6 +74,10 @@ public struct SyncProgress: Codable, Sendable {
     public var targetReadBytes: Int64 = 0
     public var latestWrittenBytes: Int64 = 0
     public var historyWrittenBytes: Int64 = 0
+    public var sourceReadRequests = 0
+    public var targetReadRequests = 0
+    public var latestWriteRequests = 0
+    public var ioBufferBudget = 0
     public var checkingSeconds: Double = 0
     public var elapsedSeconds: Double = 0
     public var lastSuccess: Date?

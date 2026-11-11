@@ -6,14 +6,15 @@ public struct BackupPresentation: Sendable {
     public let volume: VolumeInfo?
     public let progress: SyncProgress
     public let organizedStorage: Bool
+    public let sourceDevice: StorageDeviceInfo?
 }
 
 private struct Subscribers {
-    var latest = BackupPresentation(job: nil, volume: nil, progress: SyncProgress(), organizedStorage: false)
+    var latest = BackupPresentation(job: nil, volume: nil, progress: SyncProgress(), organizedStorage: false, sourceDevice: nil)
     var streams: [UUID: AsyncStream<SyncProgress>.Continuation] = [:]
 }
 
-private final class Scope {
+final class Scope: @unchecked Sendable {
     let url: URL
     private let accessed: Bool
 
@@ -23,6 +24,17 @@ private final class Scope {
     }
 
     deinit { if accessed { url.stopAccessingSecurityScopedResource() } }
+
+    static func resolving(_ bookmark: Data?, fallback: URL) -> Scope {
+        if let bookmark {
+            var stale = false
+            for options: URL.BookmarkResolutionOptions in [[.withSecurityScope, .withoutUI], [.withoutUI]] {
+                if let url = try? URL(resolvingBookmarkData: bookmark, options: options, relativeTo: nil,
+                                      bookmarkDataIsStale: &stale) { return Scope(url) }
+            }
+        }
+        return Scope(fallback)
+    }
 }
 
 private final class PreparationResults: @unchecked Sendable {
@@ -37,7 +49,7 @@ private final class PreparationResults: @unchecked Sendable {
 /// The serial utility queue owns the database, drive lease and transaction
 /// writer. Independent preparation workers use descriptor-relative I/O only.
 public final class SyncEngine: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "backupgenius.engine", qos: .utility)
+    private let queue: DispatchQueue
     private let publishedLock = NSLock()
     private var subscribers = Subscribers()
     private let pauseLock = NSLock()
@@ -71,6 +83,11 @@ public final class SyncEngine: @unchecked Sendable {
     private var progress = SyncProgress()
     private var lastPublished: Double = 0
     private var host = UUID()
+    private let sharedHost: UUID?
+    private var automaticHandler: (@Sendable (Bool) -> Void)?
+    private var mappedVolume: VolumeInfo?
+    private var sourceDevice: (dev_t, StorageDeviceInfo)?
+    private var mediumOverrides: [String: StorageMedium] = [:]
     private var takeover: (draft: TakeoverDraft, job: BackupJob, access: Scope)?
 
     public convenience init(storage: URL) {
@@ -83,13 +100,18 @@ public final class SyncEngine: @unchecked Sendable {
 
     init(storage: URL, allowInternal: Bool, monitor: Bool, testFormat: DiskFormat? = nil,
          interruption: (@Sendable (InterruptionPoint) throws -> Void)? = nil,
-         prepareEjection: @escaping @Sendable (URL) throws -> DiskEjectAction = BackupDisk.prepare) {
+         prepareEjection: @escaping @Sendable (URL) throws -> DiskEjectAction = BackupDisk.prepare,
+         queue: DispatchQueue = DispatchQueue(label: "backupgenius.engine", qos: .utility),
+         host: UUID? = nil, automaticHandler: (@Sendable (Bool) -> Void)? = nil) {
         self.storage = storage
         self.allowInternal = allowInternal
         self.monitor = monitor
         self.testFormat = testFormat
         self.interruption = interruption
         self.prepareEjection = prepareEjection
+        self.queue = queue
+        sharedHost = host
+        self.automaticHandler = automaticHandler
     }
 
     public var presentation: BackupPresentation {
@@ -126,7 +148,7 @@ public final class SyncEngine: @unchecked Sendable {
         guard force || now - lastPublished >= 0.2 else { return }
         lastPublished = now
         let snapshot = BackupPresentation(job: job, volume: repository?.volume, progress: progress,
-                                          organizedStorage: repository?.tree.controlTree != nil)
+                                          organizedStorage: repository?.tree.controlTree != nil, sourceDevice: sourceDevice?.1)
         publishedLock.withLock {
             subscribers.latest = snapshot
             for stream in subscribers.streams.values { stream.yield(snapshot.progress) }
@@ -152,14 +174,7 @@ public final class SyncEngine: @unchecked Sendable {
         guard !started else { return }
         try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
         let hostURL = storage.appending(path: "host-id")
-        if FileManager.default.fileExists(atPath: hostURL.path) {
-            guard let saved = UUID(uuidString: try String(contentsOf: hostURL, encoding: .utf8)) else {
-                throw BackupError.message("本机备份标识无效")
-            }
-            host = saved
-        } else {
-            try host.uuidString.write(to: hostURL, atomically: true, encoding: .utf8)
-        }
+        host = try sharedHost ?? Self.hostID(at: hostURL)
         let scratchURL = storage.appending(path: "scratch", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: scratchURL, withIntermediateDirectories: true)
         scratch = try Tree(scratchURL.resolvingSymlinksInPath())
@@ -175,13 +190,30 @@ public final class SyncEngine: @unchecked Sendable {
         started = true
     }
 
+    static func hostID(at url: URL) throws -> UUID {
+        if FileManager.default.fileExists(atPath: url.path) {
+            guard let saved = UUID(uuidString: try String(contentsOf: url, encoding: .utf8)) else {
+                throw BackupError.message("本机备份标识无效")
+            }
+            return saved
+        }
+        let id = UUID()
+        try id.uuidString.write(to: url, atomically: true, encoding: .utf8)
+        return id
+    }
+
+    func coordinate(_ handler: @escaping @Sendable (Bool) -> Void) async throws {
+        try await perform { $0.automaticHandler = handler }
+    }
+
     private func periodic() {
         guard let job, let repository, !isPaused else { return }
         do {
             guard try !requiresTakeover(repository, job: job), !job.restoreOnly || !repository.descriptor.portable else { return }
             let due = try verifyDue(repository.catalog)
             if !job.restoreOnly, job.automatic, due || streamFailure {
-                _ = try run(verify: due)
+                if let automaticHandler { automaticHandler(due) }
+                else { _ = try run(verify: due) }
             } else {
                 try pruneIfDue(repository)
             }
@@ -219,7 +251,7 @@ public final class SyncEngine: @unchecked Sendable {
                     disk = nil
                 }
                 let storageBookmark = try selectedStorage.flatMap { try engine.bookmarkForStorage($0) } ?? saved
-                let identity = try engine.identity(input)
+                let identity = try Self.identity(input)
                 let marker = try Repository.enroll(output, volume: volume, sourceIdentity: identity, source: input.url,
                                                     host: engine.host, disk: disk)
                 let configured = BackupJob(
@@ -282,6 +314,7 @@ public final class SyncEngine: @unchecked Sendable {
         sourceScope = nil
         targetScope = nil
         storageScope = nil
+        sourceDevice = nil
         takeover = nil
         self.job = job
         catalog = index
@@ -349,7 +382,7 @@ public final class SyncEngine: @unchecked Sendable {
         if let testFormat {
             return VolumeInfo(name: info.name, mount: info.mount, identifier: info.identifier, format: testFormat,
                               availableBytes: info.availableBytes, totalBytes: info.totalBytes, caseSensitive: info.caseSensitive,
-                              isExternal: info.isExternal, isSolidState: info.isSolidState)
+                              isExternal: info.isExternal, device: info.device)
         }
         return info
     }
@@ -362,18 +395,7 @@ public final class SyncEngine: @unchecked Sendable {
     }
 
     private func scoped(_ bookmark: Data?, fallback: URL) -> Scope {
-        if let bookmark {
-            var stale = false
-            if let resolved = try? URL(resolvingBookmarkData: bookmark, options: [.withSecurityScope, .withoutUI],
-                                       relativeTo: nil, bookmarkDataIsStale: &stale) {
-                return Scope(resolved)
-            }
-            if let resolved = try? URL(resolvingBookmarkData: bookmark, options: .withoutUI,
-                                       relativeTo: nil, bookmarkDataIsStale: &stale) {
-                return Scope(resolved)
-            }
-        }
-        return Scope(fallback)
+        Scope.resolving(bookmark, fallback: fallback)
     }
 
     private func bookmarkForStorage(_ scope: Scope) throws -> Data? {
@@ -453,29 +475,49 @@ public final class SyncEngine: @unchecked Sendable {
         }
     }
 
-    private func identity(_ tree: Tree) throws -> String {
+    static func identity(_ tree: Tree) throws -> String {
         let location = try VolumeLocation(tree.root)
         let uuid = try location.mount.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString
         return "\(uuid ?? location.mount.path):\(tree.identity)"
     }
 
     private func sourceTree(_ job: BackupJob) throws -> Tree {
-        let scope = sourceScope ?? scoped(job.sourceBookmark, fallback: job.source)
-        let tree: Tree
+        var scope = sourceScope ?? scoped(job.sourceBookmark, fallback: job.source)
+        var tree: Tree
         do {
             tree = try Tree(scope.url.resolvingSymlinksInPath())
         } catch {
-            sourceScope = nil
-            throw BackupError.message("无法访问源文件夹：\(job.source.path)")
+            scope = scoped(job.sourceBookmark, fallback: job.source)
+            guard let relocated = try? Tree(scope.url.resolvingSymlinksInPath()) else {
+                sourceScope = nil
+                throw BackupError.message("无法访问源文件夹：\(job.source.path)")
+            }
+            tree = relocated
         }
-        guard try identity(tree) == job.sourceIdentity else {
-            throw BackupError.message("源文件夹已替换，请在设置中重新选择")
+        if try Self.identity(tree) != job.sourceIdentity {
+            let resolved = scoped(job.sourceBookmark, fallback: job.source)
+            guard resolved.url != scope.url, let relocated = try? Tree(resolved.url.resolvingSymlinksInPath()),
+                  try Self.identity(relocated) == job.sourceIdentity else {
+                throw BackupError.message("源文件夹已替换，请在设置中重新选择")
+            }
+            scope = resolved
+            tree = relocated
+        }
+        if let actual = tree.actualURL, actual.path != tree.url.path {
+            let resolved = try Tree(actual)
+            guard resolved.identity == tree.identity, resolved.device == tree.device else { throw BackupError.unstable(actual.path) }
+            tree = resolved
         }
         sourceScope = scope
         return tree
     }
 
     private func findTarget(_ job: BackupJob) throws -> (Tree, VolumeInfo)? {
+        if job.setID != nil {
+            guard let volume = mappedVolume else { return nil }
+            let disk = try Tree(volume.mount.resolvingSymlinksInPath())
+            return (try Repository.memberTree(on: disk, folder: job.targetRelativePath, job: job.id, volume: volume), volume)
+        }
         // The retained scope may still name the old mount point after a volume rename.
         let primary = scoped(job.targetBookmark, fallback: job.target)
         let diskAccess = job.storageBookmark.map { scoped($0, fallback: job.target) }
@@ -571,8 +613,8 @@ public final class SyncEngine: @unchecked Sendable {
             }
             return false
         }
-        let disk = try storageDisk(job, tree: tree, volume: volume)
-        let located = try Repository.locatedTree(tree, volume: volume, disk: disk)
+        let disk = job.setID == nil ? try storageDisk(job, tree: tree, volume: volume) : nil
+        let located = job.setID == nil ? try Repository.locatedTree(tree, volume: volume, disk: disk) : tree
         let next = try Repository(tree: located, volume: volume, job: job, catalog: catalog, host: host, interruption: interruption)
         repository = next
         do {
@@ -676,6 +718,10 @@ public final class SyncEngine: @unchecked Sendable {
             if changed { automaticRetries = 0 }
             guard let job, job.automatic, !job.restoreOnly, !isPaused, let repository, changed || force,
                   try !requiresTakeover(repository, job: job) else { return }
+            if let automaticHandler {
+                automaticHandler(false)
+                return
+            }
             _ = try run(verify: false)
             if unstableThisRun, automaticRetries < 2 {
                 automaticRetries += 1
@@ -714,7 +760,14 @@ public final class SyncEngine: @unchecked Sendable {
 
     public func syncNow() async throws -> SyncProgress {
         try await perform { engine in
-            do { return try engine.run(verify: false) }
+            do {
+                let result = try engine.run(verify: false)
+                if engine.automaticHandler != nil, engine.unstableThisRun, engine.automaticRetries < 2 {
+                    engine.automaticRetries += 1
+                    engine.schedule(force: true, delay: .seconds(2))
+                }
+                return result
+            }
             catch { engine.fail(error); throw error }
         }
     }
@@ -743,8 +796,95 @@ public final class SyncEngine: @unchecked Sendable {
             self.suppressConnection = false
             do {
                 try self.refresh()
-                if self.repository != nil { _ = try self.run(verify: false) }
+                if self.repository != nil {
+                    if let handler = self.automaticHandler { handler(false) }
+                    else { _ = try self.run(verify: false) }
+                }
             } catch { self.fail(error) }
+        }
+    }
+
+    func bindMember(to volume: VolumeInfo?, relative: String?, source: URL? = nil) async throws {
+        try await perform { engine in
+            try engine.load()
+            guard var job = engine.job, job.setID != nil else { return }
+            if let relative { job.targetRelativePath = relative }
+            if let source { job.source = source }
+            if let volume {
+                job.target = volume.mount.appending(path: job.targetRelativePath, directoryHint: .isDirectory)
+                job.volumeName = volume.name
+            }
+            if engine.mappedVolume?.mount != volume?.mount || engine.job?.targetRelativePath != job.targetRelativePath {
+                engine.repository = nil
+                engine.targetMonitor = nil
+            }
+            if volume != nil, engine.mappedVolume == nil { engine.suppressConnection = false }
+            engine.mappedVolume = volume
+            if engine.job?.target != job.target || engine.job?.source != job.source ||
+                engine.job?.volumeName != job.volumeName {
+                try JSONEncoder().encode(job).write(to: engine.configURL, options: .atomic)
+            }
+            engine.job = job
+            do { try engine.refresh(); engine.publish() }
+            catch { engine.fail(error); throw error }
+        }
+    }
+
+    func memberSource() async throws -> URL {
+        try await perform { engine in
+            guard let job = engine.job, !job.restoreOnly else { throw BackupError.message("请选择源文件夹") }
+            return try engine.sourceTree(job).url
+        }
+    }
+
+    func setMediumOverrides(_ values: [String: StorageMedium]) async {
+        try? await perform { $0.mediumOverrides = values }
+    }
+
+    private func profile(_ source: Tree, target: VolumeInfo) -> IOProfile {
+        if sourceDevice?.0 != source.device { sourceDevice = (source.device, StorageDeviceInfo.inspect(source)) }
+        let device = sourceDevice!.1
+        return IOProfile(source: mediumOverrides[device.identifier.uppercased()] ?? device.medium,
+                         target: mediumOverrides[target.device.identifier.uppercased()] ?? target.device.medium)
+    }
+
+    func hasPendingChanges() async throws -> Bool {
+        try await perform { engine in
+            _ = try engine.persistEvents(flush: true)
+            guard let catalog = engine.catalog else { return false }
+            return try !catalog.pending("source").empty || !catalog.pending("target").empty
+        }
+    }
+
+    func report(_ error: any Error) async {
+        try? await perform { $0.fail(error) }
+    }
+
+    func releaseForEjection() async throws {
+        try await perform { engine in
+            _ = try engine.persistEvents(flush: true)
+            if let repository = engine.repository {
+                if try repository.needsRecovery() { try repository.open() }
+                try repository.tree.checkRoot()
+                try repository.tree.root.flush(directory: true)
+            }
+            engine.repository = nil
+            engine.targetMonitor = nil
+            engine.sourceMonitor = nil
+            engine.targetScope = nil
+            engine.storageScope = nil
+            engine.mappedVolume = nil
+            engine.suppressConnection = true
+            engine.scheduled?.cancel()
+            engine.progress.state = .ejecting
+            engine.publish()
+        }
+    }
+
+    func didEject(_ failure: String?) async {
+        try? await perform {
+            $0.setPaused(false)
+            $0.completeEjection(failure: failure, afterBackup: true)
         }
     }
 
@@ -851,14 +991,15 @@ public final class SyncEngine: @unchecked Sendable {
             let access = Scope(folder)
             let source = try Tree(folder.resolvingSymlinksInPath())
             try engine.validateFolders(source.url, repo.tree.url)
-            let identity = try engine.identity(source)
+            let identity = try Self.identity(source)
             let configured = BackupJob(id: job.id, source: source.url, target: repo.tree.url, volumeID: job.volumeID,
                                        volumeName: job.volumeName, format: job.format,
                                        sourceBookmark: engine.bookmark(folder, readOnly: false), targetBookmark: job.targetBookmark,
                                        sourceIdentity: identity, targetRelativePath: job.targetRelativePath,
                                        automatic: job.restoreOnly || job.automatic, restoreOnly: false,
                                        reuseMatchingFiles: job.reuseMatchingFiles, existingFiles: job.existingFiles,
-                                       ejectAfterBackup: job.ejectAfterBackup, storageBookmark: job.storageBookmark)
+                                       ejectAfterBackup: job.ejectAfterBackup, storageBookmark: job.storageBookmark,
+                                       setID: job.setID)
             let checkpoint = engine.alignmentURL(job)
             if FileManager.default.fileExists(atPath: checkpoint.path) {
                 var saved = try JSONDecoder().decode(AlignmentCheckpoint.self, from: Data(contentsOf: checkpoint))
@@ -884,7 +1025,7 @@ public final class SyncEngine: @unchecked Sendable {
             guard let session = engine.takeover, session.draft.preview.id == id, let repo = engine.repository,
                   session.job.id == repo.descriptor.job else { throw BackupError.message("请重新预览接管") }
             let source = try Tree(session.access.url.resolvingSymlinksInPath())
-            guard try engine.identity(source) == session.job.sourceIdentity else { throw BackupError.message("源文件夹已替换") }
+            guard try Self.identity(source) == session.job.sourceIdentity else { throw BackupError.message("源文件夹已替换") }
             let checkpointURL = engine.alignmentURL(session.job)
             let draft = session.draft
             let plan: AlignmentCheckpoint
@@ -1023,6 +1164,8 @@ public final class SyncEngine: @unchecked Sendable {
             return progress
         }
         let source = try sourceTree(job)
+        let profile = profile(source, target: repository.volume)
+        repository.ioProfile = profile
         try startSourceMonitor(source, catalog: catalog)
         try persistEvents(flush: true)
         let begin = ProcessInfo.processInfo.systemUptime
@@ -1042,6 +1185,7 @@ public final class SyncEngine: @unchecked Sendable {
         progress = SyncProgress(state: verify ? .verifying : .checking, trackedFiles: oldCount,
                                 unmanaged: progress.unmanaged, lastSuccess: lastSuccess)
         progress.lastRunID = previousRun
+        progress.ioBufferBudget = profile.bufferBudget
         unstableThisRun = false
         publish()
 
@@ -1066,11 +1210,11 @@ public final class SyncEngine: @unchecked Sendable {
         var problems = plan.problems
         var targetRetry = Set<String>()
         let transfer = Transfer(source: source, target: repository.tree, scratch: scratch, volume: repository.volume,
-                                existingFilesPolicy: job.existingFilesPolicy)
+                                existingFilesPolicy: job.existingFilesPolicy, profile: profile)
         for wave in plan.waves {
-            for start in stride(from: 0, to: wave.count, by: 128) {
+            for start in stride(from: 0, to: wave.count, by: IOProfile.batchSize) {
                 if isPaused { throw BackupError.paused }
-                let items = Array(wave[start..<min(start + 128, wave.count)])
+                let items = Array(wave[start..<min(start + IOProfile.batchSize, wave.count)])
                 progress.currentPath = items.first?.path
                 try runBatch(items, run: run, transfer: transfer, repository: repository,
                              problems: &problems, targetRetry: &targetRetry)
@@ -1094,7 +1238,7 @@ public final class SyncEngine: @unchecked Sendable {
         }
         try pruneIfDue(repository)
         repository.refreshCapacity()
-        let autoEject = job.ejectAfterBackup == true && success
+        let autoEject = automaticHandler == nil && job.ejectAfterBackup == true && success
         let newerChanges = try persistEvents(flush: autoEject)
         progress.trackedFiles = try catalog.fileCount()
         try catalog.finishRun(run.id, outcome: success ? .completed : .needsAttention, at: .now, issues: problems.count)
@@ -1123,7 +1267,7 @@ public final class SyncEngine: @unchecked Sendable {
     private func runBatch(_ items: [Work], run: BackupRunTag, transfer: Transfer, repository: Repository,
                           problems: inout [String: String], targetRetry: inout Set<String>) throws {
         let results = PreparationResults(count: items.count)
-        let workers = min(items.count, repository.volume.isSolidState ? 4 : 1)
+        let workers = min(items.count, transfer.profile.workers)
         DispatchQueue.concurrentPerform(iterations: workers) { worker in
             for index in stride(from: worker, to: items.count, by: workers) {
                 results.set(Result { try transfer.prepare(items[index]) }, at: index)
@@ -1152,6 +1296,9 @@ public final class SyncEngine: @unchecked Sendable {
                 progress.sourceReadBytes += prepared.sourceBytes
                 progress.targetReadBytes += prepared.targetBytes
                 progress.latestWrittenBytes += prepared.latestBytes - (prepared.patch?.bytes ?? 0)
+                progress.sourceReadRequests += prepared.sourceReadRequests
+                progress.targetReadRequests += prepared.targetReadRequests
+                progress.latestWriteRequests += prepared.latestWriteRequests
                 guard var edit = prepared.edit else {
                     if item.stamp?.kind == .regular || item.stamp?.kind == .symlink { progress.skipped += 1 }
                     continue
@@ -1159,6 +1306,7 @@ public final class SyncEngine: @unchecked Sendable {
                 if prepared.archive {
                     edit.archive = try repository.archive(edit, old: item.old, knownHashes: prepared.oldHashes, writer: writer) {
                         progress.targetReadBytes += Int64($0)
+                        progress.targetReadRequests += 1
                     }
                 }
                 if let patch = prepared.patch { patches[edit.path] = patch }
@@ -1192,6 +1340,7 @@ public final class SyncEngine: @unchecked Sendable {
                 }
             }
             progress.latestWrittenBytes += patches.values.reduce(0) { $0 + $1.bytes }
+            progress.latestWriteRequests += patches.values.reduce(0) { $0 + $1.writeRequests(window: transfer.profile.targetWindow) }
             progress.unmanaged = max(0, progress.unmanaged - adoptedEntries)
             progress.skipped += reusedFiles
             if reusedFiles > 0 { progress.reusedFiles = (progress.reusedFiles ?? 0) + reusedFiles }

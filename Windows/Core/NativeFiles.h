@@ -25,6 +25,21 @@ struct Time {
 };
 
 enum class Kind { regular, directory, link, unsupported };
+enum class StorageMedium { unknown, hdd, ssd };
+struct StorageDeviceInfo {
+    std::string id;
+    StorageMedium medium{};
+};
+struct IOProfile {
+    static constexpr size_t batchSize = 128;
+    static constexpr size_t bufferLimit = 64 * 1024 * 1024;
+    static constexpr size_t window(StorageMedium medium) { return (medium == StorageMedium::ssd ? 1 : 4) * 1024 * 1024; }
+    size_t sourceWindow, targetWindow, workers;
+    IOProfile(StorageMedium source = {}, StorageMedium target = {})
+        : sourceWindow(window(source)), targetWindow(window(target)),
+          workers(source == StorageMedium::ssd && target == StorageMedium::ssd ? 4 : 1) {}
+    size_t bufferBudget() const { return workers * (sourceWindow + targetWindow) + targetWindow; }
+};
 struct Stamp {
     Kind kind{};
     int64_t size{};
@@ -53,7 +68,7 @@ Bytes unbase64(std::string_view data);
 class File {
 public:
     enum class Mode { read, write, create };
-    File(const fs::path&, Mode);
+    File(const fs::path&, Mode, bool sequential = false);
     ~File();
     File(File&&) noexcept;
     File& operator=(File&&) noexcept;
@@ -68,6 +83,16 @@ private:
     intptr_t handle_{-1};
 };
 
+class FileLease {
+public:
+    explicit FileLease(const fs::path&);
+    ~FileLease();
+    FileLease(const FileLease&) = delete;
+    FileLease& operator=(const FileLease&) = delete;
+private:
+    intptr_t handle_{-1};
+};
+
 class Tree {
 public:
     explicit Tree(fs::path root);
@@ -78,7 +103,7 @@ public:
     void check() const;
     std::optional<Stamp> entry(std::string_view relative) const;
     fs::path checked(std::string_view relative) const;
-    File file(std::string_view relative, File::Mode mode = File::Mode::read) const;
+    File file(std::string_view relative, File::Mode mode = File::Mode::read, bool sequential = false) const;
     std::vector<std::string> children(std::string_view relative = {}) const;
     void walk(std::string_view relative, const std::function<void(const std::string&, const Stamp&)>&,
               bool skipControl = true) const;
@@ -89,7 +114,8 @@ public:
     void removeOwned(std::string_view relative) const;
     void createLink(std::string_view relative, std::string_view target, bool directory) const;
     Bytes readDocument(std::string_view relative) const;
-    void writeDocument(std::string_view relative, std::string_view data, bool replace = false) const;
+    void writeDocument(std::string_view relative, std::string_view data, bool replace = false,
+                       std::string_view staging = {}, bool hidden = false) const;
     void metadata(std::string_view relative, Time modified, Time created, uint32_t attributes, bool readOnly = false) const;
     void flushDirectory(std::string_view relative = {}) const;
     void hide(std::string_view relative) const;
@@ -104,11 +130,13 @@ struct Volume {
     fs::path mount;
     std::string id, label, format;
     uint64_t free{}, total{};
-    bool external{}, solidState{};
+    bool external{};
+    StorageDeviceInfo device;
 };
 Volume inspect(const fs::path&);
 std::optional<fs::path> findVolume(std::string_view id);
 void eject(const Volume&);
-Bytes hashFile(const File&, int64_t size, int64_t* readBytes = nullptr);
+Bytes hashFile(const File&, int64_t size, int64_t* readBytes = nullptr,
+               size_t window = IOProfile::window(StorageMedium::unknown), int64_t* requests = nullptr);
 void copyChecked(const File&, File&, int64_t size, std::string_view hashes);
 }

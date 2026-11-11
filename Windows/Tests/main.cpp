@@ -1,4 +1,4 @@
-#include "../Core/Engine.h"
+#include "../Core/Coordinator.h"
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -320,6 +320,169 @@ void organizedRepository(const fs::path& volume) {
     expect(read(restored, "file.txt") == "first", "restore from external history");
 }
 
+void collectionRecovery(const fs::path& volume) {
+    for (auto point : {SetInterruption::prepared, SetInterruption::relocated, SetInterruption::published}) {
+        Fixture f(volume);
+        auto info = inspect(f.target);
+        info.mount = f.target;
+        info.format = "exfat";
+        const auto job = uuid(), host = uuid();
+        BackupSet set{uuid(), "exfat", 1, {{uuid(), job, "Projects", true}}};
+        std::optional<SetInterruption> fault;
+        {
+            BackupSetStore store(info, [&](auto at) {
+                if (fault == at) { fault.reset(); throw std::runtime_error("interrupted set change"); }
+            });
+            Json marker = {{"version", 2}, {"job", job}, {"format", "exfat"}, {"initialWriter", host}, {"legacyGeneration", 0}};
+            store.apply({0, set, {marker}, {}});
+            write(store.disk, "BackupGenius/Projects/file", "preserved");
+            set.revision = 2;
+            set.mappings[0].folder = "Work/Projects";
+            fault = point;
+            bool stopped = false;
+            try { store.apply({1, set, {}, {{"Projects", "Work/Projects", job}}}); }
+            catch (...) { stopped = true; }
+            expect(stopped, "set interruption must fire");
+        }
+        BackupSetStore recovered(info);
+        expect(recovered.recover() == set && recovered.recover() == set, "set recovery is repeatable");
+        expect(read(recovered.disk, "BackupGenius/Work/Projects/file") == "preserved", "relocation preserves the latest bytes");
+        expect(!recovered.disk.entry("BackupGenius/Work/Projects/.backup-genius.json"), "relocation witness is removed");
+    }
+}
+
+void collections(const fs::path& volume) {
+    if (volume.empty() || inspect(volume).format != "exfat") return;
+    Fixture f;
+    const auto work = f.source / "Work" / "Projects", personal = f.source / "Personal" / "Projects";
+    fs::create_directories(work);
+    fs::create_directories(personal);
+    write(Tree(work), "file.txt", "first");
+    write(Tree(personal), "file.txt", "personal");
+    std::set<std::string> jobs;
+    struct Cleanup {
+        fs::path volume;
+        std::set<std::string>& jobs;
+        ~Cleanup() {
+            std::error_code error;
+            fs::remove_all(volume / path(backupRoot), error);
+            fs::remove_all(volume / path(join(storageFolder, "set")), error);
+            for (const auto& job : jobs) fs::remove_all(volume / path(join(storageFolder, job)), error);
+        }
+    } cleanup{volume, jobs};
+    {
+        BackupCoordinator coordinator(f.state, {}, true);
+        coordinator.start();
+        auto preview = coordinator.previewSetup(volume, {work});
+        bool rejected = false;
+        try {
+            coordinator.confirmSetup(preview.id, {{preview.rows.front().id, "../invalid"}}, false, false);
+        } catch (const std::runtime_error&) { rejected = true; }
+        expect(rejected, "invalid setup must fail");
+        preview = coordinator.previewSetup(volume, {work});
+        coordinator.confirmSetup(preview.id, {}, false, false);
+        auto snapshot = coordinator.presentation();
+        expect(snapshot.folders.size() == 1 && snapshot.folders[0].mapping->folder == "Projects", "single mapping preserves its name");
+        jobs.insert(snapshot.folders[0].job.id);
+        preview = coordinator.previewSetup(volume, {personal});
+        expect(preview.rows[0].folder() == "Work/Projects" && preview.rows[1].folder() == "Personal/Projects", "duplicate names get parent groups");
+        coordinator.confirmSetup(preview.id, {}, false, false);
+        snapshot = coordinator.presentation();
+        expect(snapshot.folders.size() == 2, "adding a mapping retains the first job");
+        for (const auto& folder : snapshot.folders) jobs.insert(folder.job.id);
+        auto result = coordinator.sync();
+        expect(result.state == SyncState::upToDate && result.sourceRead == 0 && result.targetRead == 0 &&
+            result.latestWritten == 0 && result.historyWritten == 0, "quiet collections avoid body I/O");
+        expect(coordinator.history().empty(), "moving a mapped folder does not archive unchanged data");
+        fs::rename(work, work.parent_path() / "Design");
+        result = coordinator.sync();
+        expect(result.state == SyncState::upToDate, result.message);
+        expect(read(Tree(volume), "BackupGenius/Work/Design/file.txt") == "first", "source folder rename follows the mapping");
+        expect(result.latestWritten == 0, "source folder rename only moves paths");
+        fs::rename(work.parent_path() / "Design", work.parent_path() / "design");
+        result = coordinator.sync();
+        expect(result.state == SyncState::upToDate, result.message);
+        const auto children = Tree(volume).children("BackupGenius/Work");
+        expect(std::find(children.begin(), children.end(), "design") != children.end(), "case-only source rename preserves its spelling");
+        expect(result.latestWritten == 0, "case-only source rename does not copy content");
+        write(Tree(personal), "file.txt", "edited");
+        result = coordinator.sync(true);
+        expect(result.state == SyncState::upToDate && read(Tree(volume), "BackupGenius/Personal/Projects/file.txt") == "edited",
+            "other source continues to sync after regrouping");
+    }
+    BackupCoordinator reopened(f.state, {}, true);
+    reopened.start();
+    expect(reopened.presentation().folders.size() == 2, "collection config survives restart");
+    expect(reopened.sync().state == SyncState::upToDate, "restarted collection can sync");
+    fs::remove_all(work.parent_path() / "design");
+    write(Tree(personal), "file.txt", "available");
+    const auto partial = reopened.sync(true);
+    expect(partial.state == SyncState::needsAttention, "missing source needs attention");
+    expect(read(Tree(volume), "BackupGenius/Work/design/file.txt") == "first", "missing source preserves its copy");
+    expect(read(Tree(volume), "BackupGenius/Personal/Projects/file.txt") == "available", "other mapping finishes after a source failure");
+    for (auto source : {StorageMedium::unknown, StorageMedium::hdd, StorageMedium::ssd})
+        for (auto target : {StorageMedium::unknown, StorageMedium::hdd, StorageMedium::ssd}) {
+            const IOProfile profile(source, target);
+            expect(profile.workers == (source == StorageMedium::ssd && target == StorageMedium::ssd ? 4 : 1), "I/O concurrency uses both devices");
+            expect(profile.bufferBudget() <= IOProfile::bufferLimit, "I/O buffers stay within budget");
+        }
+}
+
+void copySetFixture(const fs::path& source, const fs::path& target) {
+    fs::create_directories(target);
+    for (const auto& entry : fs::directory_iterator(source)) {
+        if (utf8(entry.path().filename()).starts_with("._")) continue;
+        const auto destination = target / entry.path().filename();
+        if (entry.is_directory()) copySetFixture(entry.path(), destination);
+        else fs::copy_file(entry.path(), destination, fs::copy_options::overwrite_existing);
+    }
+}
+void setInterop(const fs::path& input, const fs::path& output, const fs::path& volume) {
+    expect(!volume.empty() && inspect(volume).format == "exfat", "set interop requires a disposable exFAT volume");
+    Fixture f;
+    for (const auto& directory : {std::string(backupRoot), std::string(storageFolder)})
+        copySetFixture(input / path(directory), volume / path(directory));
+    const auto info = inspect(volume);
+    auto set = *BackupSetStore::read(Tree(volume), info.format);
+    const auto job = set.mappings.front().job;
+    {
+        BackupCoordinator coordinator(f.state, {}, true);
+        coordinator.openExisting(volume / path(backupRoot));
+        expect(coordinator.presentation().folders.size() == 1, "read Swift set");
+        expect(coordinator.history().size() == 1, "read Swift set history");
+        const auto source = f.source / "Source";
+        fs::create_directory(source);
+        const auto takeover = coordinator.previewTakeover(source);
+        coordinator.confirmTakeover(takeover.id, {});
+        auto expected = Bytes(2 * blockSize, 'A');
+        expected[0] = 'M';
+        expect(read(Tree(source), "payload.bin") == expected, "restore Swift set onto a new host");
+        expected[blockSize] = 'W';
+        write(Tree(source), "payload.bin", expected);
+        const auto result = coordinator.sync(true);
+        expect(result.state == SyncState::upToDate, result.message);
+        expect(result.latestWritten == blockSize, "C++ set updates one logical block");
+    }
+    {
+        BackupSetStore store(info, [](auto at) {
+            if (at == SetInterruption::relocated) throw std::runtime_error("interrupted collection move");
+        });
+        set.revision += 1;
+        set.mappings[0].folder = "Origin/Source";
+        bool stopped = false;
+        try { store.apply({set.revision - 1, set, {}, {{"Source", "Origin/Source", job}}}); }
+        catch (...) { stopped = true; }
+        expect(stopped, "C++ set move was interrupted after staging");
+    }
+    copySetFixture(volume / path(backupRoot), output / path(backupRoot));
+    for (const auto& directory : {job, std::string("set")})
+        copySetFixture(volume / path(join(storageFolder, directory)), output / path(join(storageFolder, directory)));
+    std::error_code error;
+    fs::remove_all(volume / path(backupRoot), error);
+    for (const auto& directory : {job, std::string("set")})
+        fs::remove_all(volume / path(join(storageFolder, directory)), error);
+}
+
 Json metrics(const SyncProgress& p) {
     return {{"checkingSeconds", p.checkingSeconds}, {"elapsedSeconds", p.elapsedSeconds}, {"examined", p.examined},
         {"sourceReadBytes", p.sourceRead}, {"targetReadBytes", p.targetRead}, {"latestWrittenBytes", p.latestWritten},
@@ -431,6 +594,8 @@ int entry(std::vector<std::string> args) {
     try {
         if (args.size() == 5 && args[1] == "--benchmark") {
             benchmark(std::stoi(args[2]), path(args[3]), path(args[4]));
+        } else if (args.size() == 5 && args[1] == "--set-interop") {
+            setInterop(path(args[2]), path(args[3]), path(args[4]));
         } else if ((args.size() == 4 || args.size() == 5) && args[1] == "--interop") {
             interop(path(args[2]), path(args[3]), args.size() == 5 ? path(args[4]) : fs::path{});
         } else {
@@ -445,6 +610,8 @@ int entry(std::vector<std::string> args) {
             safety(volume);
             macOnlyNames(volume);
             organizedRepository(volume);
+            collectionRecovery(volume);
+            collections(volume);
             pruning(volume);
 #ifdef _WIN32
             liveEvents(volume);

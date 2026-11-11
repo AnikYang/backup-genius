@@ -24,6 +24,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/mount.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -321,12 +322,13 @@ Bytes unbase64(std::string_view input) {
     return out;
 }
 
-File::File(const fs::path& p, Mode mode) {
+File::File(const fs::path& p, Mode mode, bool sequential) {
 #ifdef _WIN32
     const auto access = mode == Mode::read ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE);
     const auto share = FILE_SHARE_READ | FILE_SHARE_DELETE | (mode == Mode::read ? FILE_SHARE_WRITE : 0);
     const auto disposition = mode == Mode::create ? CREATE_NEW : OPEN_EXISTING;
-    auto h = CreateFileW(p.c_str(), access, share, nullptr, disposition, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    auto flags = FILE_FLAG_OPEN_REPARSE_POINT | (sequential ? FILE_FLAG_SEQUENTIAL_SCAN : 0);
+    auto h = CreateFileW(p.c_str(), access, share, nullptr, disposition, flags, nullptr);
     if (h == INVALID_HANDLE_VALUE) throw std::system_error(GetLastError(), std::system_category(), "CreateFileW " + utf8(p));
     handle_ = reinterpret_cast<intptr_t>(h);
 #else
@@ -334,9 +336,37 @@ File::File(const fs::path& p, Mode mode) {
     if (mode == Mode::create) flags |= O_CREAT | O_EXCL;
     handle_ = ::open(p.c_str(), flags | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (handle_ < 0) throw std::system_error(errno, std::generic_category(), "open " + utf8(p));
+    if (sequential) (void)fcntl(static_cast<int>(handle_), F_RDAHEAD, 1);
 #endif
     try { require(stamp().kind == Kind::regular, "需要普通文件"); }
     catch (...) { File cleanup(std::move(*this)); throw; }
+}
+FileLease::FileLease(const fs::path& p) {
+#ifdef _WIN32
+    const auto h = CreateFileW(p.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) fail("打开备份锁");
+    OVERLAPPED range{};
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &range)) {
+        CloseHandle(h);
+        throw std::runtime_error("此备份正在另一个进程中使用");
+    }
+    handle_ = reinterpret_cast<intptr_t>(h);
+#else
+    const auto fd = ::open(p.c_str(), O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0) close(fd);
+        throw std::runtime_error("此备份正在另一个进程中使用");
+    }
+    handle_ = fd;
+#endif
+}
+FileLease::~FileLease() {
+#ifdef _WIN32
+    CloseHandle(reinterpret_cast<HANDLE>(handle_));
+#else
+    close(static_cast<int>(handle_));
+#endif
 }
 File::File(File&& other) noexcept : handle_(std::exchange(other.handle_, -1)) {}
 File& File::operator=(File&& other) noexcept {
@@ -479,11 +509,11 @@ fs::path Tree::checked(std::string_view relative) const {
     }
 }
 std::optional<Stamp> Tree::entry(std::string_view relative) const { return probe(checked(relative)); }
-File Tree::file(std::string_view relative, File::Mode mode) const {
+File Tree::file(std::string_view relative, File::Mode mode, bool sequential) const {
     const auto [root, routed] = route(relative);
     require(!routed.empty(), "根目录不可当作文件打开");
     const PinDirectories pin(root->root_, root->identity_, routed);
-    return File(checked(relative), mode);
+    return File(checked(relative), mode, sequential);
 }
 std::vector<std::string> Tree::children(std::string_view relative) const {
     auto p = checked(relative);
@@ -579,15 +609,24 @@ Bytes Tree::readDocument(std::string_view relative) const {
     require(size >= 0 && size <= 64 * 1024 * 1024, "记录大小异常");
     return input.read(0, static_cast<size_t>(size));
 }
-void Tree::writeDocument(std::string_view relative, std::string_view data, bool replace) const {
+void Tree::writeDocument(std::string_view relative, std::string_view data, bool replace,
+                         std::string_view staging, bool hidden) const {
     require(data.size() <= 64 * 1024 * 1024, "备份记录超过大小限制");
-    const auto temporary = join(parent(relative), ".write-" + uuid());
-    auto output = file(temporary, File::Mode::create);
+    const auto temporary = join(staging.empty() ? parent(relative) : staging, ".write-" + uuid());
+    auto output = std::make_optional(file(temporary, File::Mode::create));
     try {
-        output.write(0, data);
-        output.flush();
+        output->write(0, data);
+        output->flush();
+        output.reset();
+        if (hidden) {
+            hide(temporary);
+#ifndef _WIN32
+            remove(join(parent(temporary), "._" + name(temporary)));
+#endif
+        }
         rename(temporary, relative, replace);
         flushDirectory(parent(relative));
+        if (!staging.empty()) flushDirectory(staging);
     } catch (...) {
         try { remove(temporary); } catch (...) {}
         throw;
@@ -641,20 +680,24 @@ void Tree::flushDirectory(std::string_view relative) const {
     if (result != 0 && error != EINVAL && error != ENOTSUP) { errno = error; fail("fsync directory"); }
 #endif
 }
-Bytes hashFile(const File& input, int64_t size, int64_t* bytes) {
+Bytes hashFile(const File& input, int64_t size, int64_t* bytes, size_t window, int64_t* requests) {
     Bytes hashes;
     for (int64_t offset = 0; offset < size;) {
-        const auto data = input.read(offset, static_cast<size_t>(std::min(blockSize, size - offset)));
-        hashes += sha256(data);
+        const auto data = input.read(offset, static_cast<size_t>(std::min<int64_t>(window, size - offset)));
+        for (size_t start = 0; start < data.size(); start += blockSize)
+            hashes += sha256(std::string_view(data).substr(start, blockSize));
         if (bytes) *bytes += data.size();
+        if (requests) ++*requests;
         offset += static_cast<int64_t>(data.size());
     }
     return hashes;
 }
 void copyChecked(const File& input, File& output, int64_t size, std::string_view hashes) {
     for (int64_t offset = 0; offset < size;) {
-        auto bytes = input.read(offset, static_cast<size_t>(std::min(blockSize, size - offset)));
-        require(sha256(bytes) == hashes.substr(static_cast<size_t>(offset / blockSize * 32), 32), "文件内容校验失败");
+        auto bytes = input.read(offset, static_cast<size_t>(std::min<int64_t>(IOProfile::window({}), size - offset)));
+        for (size_t start = 0; start < bytes.size(); start += blockSize)
+            require(sha256(std::string_view(bytes).substr(start, blockSize)) ==
+                    hashes.substr((static_cast<size_t>(offset) + start) / blockSize * 32, 32), "文件内容校验失败");
         output.write(offset, bytes);
         offset += static_cast<int64_t>(bytes.size());
     }
@@ -671,7 +714,7 @@ Volume inspect(const fs::path& p) {
     ULARGE_INTEGER free{}, total{};
     if (!GetDiskFreeSpaceExW(mount, &free, &total, nullptr)) fail("GetDiskFreeSpaceExW");
     bool external = GetDriveTypeW(mount) == DRIVE_REMOVABLE;
-    bool solidState = false;
+    auto medium = StorageMedium::unknown;
     std::wstring volumeDevice(volumeName);
     volumeDevice.pop_back();
     auto h = CreateFileW(volumeDevice.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -687,17 +730,20 @@ Volume inspect(const fs::path& p) {
         query.PropertyId = StorageDeviceSeekPenaltyProperty;
         DEVICE_SEEK_PENALTY_DESCRIPTOR penalty{};
         if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query), &penalty, sizeof(penalty), &received, nullptr) &&
-            received >= sizeof(penalty)) solidState = !penalty.IncursSeekPenalty;
+            received >= sizeof(penalty) && penalty.Size >= sizeof(penalty))
+            medium = penalty.IncursSeekPenalty ? StorageMedium::hdd : StorageMedium::ssd;
         CloseHandle(h);
     }
-    return {fs::path(mount), utf8(fs::path(volumeName)) + "|" + std::to_string(serial), utf8(fs::path(label)),
-        folded(utf8(fs::path(format))), free.QuadPart, total.QuadPart, external, solidState};
+    const auto id = utf8(fs::path(volumeName)) + "|" + std::to_string(serial);
+    return {fs::path(mount), id, utf8(fs::path(label)),
+        folded(utf8(fs::path(format))), free.QuadPart, total.QuadPart, external, {id, medium}};
 #else
     struct statfs info{};
     if (statfs(p.c_str(), &info) != 0) fail("statfs");
-    return {fs::path(info.f_mntonname), std::to_string(info.f_fsid.val[0]), fs::path(info.f_mntonname).filename().string(),
+    const auto id = std::to_string(info.f_fsid.val[0]);
+    return {fs::path(info.f_mntonname), id, fs::path(info.f_mntonname).filename().string(),
         info.f_fstypename, static_cast<uint64_t>(info.f_bavail) * info.f_bsize,
-        static_cast<uint64_t>(info.f_blocks) * info.f_bsize, false, false};
+        static_cast<uint64_t>(info.f_blocks) * info.f_bsize, false, {id, StorageMedium::unknown}};
 #endif
 }
 std::optional<fs::path> findVolume(std::string_view id) {

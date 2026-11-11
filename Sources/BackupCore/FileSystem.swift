@@ -153,14 +153,24 @@ final class FD: @unchecked Sendable {
         }
     }
 
-    func fileHashes(size: Int64, onRead: (Int) -> Void = { _ in }) throws -> Data {
-        var result = Data()
+    func readSequentially(size: Int64, window: Int, _ visit: (Int64, Data) throws -> Void) throws {
+        guard size > 0 else { return }
+        if size > Int64(window) { _ = fcntl(value, F_RDAHEAD, 1) }
         var offset: Int64 = 0
         while offset < size {
-            let data = try readExact(at: offset, length: Int(min(Int64(blockSize), size - offset)))
-            onRead(data.count)
-            result.append(digest(data))
+            let data = try readExact(at: offset, length: Int(min(Int64(window), size - offset)))
+            try visit(offset, data)
             offset += Int64(data.count)
+        }
+    }
+
+    func fileHashes(size: Int64, window: Int = IOProfile.window(.unknown), onRead: (Int) -> Void = { _ in }) throws -> Data {
+        var result = Data()
+        try readSequentially(size: size, window: window) { _, data in
+            onRead(data.count)
+            for start in stride(from: 0, to: data.count, by: blockSize) {
+                result.append(digest(data[start..<min(start + blockSize, data.count)]))
+            }
         }
         return result
     }
@@ -264,6 +274,13 @@ final class Tree: @unchecked Sendable {
 
     func subtree(_ path: String) throws -> Tree {
         try Tree(url.appending(path: path, directoryHint: .isDirectory), root: directory(path))
+    }
+
+    var actualURL: URL? {
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fcntl(root.value, F_GETPATH, &path) == 0 else { return nil }
+        let pathBytes = path.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return URL(fileURLWithPath: String(decoding: pathBytes, as: UTF8.self), isDirectory: true)
     }
 
     func checkRoot() throws {
@@ -594,22 +611,10 @@ public extension VolumeInfo {
             isExternal = values.volumeIsInternal == false ||
                 (mountedUnderVolumes && (values.volumeIsInternal == nil || format == .exfat))
         }
-        var solidState = false
-        if let disk {
-            let media = DADiskCopyIOMedia(disk)
-            if media != 0 {
-                defer { IOObjectRelease(media) }
-                let property = IORegistryEntrySearchCFProperty(media, kIOServicePlane,
-                    "Device Characteristics" as CFString, kCFAllocatorDefault,
-                    IOOptionBits(kIORegistryIterateParents | kIORegistryIterateRecursively))
-                let attributes = property as? [String: Any]
-                solidState = attributes?["Medium Type"] as? String == "Solid State"
-            }
-        }
         return Self(name: values.volumeName ?? location.mount.lastPathComponent, mount: location.mount,
                     identifier: identifier, format: format, availableBytes: Int64(values.volumeAvailableCapacity ?? 0),
                     totalBytes: Int64(values.volumeTotalCapacity ?? 0),
                     caseSensitive: values.volumeSupportsCaseSensitiveNames ?? false,
-                    isExternal: isExternal, isSolidState: solidState)
+                    isExternal: isExternal, device: StorageDeviceInfo.inspect(disk, identifier: identifier))
     }
 }

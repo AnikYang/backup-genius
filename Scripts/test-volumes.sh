@@ -19,8 +19,9 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$apfs"
-hdiutil create -type SPARSE -size 2g -fs APFS -volname BG-APFS "$fixture/apfs.sparseimage"
-hdiutil create -type SPARSE -size 2g -fs ExFAT -layout GPTSPUD -volname "BGX$RANDOM" "$fixture/exfat.sparseimage"
+volume_size="${BACKUP_GENIUS_TEST_VOLUME_SIZE:-2g}"
+hdiutil create -type SPARSE -size "$volume_size" -fs APFS -volname BG-APFS "$fixture/apfs.sparseimage"
+hdiutil create -type SPARSE -size "$volume_size" -fs ExFAT -layout GPTSPUD -volname "BGX$RANDOM" "$fixture/exfat.sparseimage"
 hdiutil attach "$fixture/apfs.sparseimage" -mountpoint "$apfs" -nobrowse
 attached="$(hdiutil attach -nomount "$fixture/exfat.sparseimage")"
 exfat_disk="$(printf '%s\n' "$attached" | awk '/GUID_partition_scheme/{print $1; exit}')"
