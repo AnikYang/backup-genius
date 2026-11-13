@@ -14,6 +14,16 @@ public struct CoordinatorPresentation: Sendable {
     public let busy: Bool
     public let diskProgress: [String: SyncProgress]
     public let media: [String: StorageMedium]
+    public let askOnConnect: Bool
+    public let backupPrompts: [BackupPrompt]
+    public let connectedDisks: Set<String>
+}
+
+public struct BackupPrompt: Identifiable, Sendable {
+    public let id: UUID
+    public let volumeID: String
+    public let volumeName: String
+    public let folderCount: Int
 }
 
 public actor BackupCoordinator {
@@ -40,6 +50,15 @@ public actor BackupCoordinator {
         let sources: [UUID: (Scope, String)]
     }
 
+    private enum ConnectionDecision: Equatable {
+        case waiting(UUID), later, allowed
+    }
+
+    private struct Connection {
+        var mount: URL
+        var decision: ConnectionDecision
+    }
+
     private let root: URL
     private let queue = DispatchQueue(label: "backupgenius.disk", qos: .utility)
     private let allowInternal: Bool
@@ -60,11 +79,16 @@ public actor BackupCoordinator {
     private var running: UUID?
     private var paused = false
     private var refreshRequested = false
+    private var diskRefreshTask: Task<Void, Never>?
+    private var disconnectedDisks = Set<String>()
     private var waiters: [CheckedContinuation<Void, Never>] = []
     private var automatic: [UUID: Bool] = [:]
+    private var confirmed = Set<String>()
+    private var connections: [String: Connection] = [:]
+    private var askOnConnect = true
     private var automaticTask: Task<Void, Never>?
     private var progressTask: Task<Void, Never>?
-    private var ejectedVolumes = Set<String>()
+    private var ejectedVolumes: [String: URL] = [:]
     private var diskProgress: [String: SyncProgress] = [:]
     private var media: [String: StorageMedium] = [:]
 
@@ -89,6 +113,7 @@ public actor BackupCoordinator {
 
     private var directory: URL { root.appending(path: "collections", directoryHint: .isDirectory) }
     private var mediaURL: URL { root.appending(path: "storage-media.json") }
+    private var askOnConnectURL: URL { root.appending(path: "ask-on-connect.json") }
     private func local(_ id: UUID) -> URL { directory.appending(path: id.uuidString, directoryHint: .isDirectory) }
     private func jobsDirectory(_ id: UUID, _ job: UUID) -> URL {
         local(id).appending(path: job.uuidString, directoryHint: .isDirectory)
@@ -102,10 +127,11 @@ public actor BackupCoordinator {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         host = try SyncEngine.hostID(at: root.appending(path: "host-id"))
         if let saved = try? Data(contentsOf: mediaURL) { media = try JSONDecoder().decode([String: StorageMedium].self, from: saved) }
+        if let saved = try? Data(contentsOf: askOnConnectURL) { askOnConnect = try JSONDecoder().decode(Bool.self, from: saved) }
         try await legacy.coordinate { [weak self] verify in Task { await self?.enqueue(nil, verify: verify) } }
         observe(legacy)
         await legacy.setMediumOverrides(media)
-        try? await legacy.start()
+        try? await legacy.start(connect: false)
         for location in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
             guard let id = UUID(uuidString: location.lastPathComponent) else { continue }
             let url = location.appending(path: "set.json")
@@ -122,7 +148,7 @@ public actor BackupCoordinator {
                 bindings[id] = pending.binding
             }
         }
-        await reconnect()
+        await refreshDisks()
     }
 
     private var allEngines: [SyncEngine] { [legacy] + Array(engines.values) }
@@ -131,18 +157,29 @@ public actor BackupCoordinator {
         legacy.presentation.job?.id == id ? legacy : engines[id]
     }
 
-    public var presentation: CoordinatorPresentation {
-        let folders = allEngines.compactMap { engine -> BackupFolderStatus? in
+    private var folderStatuses: [BackupFolderStatus] {
+        allEngines.compactMap { engine -> BackupFolderStatus? in
             let snapshot = engine.presentation
             guard let job = snapshot.job else { return nil }
             let mapping = job.setID.flatMap { sets[$0]?.mappings.first(where: { $0.job == job.id }) }
             return BackupFolderStatus(job: job, mapping: mapping, snapshot: snapshot)
-        }.sorted { lhs, rhs in
+        }
+    }
+
+    public var presentation: CoordinatorPresentation {
+        let folders = folderStatuses.sorted { lhs, rhs in
             if lhs.job.setID == nil { return rhs.job.setID != nil }
             if rhs.job.setID == nil { return false }
             return (lhs.job.volumeName, lhs.title, lhs.id.uuidString) < (rhs.job.volumeName, rhs.title, rhs.id.uuidString)
         }
-        return CoordinatorPresentation(folders: folders, running: running, busy: busy, diskProgress: diskProgress, media: media)
+        let prompts = connections.compactMap { disk, connection -> BackupPrompt? in
+            guard case let .waiting(token) = connection.decision else { return nil }
+            let count = writableFolders(folders, on: disk).count
+            guard count > 0 else { return nil }
+            return BackupPrompt(id: token, volumeID: disk, volumeName: connection.mount.lastPathComponent, folderCount: count)
+        }.sorted { ($0.volumeName, $0.id.uuidString) < ($1.volumeName, $1.id.uuidString) }
+        return CoordinatorPresentation(folders: folders, running: running, busy: busy, diskProgress: diskProgress, media: media,
+                                       askOnConnect: askOnConnect, backupPrompts: prompts, connectedDisks: Set(connections.keys))
     }
 
     public func updates() -> AsyncStream<CoordinatorPresentation> {
@@ -175,6 +212,7 @@ public actor BackupCoordinator {
 
     private func publishProgress() {
         progressTask = nil
+        if !busy && !refreshRequested { offerLegacyConnection() }
         publish()
     }
 
@@ -195,7 +233,7 @@ public actor BackupCoordinator {
         publish()
         for waiter in waiters { waiter.resume() }
         waiters.removeAll()
-        if refreshRequested && !closing { Task { await volumesDidChange() } }
+        if refreshRequested { scheduleDiskRefresh() }
         else { scheduleAutomatic() }
     }
 
@@ -238,45 +276,113 @@ public actor BackupCoordinator {
             engines[job] = engine
             observe(engine)
             await engine.setMediumOverrides(media)
-            try? await engine.start()
+            try? await engine.start(connect: false)
         }
     }
 
-    public func volumesDidChange(connected: Bool = false) async {
+    public func volumesDidChange(mounted: URL? = nil, unmounted: URL? = nil) async {
         guard started, !closing else { return }
-        if connected { ejectedVolumes.removeAll() }
-        if busy { refreshRequested = true; return }
+        if let mounted {
+            for (disk, path) in ejectedVolumes where path.standardizedFileURL.path == mounted.standardizedFileURL.path {
+                ejectedVolumes[disk] = nil
+            }
+        }
+        if let unmounted {
+            for (disk, connection) in connections where connection.mount.standardizedFileURL.path == unmounted.standardizedFileURL.path {
+                disconnect(disk)
+                disconnectedDisks.insert(disk)
+            }
+        }
+        refreshRequested = true
+        if mounted != nil || unmounted != nil || busy {
+            publish()
+            scheduleDiskRefresh()
+            return
+        }
+        await checkConnectedDisks()
+    }
+
+    private func scheduleDiskRefresh() {
+        guard diskRefreshTask == nil, !busy, !closing else { return }
+        diskRefreshTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(180))
+            if !Task.isCancelled { await self?.checkConnectedDisks() }
+        }
+    }
+
+    private func checkConnectedDisks() async {
+        diskRefreshTask?.cancel()
+        diskRefreshTask = nil
+        guard !busy, !closing else { return }
         refreshRequested = false
         busy = true
         defer { endOperation() }
-        legacy.volumesDidChange()
+        await refreshDisks()
+    }
+
+    private func refreshDisks() async {
+        let removed = disconnectedDisks
+        disconnectedDisks.removeAll()
+        for disk in removed {
+            for (id, binding) in bindings where binding.volumeID.uppercased() == disk { stores[id] = nil }
+            for folder in onDisk(disk) { await engine(for: folder.id)?.refreshConnection(available: false) }
+        }
+        await refreshLegacyConnection()
         await reconnect()
     }
 
-    private func resolve(_ binding: Binding) -> (Scope, VolumeInfo)? {
-        let access = Scope.resolving(binding.bookmark, fallback: binding.mount)
-        let mounts = VolumeInfo.matchingMounts(binding.volumeID, format: sets[binding.id]?.format)
-        guard !mounts.isEmpty else { return nil }
-        for path in mounts {
-            if let info = try? VolumeInfo.inspect(path), info.identifier.caseInsensitiveCompare(binding.volumeID) == .orderedSame {
-                return (access, info)
+    private func refreshLegacyConnection() async {
+        if let job = legacy.presentation.job {
+            let disk = job.volumeID.uppercased()
+            if let mount = VolumeInfo.matchingMounts(job.volumeID, format: job.format).first {
+                let isNew = connections[disk] == nil || legacy.presentation.volume == nil
+                if !job.restoreOnly { considerConnection(disk, mount: mount) }
+                if ejectedVolumes[disk] == nil, job.restoreOnly || connections[disk]?.decision == .allowed {
+                    await legacy.refreshConnection()
+                    if !job.restoreOnly && isNew { enqueue(job.id, verify: false) }
+                }
+            } else {
+                ejectedVolumes[disk] = nil
+                disconnect(disk)
+                await legacy.refreshConnection(available: false)
             }
         }
-        return nil
+    }
+
+    private func resolve(_ binding: Binding, mounts: [URL]) throws -> (Scope, VolumeInfo) {
+        let access = Scope.resolving(binding.bookmark, fallback: binding.mount)
+        var failure: (any Error)?
+        for path in mounts {
+            do {
+                let info = try VolumeInfo.inspect(path)
+                if info.identifier.caseInsensitiveCompare(binding.volumeID) == .orderedSame { return (access, info) }
+            } catch { failure = error }
+        }
+        throw failure ?? BackupError.disconnected
     }
 
     private func reconnect() async {
         for binding in Array(bindings.values) {
             let id = binding.id, volumeID = binding.volumeID.uppercased()
-            if let old = stores[id], (try? old.disk.checkRoot()) == nil { stores[id] = nil }
-            guard let (access, volume) = resolve(binding) else {
+            let mounts = VolumeInfo.matchingMounts(binding.volumeID, format: sets[id]?.format)
+            guard let mount = mounts.first else {
                 stores[id] = nil
-                ejectedVolumes.remove(volumeID)
-                for job in binding.jobs { try? await engines[job]?.bindMember(to: nil, relative: nil) }
+                ejectedVolumes[volumeID] = nil
+                disconnect(volumeID)
+                for job in binding.jobs { await engines[job]?.refreshConnection(available: false) }
                 continue
             }
-            guard !ejectedVolumes.contains(volumeID) else { continue }
+            guard ejectedVolumes[volumeID] == nil else { continue }
+            let writable = binding.jobs.contains { job in
+                engines[job]?.presentation.job?.restoreOnly == false && sets[id]?.mappings.first(where: { $0.job == job })?.enabled != false
+            }
+            if writable {
+                considerConnection(volumeID, mount: mount)
+                guard connections[volumeID]?.decision == .allowed else { continue }
+            }
+            if let old = stores[id], (try? old.disk.checkRoot()) == nil { stores[id] = nil }
             do {
+                let (access, volume) = try resolve(binding, mounts: mounts)
                 let alreadyOpen = stores[id] != nil
                 let store = try stores[id] ?? BackupSetStore(access, volume: volume, interrupt: interrupt)
                 store.volume = volume
@@ -294,9 +400,7 @@ public actor BackupCoordinator {
                 }
                 stores[id] = store
                 try await attach(set, to: store)
-                if !alreadyOpen {
-                    for job in set.mappings where job.enabled { enqueue(job.job, verify: false) }
-                }
+                if !alreadyOpen { for job in set.mappings where job.enabled { enqueue(job.job, verify: false) } }
             } catch {
                 stores[id] = nil
                 for job in binding.jobs { await engines[job]?.report(error) }
@@ -458,6 +562,7 @@ public actor BackupCoordinator {
         self.draft = nil
         try await attach(set, to: store)
         paused = false
+        connections[volume.identifier.uppercased()] = Connection(mount: volume.mount, decision: .allowed)
         for job in jobs where job.automatic { enqueue(job.id, verify: false) }
         return set
     }
@@ -529,6 +634,29 @@ public actor BackupCoordinator {
         if enabled { enqueue(id, verify: false) }
     }
 
+    public func setAskOnConnect(_ value: Bool) throws {
+        try save(value, to: askOnConnectURL)
+        askOnConnect = value
+        if !value {
+            for (disk, connection) in connections {
+                if case .waiting = connection.decision {
+                    connections[disk]?.decision = .allowed
+                    refreshRequested = true
+                }
+            }
+        }
+        if refreshRequested { scheduleDiskRefresh() }
+        publish()
+    }
+
+    public func respondToBackupPrompt(_ id: UUID, backup: Bool) {
+        guard !closing, let disk = connections.first(where: { $0.value.decision == .waiting(id) })?.key else { return }
+        connections[disk]?.decision = backup ? .allowed : .later
+        if backup { confirmed.insert(disk) }
+        publish()
+        scheduleAutomatic()
+    }
+
     public func setEjectAfterBackup(_ enabled: Bool, job id: UUID) async throws {
         guard let selected = engine(for: id), let job = selected.presentation.job else { return }
         if let setID = job.setID, let set = sets[setID] {
@@ -542,7 +670,23 @@ public actor BackupCoordinator {
         try beginOperation()
         defer { endOperation() }
         guard let engine = engine(for: id) else { throw BackupError.disconnected }
+        if let job = engine.presentation.job, let connection = connections[job.volumeID.uppercased()],
+           engine.presentation.volume == nil {
+            try await openForRestore(job, engine: engine, at: connection.mount)
+        }
         return try await engine.restore(version, to: folder)
+    }
+
+    private func openForRestore(_ job: BackupJob, engine: SyncEngine, at mount: URL) async throws {
+        if let set = job.setID, let binding = bindings[set] {
+            let (access, volume) = try resolve(binding, mounts: [mount])
+            let store = try stores[set] ?? BackupSetStore(access, volume: volume, interrupt: interrupt)
+            guard let layout = try store.recover(), layout.id == set else { throw BackupError.disconnected }
+            stores[set] = store
+            try await attach(layout, to: store)
+        } else {
+            await engine.refreshConnection()
+        }
     }
 
     public func confirmTakeover(job id: UUID, preview: UUID, choices: [String: TakeoverChoice]) async throws -> BackupJob {
@@ -550,22 +694,56 @@ public actor BackupCoordinator {
         defer { endOperation() }
         guard let engine = engine(for: id) else { throw BackupError.disconnected }
         let job = try await engine.confirmTakeover(preview, choices: choices)
+        if let volume = engine.presentation.volume {
+            connections[job.volumeID.uppercased()] = Connection(mount: volume.mount, decision: .allowed)
+        }
         enqueue(id, verify: false)
         return job
     }
 
+    private func writableFolders(_ folders: [BackupFolderStatus], on disk: String) -> [BackupFolderStatus] {
+        folders.filter {
+            $0.job.volumeID.uppercased() == disk && !$0.job.restoreOnly && $0.mapping?.enabled != false
+        }
+    }
+
+    private func considerConnection(_ disk: String, mount: URL) {
+        guard ejectedVolumes[disk] == nil else { return }
+        if connections[disk] != nil {
+            connections[disk]?.mount = mount
+        } else {
+            let decision: ConnectionDecision = askOnConnect ? .waiting(UUID()) : .allowed
+            connections[disk] = Connection(mount: mount, decision: decision)
+        }
+    }
+
+    private func offerLegacyConnection() {
+        guard !closing, let job = legacy.presentation.job, !job.restoreOnly, let volume = legacy.presentation.volume,
+              connections[job.volumeID.uppercased()] == nil else { return }
+        connections[job.volumeID.uppercased()] = Connection(mount: volume.mount, decision: .allowed)
+        enqueue(job.id, verify: false)
+    }
+
+    private func disconnect(_ disk: String) {
+        connections[disk] = nil
+        confirmed.remove(disk)
+        for folder in onDisk(disk) { automatic[folder.id] = nil }
+    }
+
     private func enqueue(_ id: UUID?, verify: Bool) {
         guard let id = id ?? legacy.presentation.job?.id, !closing,
-              let engine = engine(for: id), engine.presentation.job?.automatic == true,
-              engine.presentation.job?.restoreOnly == false else { return }
-        if let setID = engine.presentation.job?.setID,
+              let snapshot = engine(for: id)?.presentation, let job = snapshot.job,
+              job.automatic, !job.restoreOnly, snapshot.volume != nil, snapshot.progress.state != .takeoverRequired,
+              connections[job.volumeID.uppercased()]?.decision == .allowed else { return }
+        if let setID = job.setID,
            sets[setID]?.mappings.first(where: { $0.job == id })?.enabled != true { return }
         automatic[id] = verify || automatic[id] == true
         scheduleAutomatic()
     }
 
     private func scheduleAutomatic() {
-        guard !automatic.isEmpty, automaticTask == nil, !busy, !paused, !closing else { return }
+        guard (!automatic.isEmpty || !confirmed.isEmpty), automaticTask == nil,
+              !busy, !refreshRequested, !paused, !closing else { return }
         automaticTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(350))
             if !Task.isCancelled { await self?.runAutomatic() }
@@ -574,7 +752,12 @@ public actor BackupCoordinator {
 
     private func runAutomatic() async {
         automaticTask = nil
-        guard !busy, !paused, !closing, let id = automatic.keys.first,
+        guard !busy, !refreshRequested, !paused, !closing else { return }
+        if let disk = confirmed.first {
+            await runDisk(disk, verify: false, requested: nil)
+            return
+        }
+        guard let id = automatic.keys.first,
               let job = engine(for: id)?.presentation.job else { return }
         let device = job.volumeID.uppercased()
         let due = automatic.filter { engine(for: $0.key)?.presentation.job?.volumeID.uppercased() == device }
@@ -588,17 +771,27 @@ public actor BackupCoordinator {
     }
 
     private func onDisk(_ id: String) -> [BackupFolderStatus] {
-        presentation.folders.filter { $0.job.volumeID.uppercased() == id }
+        folderStatuses.filter { $0.job.volumeID.uppercased() == id }.sorted { ($0.title, $0.id.uuidString) < ($1.title, $1.id.uuidString) }
     }
 
     private func runDisk(_ diskID: String, verify: Bool, requested: [UUID: Bool]?) async {
-        guard !busy, !paused, !closing else { return }
-        let all = onDisk(diskID).filter { !$0.job.restoreOnly && $0.mapping?.enabled != false }
-        let eligible = all.filter { requested == nil || $0.job.automatic }
-        guard !eligible.isEmpty, eligible.contains(where: { $0.snapshot.volume != nil }) else { scheduleAutomatic(); return }
-        for folder in eligible { automatic[folder.id] = nil }
+        guard !busy, !paused, !closing, !refreshRequested else { return }
         busy = true
         defer { endOperation() }
+        if requested == nil, connections[diskID] != nil {
+            connections[diskID]?.decision = .allowed
+            if writableFolders(folderStatuses, on: diskID).contains(where: { $0.snapshot.volume == nil }) {
+                await refreshDisks()
+            }
+            guard !paused, !closing, !refreshRequested else { return }
+        }
+        confirmed.remove(diskID)
+        let all = onDisk(diskID).filter { !$0.job.restoreOnly && $0.mapping?.enabled != false }
+        let eligible = all.filter { requested == nil || $0.job.automatic }
+        if let volume = eligible.compactMap(\.snapshot.volume).first {
+            connections[diskID] = Connection(mount: volume.mount, decision: .allowed)
+        } else if connections[diskID] == nil { return }
+        for folder in eligible { automatic[folder.id] = nil }
         var summary = SyncProgress(state: .checking)
         var success = true
         var ejectionRequested = false
@@ -610,8 +803,13 @@ public actor BackupCoordinator {
             diskProgress[diskID] = summary
             publish()
             do {
-                try await alignFolderName(folder, engine: engine)
-                let result = try await (verify || requested?[folder.id] == true ? engine.verify() : engine.syncNow())
+                let result: SyncProgress
+                if engine.presentation.volume == nil, engine.presentation.progress.state == .needsAttention {
+                    result = engine.presentation.progress
+                } else {
+                    try await alignFolderName(folder, engine: engine)
+                    result = try await (verify || requested?[folder.id] == true ? engine.verify() : engine.syncNow())
+                }
                 summary.add(result)
                 success = success && result.state == .upToDate
                 if result.state != .upToDate, summary.message == nil { summary.message = result.message ?? "有备份文件夹需要处理" }
@@ -683,7 +881,8 @@ public actor BackupCoordinator {
     public func resume(_ id: UUID) async {
         paused = false
         for engine in allEngines { engine.resume() }
-        if !busy { await sync(id) }
+        if !busy, let job = engine(for: id)?.presentation.job,
+           connections[job.volumeID.uppercased()]?.decision == .allowed { await sync(id) }
         scheduleAutomatic()
     }
 
@@ -701,8 +900,10 @@ public actor BackupCoordinator {
 
     private func ejectDisk(_ id: String) async throws {
         let members = onDisk(id)
-        guard let volume = members.compactMap(\.snapshot.volume).first else { throw BackupError.disconnected }
-        let eject = try prepareEjection(volume.mount)
+        guard let mount = members.compactMap(\.snapshot.volume).first?.mount ?? connections[id]?.mount,
+              VolumeInfo.matchingMounts(id).contains(where: { $0.standardizedFileURL.path == mount.standardizedFileURL.path })
+        else { throw BackupError.disconnected }
+        let eject = try prepareEjection(mount)
         let setIDs = Set(members.compactMap(\.job.setID))
         var released: [SyncEngine] = []
         do {
@@ -714,7 +915,8 @@ public actor BackupCoordinator {
             }
             for set in setIDs { stores[set] = nil }
             try await eject()
-            ejectedVolumes.insert(id)
+            ejectedVolumes[id] = mount
+            disconnect(id)
             diskProgress[id]?.state = .ejected
             for engine in released { await engine.didEject(nil) }
         } catch {
@@ -728,6 +930,7 @@ public actor BackupCoordinator {
         closing = true
         automaticTask?.cancel()
         progressTask?.cancel()
+        diskRefreshTask?.cancel()
         pause()
         if busy { await withCheckedContinuation { waiters.append($0) } }
         for engine in allEngines { await engine.finishAndClose() }

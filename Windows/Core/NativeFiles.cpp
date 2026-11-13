@@ -746,7 +746,7 @@ Volume inspect(const fs::path& p) {
         static_cast<uint64_t>(info.f_blocks) * info.f_bsize, false, {id, StorageMedium::unknown}};
 #endif
 }
-std::optional<fs::path> findVolume(std::string_view id) {
+std::optional<Volume> findMountedVolume(std::string_view id) {
 #ifdef _WIN32
     auto split = id.rfind('|');
     if (split == id.npos) return {};
@@ -754,12 +754,16 @@ std::optional<fs::path> findVolume(std::string_view id) {
     wchar_t mounts[32768]{};
     DWORD needed{};
     if (GetVolumePathNamesForVolumeNameW(volume.c_str(), mounts, static_cast<DWORD>(std::size(mounts)), &needed) && mounts[0]) {
-        auto mount = fs::path(mounts);
-        if (inspect(mount).id == id) return mount;
+        auto mounted = inspect(fs::path(mounts));
+        if (mounted.id == id) return mounted;
     }
 #else
     (void)id;
 #endif
+    return {};
+}
+std::optional<fs::path> findVolume(std::string_view id) {
+    if (auto mounted = findMountedVolume(id)) return mounted->mount;
     return {};
 }
 void eject(const Volume& volume) {

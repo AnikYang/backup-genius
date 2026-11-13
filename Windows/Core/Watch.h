@@ -3,6 +3,7 @@
 #include "NativeFiles.h"
 #include <map>
 #include <memory>
+#include <functional>
 
 namespace bg {
 constexpr uint32_t nameChange = 1;
@@ -20,7 +21,7 @@ std::optional<Changes> changesSince(const fs::path& root, Cursor from, Cursor to
 
 class DirectoryWatch {
 public:
-    explicit DirectoryWatch(const fs::path& root);
+    explicit DirectoryWatch(const fs::path& root, std::function<void()> changesReady = {}, bool excludeControl = false);
     ~DirectoryWatch();
     Changes take();
     bool alive() const;

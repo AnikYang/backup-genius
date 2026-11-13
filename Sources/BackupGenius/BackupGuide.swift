@@ -77,7 +77,7 @@ struct BackupGuide: View {
                         }
                     }
                     Section("备份规则") {
-                        Toggle("连接后自动备份", isOn: $automatic)
+                        Toggle("允许自动同步", isOn: $automatic)
                         Toggle("全部完成后自动推出硬盘", isOn: $eject)
                         Toggle("登录时启动", isOn: $login)
                         LabeledContent("旧版保留", value: "\(BackupJob.retentionDays) 天")
@@ -172,6 +172,7 @@ struct BackupGuide: View {
                     if login != model.loginEnabled { model.setLogin(login) }
                     model.page = .overview
                     dismiss()
+                    await model.requestBackupNotificationPermission()
                 }
             } catch {
                 self.error = error.localizedDescription

@@ -4,6 +4,7 @@
 #include <array>
 #include <future>
 #include <mutex>
+#include <stop_token>
 #include <thread>
 #include <utility>
 
@@ -24,72 +25,94 @@ struct DirectoryWatch::State {
 #endif
     std::jthread thread;
 };
-DirectoryWatch::DirectoryWatch(const fs::path& root) : state_(std::make_unique<State>()) {
+DirectoryWatch::DirectoryWatch(const fs::path& root, std::function<void()> changesReady, bool excludeControl)
+    : state_(std::make_unique<State>()) {
 #ifdef _WIN32
     auto state = state_.get();
     auto folder = Tree(root).checked({});
     std::promise<void> firstRead;
     auto ready = firstRead.get_future();
-    state->thread = std::jthread([state, folder, firstRead = std::move(firstRead)](std::stop_token stop) mutable {
+    state->thread = std::jthread([state, folder, firstRead = std::move(firstRead), changesReady = std::move(changesReady),
+                                  excludeControl](std::stop_token stop) mutable {
         auto h = CreateFileW(folder.c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED |
                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (h == INVALID_HANDLE_VALUE) { firstRead.set_value(); return; }
         auto event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!event) { CloseHandle(h); firstRead.set_value(); return; }
+        auto cancelled = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!event || !cancelled) {
+            if (event) CloseHandle(event);
+            if (cancelled) CloseHandle(cancelled);
+            CloseHandle(h);
+            firstRead.set_value();
+            return;
+        }
         {
             std::lock_guard lock(state->mutex);
             state->folder = h;
         }
         alignas(DWORD) std::array<unsigned char, 65536> buffer{};
-        bool starting = true;
-        while (!stop.stop_requested()) {
-            OVERLAPPED operation{};
-            operation.hEvent = event;
-            ResetEvent(event);
-            const auto mask = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE |
-                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_CREATION |
-                FILE_NOTIFY_CHANGE_SECURITY;
-            const bool posted = ReadDirectoryChangesW(h, buffer.data(), static_cast<DWORD>(buffer.size()), TRUE, mask, nullptr, &operation, nullptr) != FALSE;
-            if (starting) {
-                state->active = posted;
-                firstRead.set_value();
-                starting = false;
-            }
-            if (!posted) break;
-            while (!stop.stop_requested() && WaitForSingleObject(event, 100) == WAIT_TIMEOUT) {}
-            if (stop.stop_requested()) {
-                CancelIoEx(h, &operation);
-                DWORD ignored{};
-                GetOverlappedResult(h, &operation, &ignored, TRUE);
-                break;
-            }
-            DWORD count{};
-            if (!GetOverlappedResult(h, &operation, &count, FALSE) || count == 0) {
-                std::lock_guard lock(state->mutex);
-                state->changes.full = true;
-                if (GetLastError() == ERROR_INVALID_HANDLE || GetLastError() == ERROR_DEVICE_NOT_CONNECTED) break;
-                continue;
-            }
-            try {
-                std::lock_guard lock(state->mutex);
-                size_t offset = 0;
-                while (offset + offsetof(FILE_NOTIFY_INFORMATION, FileName) <= count) {
-                    const auto* item = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer.data() + offset);
-                    if (offset + offsetof(FILE_NOTIFY_INFORMATION, FileName) + item->FileNameLength > count) {
-                        state->changes.full = true;
-                        break;
-                    }
-                    std::wstring name(item->FileName, item->FileNameLength / sizeof(wchar_t));
-                    auto relative = utf8(fs::path(name));
-                    if (validPath(relative)) state->changes.paths[relative] |= item->Action == FILE_ACTION_MODIFIED ? contentChange : nameChange;
-                    if (item->NextEntryOffset == 0) break;
-                    offset += item->NextEntryOffset;
+        {
+            const std::stop_callback cancel(stop, [cancelled] { SetEvent(cancelled); });
+            const HANDLE events[]{event, cancelled};
+            bool starting = true;
+            while (!stop.stop_requested()) {
+                OVERLAPPED operation{};
+                operation.hEvent = event;
+                ResetEvent(event);
+                const auto mask = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_SIZE |
+                    FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_CREATION |
+                    FILE_NOTIFY_CHANGE_SECURITY;
+                const bool posted = ReadDirectoryChangesW(h, buffer.data(), static_cast<DWORD>(buffer.size()), TRUE, mask,
+                                                           nullptr, &operation, nullptr) != FALSE;
+                if (starting) {
+                    state->active = posted;
+                    firstRead.set_value();
+                    starting = false;
                 }
-                if (state->changes.paths.size() > 100000) { state->changes.paths.clear(); state->changes.full = true; }
-            } catch (...) {
-                std::lock_guard lock(state->mutex);
-                state->changes.full = true;
+                if (!posted) break;
+                if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 || stop.stop_requested()) {
+                    CancelIoEx(h, &operation);
+                    DWORD ignored{};
+                    GetOverlappedResult(h, &operation, &ignored, TRUE);
+                    break;
+                }
+                DWORD count{};
+                const bool received = GetOverlappedResult(h, &operation, &count, FALSE) != FALSE;
+                if (!received || count == 0) {
+                    const auto error = received ? ERROR_SUCCESS : GetLastError();
+                    { std::lock_guard lock(state->mutex); state->changes.full = true; }
+                    if (error != ERROR_SUCCESS && error != ERROR_NOTIFY_ENUM_DIR) break;
+                    if (changesReady) changesReady();
+                    continue;
+                }
+                bool changed = false;
+                try {
+                    std::lock_guard lock(state->mutex);
+                    size_t offset = 0;
+                    while (offset + offsetof(FILE_NOTIFY_INFORMATION, FileName) <= count) {
+                        const auto* item = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer.data() + offset);
+                        if (offset + offsetof(FILE_NOTIFY_INFORMATION, FileName) + item->FileNameLength > count) {
+                            state->changes.full = true;
+                            changed = true;
+                            break;
+                        }
+                        std::wstring name(item->FileName, item->FileNameLength / sizeof(wchar_t));
+                        auto relative = utf8(fs::path(name));
+                        if (validPath(relative) && (!excludeControl || !backupControl(relative))) {
+                            state->changes.paths[relative] |= item->Action == FILE_ACTION_MODIFIED ? contentChange : nameChange;
+                            changed = true;
+                        }
+                        if (item->NextEntryOffset == 0) break;
+                        offset += item->NextEntryOffset;
+                    }
+                    if (state->changes.paths.size() > 100000) { state->changes.paths.clear(); state->changes.full = true; }
+                } catch (...) {
+                    std::lock_guard lock(state->mutex);
+                    state->changes.full = true;
+                    changed = true;
+                }
+                if (changed && changesReady) changesReady();
             }
         }
         state->active = false;
@@ -99,11 +122,13 @@ DirectoryWatch::DirectoryWatch(const fs::path& root) : state_(std::make_unique<S
             state->folder = INVALID_HANDLE_VALUE;
         }
         CloseHandle(event);
+        CloseHandle(cancelled);
         CloseHandle(h);
+        if (!stop.stop_requested() && changesReady) changesReady();
     });
     ready.get();
 #else
-    (void)root;
+    (void)root; (void)changesReady; (void)excludeControl;
 #endif
 }
 DirectoryWatch::~DirectoryWatch() = default;

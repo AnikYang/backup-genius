@@ -1,9 +1,13 @@
 #include "Engine.h"
 
 #include <algorithm>
+#include <cmath>
+#include <condition_variable>
 #include <future>
+#include <mutex>
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 namespace bg {
 namespace {
@@ -17,6 +21,75 @@ struct Work {
     uint32_t flags{};
     bool checkTarget{};
     std::string from;
+
+    double estimatedWork() const {
+        const auto size = from.empty() && source && source->kind == Kind::regular ? source->size : 0;
+        return blockSize + 2.0 * size;
+    }
+};
+
+// Only a running backup samples progress. Preparation workers report payload I/O.
+class TransferProgress {
+public:
+    using Callback = std::function<void(const SyncProgress&)>;
+    TransferProgress(double total, Callback callback)
+        : total_(total), started_(Clock::now()), sampled_(started_), lastWork_(started_) {
+        if (total > 0 && callback) {
+            timer_ = std::jthread([this, callback = std::move(callback)](std::stop_token stop) {
+                std::unique_lock lock(mutex_);
+                while (!wake_.wait_for(lock, stop, std::chrono::milliseconds(400), [] { return false; }) && !stop.stop_requested()) {
+                    const auto progress = sample();
+                    lock.unlock();
+                    callback(progress);
+                    lock.lock();
+                }
+            });
+        }
+    }
+    void begin(double work) { std::lock_guard lock(mutex_); batch_ = work; }
+    void record(size_t read, size_t written) {
+        std::lock_guard lock(mutex_);
+        batchIO_ += static_cast<double>(read) + static_cast<double>(written);
+        written_ += static_cast<double>(written);
+    }
+    void complete() {
+        std::lock_guard lock(mutex_);
+        completed_ += batch_;
+        batch_ = batchIO_ = 0;
+    }
+    void stop() {
+        if (timer_.joinable()) { timer_.request_stop(); timer_.join(); }
+    }
+private:
+    SyncProgress sample() {
+        SyncProgress progress;
+        const auto time = Clock::now();
+        const auto interval = std::chrono::duration<double>(time - sampled_).count();
+        const auto work = completed_ + std::min(batchIO_, batch_ * 0.8);
+        const auto weight = std::min(1.0, interval / 2);
+        const auto nextWork = (work - sampledWork_) / interval;
+        const auto nextWrite = (written_ - sampledWritten_) / interval;
+        if (nextWork > 0) lastWork_ = time;
+        workRate_ = workRate_.value_or(nextWork) * (1 - weight) + nextWork * weight;
+        writeRate_ = writeRate_.value_or(nextWrite) * (1 - weight) + nextWrite * weight;
+        progress.writeBytesPerSecond = nextWrite == 0 ? 0 : *writeRate_;
+        if (time - started_ >= std::chrono::seconds(1) && work > 0 && work < total_ &&
+            time - lastWork_ < std::chrono::seconds(2) && *workRate_ > 0) {
+            const auto remaining = (total_ - work) / *workRate_;
+            if (std::isfinite(remaining)) progress.estimatedSecondsRemaining = remaining;
+        }
+        sampled_ = time;
+        sampledWork_ = work;
+        sampledWritten_ = written_;
+        return progress;
+    }
+    std::mutex mutex_;
+    std::condition_variable_any wake_;
+    const double total_;
+    Clock::time_point started_, sampled_, lastWork_;
+    double completed_{}, batch_{}, batchIO_{}, written_{}, sampledWork_{}, sampledWritten_{};
+    std::optional<double> workRate_, writeRate_;
+    std::jthread timer_;
 };
 struct Prepared {
     Json edit, original;
@@ -111,7 +184,7 @@ Json makeEdit(std::string method, std::string rel, const std::optional<Stamp>& b
 }
 
 Prepared prepare(const Work& work, const Tree& source, const Tree& target, const Tree& scratch,
-                 const IOProfile& profile, bool adoptExisting) {
+                 const IOProfile& profile, bool adoptExisting, TransferProgress& meter) {
     Prepared result;
     const auto& rel = work.path;
     if (!validPath(rel) || !representable(rel) || (work.source && work.source->kind == Kind::unsupported)) {
@@ -210,6 +283,7 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
         targetHashes = adopting || work.checkTarget || !stable(observeTarget, *actual) ?
             hashFile(target.file(rel, File::Mode::read, true), actual->size, &result.targetRead,
                      profile.targetWindow, &result.targetRequests) : unbase64(work.old.at("hashes").get<std::string>());
+        meter.record(static_cast<size_t>(result.targetRead), 0);
         require(target.entry(rel) == actual, "读取时目标文件已变化");
     }
     const auto cachedHashes = sourceTrusted ? unbase64(work.old.at("hashes").get<std::string>()) : Bytes{};
@@ -236,6 +310,7 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
                     data = sparse;
                     result.read += static_cast<int64_t>(length);
                     ++result.sourceRequests;
+                    meter.record(length, 0);
                     require(sha256(data) == hash, "源文件内容已变化");
                 }
                 if (!output) output.emplace(spool, File::Mode::create);
@@ -259,6 +334,7 @@ Prepared prepare(const Work& work, const Tree& source, const Tree& target, const
                     result.written += static_cast<int64_t>(data.size());
                     ++result.writeRequests;
                 }
+                meter.record(data.size(), actual ? 0 : data.size());
                 offset += static_cast<int64_t>(data.size());
             }
         } else {
@@ -319,18 +395,26 @@ struct SyncEngine::Draft {
     Records local, disk;
 };
 
-SyncEngine::SyncEngine(fs::path storage, Progress update, bool allowInternal, Fault fault, std::string host)
-    : storage_(std::move(storage)), notify_(std::move(update)), fault_(std::move(fault)),
+SyncEngine::SyncEngine(fs::path storage, Progress update, bool allowInternal, Fault fault, std::string host,
+                       std::function<void()> changesReady)
+    : storage_(std::move(storage)), notify_(std::move(update)), changesReady_(std::move(changesReady)), fault_(std::move(fault)),
       host_(std::move(host)), allowInternal_(allowInternal) {}
 SyncEngine::~SyncEngine() = default;
 void SyncEngine::publish(bool force) {
+    std::lock_guard lock(publishedMutex_);
     auto time = Clock::now();
     if (force || time - published_ >= std::chrono::milliseconds(200)) {
+        auto current = view_;
+        if (current.progress.state == SyncState::syncing && publishedView_.progress.state == SyncState::syncing) {
+            current.progress.writeBytesPerSecond = publishedView_.progress.writeBytesPerSecond;
+            current.progress.estimatedSecondsRemaining = publishedView_.progress.estimatedSecondsRemaining;
+        }
+        publishedView_ = std::move(current);
         published_ = time;
-        if (notify_) notify_(view_);
+        if (notify_) notify_(publishedView_);
     }
 }
-void SyncEngine::start() {
+void SyncEngine::start(bool connect) {
     if (settings_) return;
     fs::create_directories(storage_ / "scratch");
     storage_ = fs::canonical(storage_);
@@ -341,8 +425,26 @@ void SyncEngine::start() {
     const auto job = settings_->get("settings", "job");
     if (!job.is_null()) {
         setJob(loadJob(job));
-        try { refresh(); } catch (const std::exception& error) { fail(error); }
+        if (connect) {
+            try { refresh(); } catch (const std::exception& error) { fail(error); }
+        }
     }
+    publish(true);
+}
+void SyncEngine::refreshConnection() {
+    try { refresh(); publish(true); } catch (const std::exception& error) { fail(error); }
+}
+void SyncEngine::disconnect() {
+    drain();
+    repo_.reset();
+    targetWatch_.reset();
+    sourceWatch_.reset();
+    sourceGap_ = true;
+    mappedVolume_.reset();
+    view_.volume.reset();
+    view_.progress.state = SyncState::disconnected;
+    view_.progress.message.clear();
+    suppress_ = false;
     publish(true);
 }
 void SyncEngine::setJob(BackupJob job) {
@@ -353,6 +455,7 @@ void SyncEngine::setJob(BackupJob job) {
     view_.job = std::move(job);
     view_.volume.reset();
     view_.progress = {};
+    view_.progress.state = SyncState::disconnected;
     index_ = std::make_unique<Index>(storage_ / (view_.job.id + ".sqlite"));
     paused_ = false;
     suppress_ = false;
@@ -467,9 +570,6 @@ bool SyncEngine::requiresTakeover() {
 }
 void SyncEngine::refresh() {
     if (view_.job.id.empty()) return;
-    if (!view_.job.restoreOnly && !sourceWatch_) {
-        try { sourceWatch_ = std::make_unique<DirectoryWatch>(sourceTree().root()); } catch (...) {}
-    }
     if (repo_) {
         try { repo_->tree.check(); } catch (...) {
             repo_.reset();
@@ -525,7 +625,10 @@ void SyncEngine::refresh() {
     if (repo->recovered) index_->put("activity", uuid(), activity("recovered", "", 0, "已回滚未完成的事务"));
     view_.job.target = target;
     view_.volume = volume;
-    targetWatch_ = std::make_unique<DirectoryWatch>(target);
+    if (!view_.job.restoreOnly && !sourceWatch_) {
+        try { sourceWatch_ = std::make_unique<DirectoryWatch>(sourceTree().root(), changesReady_); } catch (...) {}
+    }
+    targetWatch_ = std::make_unique<DirectoryWatch>(target, changesReady_, true);
     repo_ = std::move(repo);
     recordChanges({{}, true}, true);
     view_.progress.tracked = index_->count("file");
@@ -590,10 +693,9 @@ std::optional<bool> SyncEngine::poll(bool automatic) {
             }
             const auto last = index_->get("meta", "lastVerify");
             const bool verify = !last.is_null() && now().seconds - integer(last) >= 7 * 86400 && !verifyAttempted_;
-            if (view_.job.automatic && time - lastAttempt_ >= std::chrono::milliseconds(900) &&
+            if (view_.job.automatic &&
                 (sourceGap_ || verify || index_->count("sourceDirty") || index_->count("targetDirty") ||
                  index_->get("meta", "sourceFull") == true || index_->get("meta", "targetFull") == true)) {
-                lastAttempt_ = time;
                 verifyAttempted_ = verify;
                 if (!automatic) return verify;
                 sync(verify);
@@ -890,17 +992,40 @@ SyncProgress SyncEngine::run(bool verify) {
         ++p.planned;
     }
     p.checkingSeconds = std::chrono::duration<double>(Clock::now() - begun).count();
-    if (p.planned) { p.state = SyncState::syncing; publish(true); }
+    if (p.planned) {
+        p.state = SyncState::syncing;
+        p.currentPath = waves.begin()->second.front().path;
+        publish(true);
+    }
+    double totalWork = 0;
+    for (const auto& [_, items] : waves) for (const auto& item : items) totalWork += item.estimatedWork();
+    TransferProgress::Callback sample;
+    if (notify_ && p.planned > 0) {
+        // Sample a consistent snapshot even when a single batch takes seconds.
+        sample = [this](const SyncProgress& metrics) {
+            std::lock_guard lock(publishedMutex_);
+            const auto time = Clock::now();
+            if (time - published_ < std::chrono::milliseconds(200)) return;
+            publishedView_.progress.writeBytesPerSecond = metrics.writeBytesPerSecond;
+            publishedView_.progress.estimatedSecondsRemaining = metrics.estimatedSecondsRemaining;
+            published_ = time;
+            notify_(publishedView_);
+        };
+    }
+    TransferProgress meter(totalWork, std::move(sample));
     std::map<std::string, int> retry;
     for (const auto& [_, items] : waves) {
         for (size_t offset = 0; offset < items.size(); offset += IOProfile::batchSize) {
             if (paused_) throw Paused();
             const auto count = std::min(IOProfile::batchSize, items.size() - offset);
+            double batchWork = 0;
+            for (size_t i = 0; i < count; ++i) batchWork += items[offset + i].estimatedWork();
+            meter.begin(batchWork);
             std::vector<Prepared> results(count);
             const auto workers = std::min(profile.workers, count);
             auto workStripe = [&](size_t worker) {
                 for (size_t i = worker; i < count; i += workers) {
-                    try { results[i] = prepare(items[offset + i], source, repo_->tree, scratch, profile, adoptExisting); }
+                    try { results[i] = prepare(items[offset + i], source, repo_->tree, scratch, profile, adoptExisting, meter); }
                     catch (const std::system_error& e) {
                         results[i].issue = e.what();
                         results[i].retry = e.code().value() == 32 || e.code().value() == 33;
@@ -916,7 +1041,7 @@ SyncProgress SyncEngine::run(bool verify) {
             workStripe(0);
             for (auto& thread : threads) thread.get();
             auto batch = repo_->batch();
-            PackWriter writer(*repo_, identifier(batch.at("id")));
+            PackWriter writer(*repo_, identifier(batch.at("id")), [&](size_t size) { meter.record(0, size); });
             std::unordered_map<std::string, Patch> patches;
             std::unordered_map<std::string, std::optional<Stamp>> expected;
             std::vector<size_t> ready;
@@ -949,7 +1074,8 @@ SyncProgress SyncEngine::run(bool verify) {
                     if (result.archive && result.before) {
                         auto original = result.original;
                         if (result.before->kind == Kind::regular) {
-                            auto hashes = writer.saveFile(repo_->tree, item.path, *result.before, result.oldHashes, p.targetRead);
+                            auto hashes = writer.saveFile(repo_->tree, item.path, *result.before, result.oldHashes, p.targetRead,
+                                [&](size_t size) { meter.record(size, 0); });
                             original = oldRecord(repo_->tree, item, *result.before, unbase64(hashes.get<std::string>()));
                         } else if (original.is_null()) original = recipe(item.path, *result.before, {});
                         result.edit["archive"] = archiveVersion(original, item.source ? "updated" : "deleted");
@@ -973,7 +1099,7 @@ SyncProgress SyncEngine::run(bool verify) {
                         if (!item.from.empty() && folded(item.from) != folded(item.path))
                             require(!source.entry(item.from), "移动前源路径重新出现");
                     }
-                }, true, expected);
+                }, true, expected, [&](size_t size) { meter.record(0, size); });
             }
             index_->transaction([&] {
                 for (auto i : ready) {
@@ -994,6 +1120,7 @@ SyncProgress SyncEngine::run(bool verify) {
             });
             p.currentPath = items[offset + count - 1].path;
             p.processed += static_cast<int64_t>(count);
+            meter.complete();
             publish();
         }
     }
@@ -1025,6 +1152,7 @@ SyncProgress SyncEngine::run(bool verify) {
     p.message = issues ? "打开活动记录查看需要处理的项目" : "";
     p.elapsedSeconds = std::chrono::duration<double>(Clock::now() - begun).count();
     p.currentPath.clear();
+    meter.stop();
     view_.volume = inspect(view_.job.target);
     drain();
     publish(true);

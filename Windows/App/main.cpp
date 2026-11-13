@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <commctrl.h>
+#include <dbt.h>
 #include <shlobj.h>
 #include <shellapi.h>
 #include <microsoft.ui.xaml.window.h>
@@ -57,6 +58,19 @@ std::wstring quantity(int64_t bytes) {
         }
     }
     return {};
+}
+
+std::wstring backupTiming(const bg::SyncProgress& progress) {
+    const auto rate = progress.writeBytesPerSecond ?
+        quantity(static_cast<int64_t>(std::clamp(*progress.writeBytesPerSecond, 0.0, 1e18))) + L"/s" : L"测量中";
+    auto text = L"写入速度 " + rate + L" · ";
+    if (progress.processed >= progress.planned) return text + L"正在收尾";
+    if (!progress.estimatedSecondsRemaining) return text + L"剩余时间估算中";
+    const auto seconds = static_cast<int64_t>(std::clamp(*progress.estimatedSecondsRemaining + 1, 1.0, 31536000.0));
+    text += L"本文件夹约剩 ";
+    if (seconds >= 3600) return text + std::to_wstring(seconds / 3600) + L" 小时 " + std::to_wstring(seconds / 60 % 60) + L" 分钟";
+    if (seconds >= 60) return text + std::to_wstring(seconds / 60) + L" 分钟 " + std::to_wstring(seconds % 60) + L" 秒";
+    return text + std::to_wstring(seconds) + L" 秒";
 }
 std::wstring timestamp(const bg::Json& date) {
     auto time = bg::eventTime(date);
@@ -172,19 +186,28 @@ void startup(bool value) {
 class Worker {
 public:
     using Task = std::function<void(bg::BackupCoordinator&)>;
-    Worker(bg::fs::path storage, std::function<void(std::string)> error)
-        : error_(std::move(error)), engine_(std::move(storage), [this](const bg::Presentation& value) {
-              std::lock_guard lock(mutex_);
-              latest_ = value;
+    Worker(bg::fs::path storage, bg::Progress progress, std::function<void(std::string)> error)
+        : error_(std::move(error)), engine_(std::move(storage), std::move(progress), false, {}, [this] {
+              { std::lock_guard lock(mutex_); if (!changes_) changes_ = std::chrono::steady_clock::now() + 350ms; }
+              wake_.notify_one();
           }),
           thread_([this](std::stop_token stop) {
+              auto maintenance = std::chrono::steady_clock::now() + 1min;
               while (!stop.stop_requested()) {
                   Task work;
                   {
                       std::unique_lock lock(mutex_);
-                      wake_.wait_for(lock, 500ms, [&] { return stop.stop_requested() || !tasks_.empty(); });
+                      while (!stop.stop_requested() && tasks_.empty()) {
+                          const auto deadline = std::min(changes_.value_or(maintenance), maintenance);
+                          if (std::chrono::steady_clock::now() >= deadline) break;
+                          wake_.wait_until(lock, deadline);
+                      }
                       if (stop.stop_requested()) break;
                       if (!tasks_.empty()) { work = std::move(tasks_.front()); tasks_.pop_front(); }
+                      else {
+                          changes_.reset();
+                          maintenance = std::chrono::steady_clock::now() + 1min;
+                      }
                   }
                   try { if (work) work(engine_); else engine_.poll(); }
                   catch (const std::exception& e) { error_(e.what()); }
@@ -192,7 +215,7 @@ public:
           }) {}
     ~Worker() {
         engine_.requestPause();
-        thread_.request_stop();
+        { std::lock_guard lock(mutex_); thread_.request_stop(); }
         wake_.notify_all();
     }
     void submit(Task task) {
@@ -200,16 +223,12 @@ public:
         wake_.notify_one();
     }
     void interrupt() { engine_.requestPause(); }
-    std::optional<bg::Presentation> take() {
-        std::lock_guard lock(mutex_);
-        return std::exchange(latest_, {});
-    }
 private:
     std::function<void(std::string)> error_;
     std::mutex mutex_;
     std::condition_variable wake_;
     std::deque<Task> tasks_;
-    std::optional<bg::Presentation> latest_;
+    std::optional<std::chrono::steady_clock::time_point> changes_;
     bg::BackupCoordinator engine_;
     std::jthread thread_;
 };
@@ -230,23 +249,21 @@ public:
         taskbarCreated_ = RegisterWindowMessageW(L"TaskbarCreated");
         check_bool(SetWindowSubclass(hwnd_, windowProc, 1, reinterpret_cast<DWORD_PTR>(this)));
         addTray();
-        worker_ = std::make_unique<Worker>(localData(), [this](std::string message) {
+        worker_ = std::make_unique<Worker>(localData(), [this](const bg::Presentation& value) {
+            dispatcher_.TryEnqueue([this, value] { if (!quitting_) render(value); });
+        }, [this](std::string message) {
             dispatcher_.TryEnqueue([this, message = std::move(message)] { error(wide(message)); });
         });
         worker_->submit([this, atLogin](bg::BackupCoordinator& engine) {
             engine.start();
+            engine.poll();
             if (!atLogin && engine.offerGuide()) dispatcher_.TryEnqueue([this] { setup(false); });
         });
-        timer_ = dispatcher_.CreateTimer();
-        timer_.Interval(200ms);
-        timer_.Tick([this](auto&&, auto&&) { if (auto value = worker_->take()) render(*value); });
-        timer_.Start();
         render({});
         window_.Activate();
         if (atLogin && trayReady_) ShowWindow(hwnd_, SW_HIDE);
     }
     ~BackupWindow() {
-        if (timer_) timer_.Stop();
         if (hwnd_) {
             auto data = trayData();
             Shell_NotifyIconW(NIM_DELETE, &data);
@@ -264,12 +281,31 @@ private:
             }
             if (message == trayMessage) {
                 if (LOWORD(l) == WM_CONTEXTMENU || LOWORD(l) == WM_RBUTTONUP) self->trayMenu();
-                else if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT || LOWORD(l) == WM_LBUTTONDBLCLK) self->show();
+                else if (LOWORD(l) == NIN_SELECT || LOWORD(l) == NIN_KEYSELECT || LOWORD(l) == WM_LBUTTONDBLCLK ||
+                         LOWORD(l) == NIN_BALLOONUSERCLICK) self->show();
                 return 0;
             }
             if (message == showMessage) { self->show(); return 0; }
             if (message == self->taskbarCreated_) self->addTray();
-            if (message == WM_DEVICECHANGE && self->worker_) self->worker_->submit([](auto& engine) { engine.volumesDidChange(); });
+            if (self->worker_ && ((message == WM_POWERBROADCAST && w == PBT_APMRESUMEAUTOMATIC) ||
+                                  (message == WM_DEVICECHANGE && w == DBT_DEVNODES_CHANGED))) {
+                self->worker_->submit([](auto& engine) { engine.volumesDidChange(); });
+            }
+            if (message == WM_DEVICECHANGE && self->worker_ && l && (w == DBT_DEVICEARRIVAL || w == DBT_DEVICEREMOVECOMPLETE)) {
+                const auto* event = reinterpret_cast<const DEV_BROADCAST_HDR*>(l);
+                if (event->dbch_devicetype == DBT_DEVTYP_VOLUME && event->dbch_size >= sizeof(DEV_BROADCAST_VOLUME)) {
+                    const auto* volume = reinterpret_cast<const DEV_BROADCAST_VOLUME*>(l);
+                    std::vector<bg::fs::path> mounts;
+                    for (int i = 0; i < 26; ++i) if (volume->dbcv_unitmask & (1u << i)) {
+                        std::wstring root = L"A:\\";
+                        root[0] += static_cast<wchar_t>(i);
+                        mounts.emplace_back(root);
+                    }
+                    self->worker_->submit([mounts = std::move(mounts), removed = w == DBT_DEVICEREMOVECOMPLETE](auto& engine) {
+                        engine.volumesDidChange(mounts, removed);
+                    });
+                }
+            }
             if (message == WM_QUERYENDSESSION && self->worker_) self->worker_->interrupt();
             if (message == WM_GETMINMAXINFO) {
                 auto limits = reinterpret_cast<MINMAXINFO*>(l);
@@ -287,7 +323,7 @@ private:
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = trayMessage;
         data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-        auto tip = std::wstring(windowName) + L" · " + std::wstring(title(view_.progress.state));
+        auto tip = std::wstring(windowName) + L" · " + (view_.backupPrompts.empty() ? std::wstring(title(view_.progress.state)) : L"等待确认备份");
         wcsncpy_s(data.szTip, tip.c_str(), _TRUNCATE);
         return data;
     }
@@ -297,6 +333,16 @@ private:
         data.uVersion = NOTIFYICON_VERSION_4;
         if (trayReady_) Shell_NotifyIconW(NIM_SETVERSION, &data);
     }
+    void notifyConnectedDisk(const bg::BackupPrompt& prompt) {
+        if (!trayReady_) return;
+        auto data = trayData();
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+        wcscpy_s(data.szInfoTitle, L"已连接备份硬盘");
+        const auto message = L"「" + wide(prompt.name) + L"」已连接。点击选择是否备份。";
+        wcsncpy_s(data.szInfo, message.c_str(), _TRUNCATE);
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
     void show() {
         ShowWindow(hwnd_, SW_RESTORE);
         window_.Activate();
@@ -304,12 +350,21 @@ private:
     }
     void trayMenu() {
         auto menu = CreatePopupMenu();
+        const auto prompts = view_.backupPrompts;
         AppendMenuW(menu, MF_STRING, 1, L"打开 Backup Genius");
+        if (view_.progress.state == bg::SyncState::syncing && view_.progress.planned > 0)
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, backupTiming(view_.progress).c_str());
         AppendMenuW(menu, MF_STRING | (view_.job.id.empty() || view_.job.restoreOnly ? MF_GRAYED : 0), 2,
                     view_.progress.state == bg::SyncState::paused ? L"继续备份" : L"暂停备份");
-        AppendMenuW(menu, MF_STRING | (view_.volume ? 0 : MF_GRAYED), 3, L"安全推出");
+        AppendMenuW(menu, MF_STRING | (view_.volume || view_.selectedDiskConnected ? 0 : MF_GRAYED), 3, L"安全推出");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, 4, L"退出");
+        if (!prompts.empty()) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            const auto name = wide(prompts[i].name);
+            AppendMenuW(menu, MF_STRING, 100 + i * 2, (L"立即备份到「" + name + L"」").c_str());
+            AppendMenuW(menu, MF_STRING, 101 + i * 2, (L"稍后备份「" + name + L"」").c_str());
+        }
         POINT cursor{};
         GetCursorPos(&cursor);
         SetForegroundWindow(hwnd_);
@@ -320,6 +375,11 @@ private:
         if (result == 2) pause();
         if (result == 3) eject();
         if (result == 4) quit();
+        if (result >= 100 && static_cast<size_t>((result - 100) / 2) < prompts.size())
+            respond(prompts[(result - 100) / 2].id, result % 2 == 0);
+    }
+    void respond(std::string id, bool backup) {
+        worker_->submit([id = std::move(id), backup](auto& engine) { engine.respondToBackupPrompt(id, backup); });
     }
     void error(std::wstring_view message) {
         alert_.Title(L"需要处理");
@@ -389,6 +449,10 @@ private:
         alert_.Margin({24, 0, 24, 0});
         StackPanel controls;
         controls.Children().Append(alert_);
+        backupPrompts_ = StackPanel();
+        backupPrompts_.Margin({24, 0, 24, 0});
+        backupPrompts_.Spacing(8);
+        controls.Children().Append(backupPrompts_);
         folders_ = ComboBox();
         folders_.Header(box_value(L"所属文件夹"));
         folders_.Margin({24, 4, 24, 4});
@@ -429,6 +493,7 @@ private:
         status_ = label(L"尚未设置备份", 32);
         AutomationProperties::SetAutomationId(status_, L"BackupStatus");
         detail_ = label(L"选择要备份的文件夹和外置硬盘。");
+        timing_ = label(L"");
         statusProgress_ = ProgressBar();
         statusProgress_.Maximum(100);
         AutomationProperties::SetName(statusProgress_, L"同步进度");
@@ -437,6 +502,7 @@ private:
         content.Children().Append(status_);
         content.Children().Append(detail_);
         content.Children().Append(statusProgress_);
+        content.Children().Append(timing_);
         content.Children().Append(route_);
         content.Children().Append(metrics_);
         StackPanel actions;
@@ -452,8 +518,14 @@ private:
         actions.Children().Append(explorer_);
         content.Children().Append(actions);
         content.Children().Append(label(L"旧版保留 30 天"));
+        askOnConnect_ = ToggleSwitch();
+        askOnConnect_.Header(box_value(L"连接已登记硬盘时询问"));
+        askOnConnect_.Toggled([this](auto&&, auto&&) {
+            if (!rendering_) worker_->submit([value = askOnConnect_.IsOn()](auto& engine) { engine.setAskOnConnect(value); });
+        });
+        content.Children().Append(askOnConnect_);
         automatic_ = ToggleSwitch();
-        automatic_.Header(box_value(L"连接后自动同步"));
+        automatic_.Header(box_value(L"允许此任务自动同步"));
         automatic_.Toggled([this](auto&&, auto&&) {
             if (rendering_) return;
             const auto on = automatic_.IsOn();
@@ -541,7 +613,10 @@ private:
         records_.Children().Append(header);
         list_ = ListView();
         list_.SelectionMode(ListViewSelectionMode::Single);
-        list_.SelectionChanged([this](auto&&, auto&&) { restoreSelected_.IsEnabled(list_.SelectedIndex() >= 0 && view_.volume && !busy(view_.progress.state)); });
+        list_.SelectionChanged([this](auto&&, auto&&) {
+            restoreSelected_.IsEnabled(list_.SelectedIndex() >= 0 && (view_.volume || view_.selectedDiskConnected) &&
+                                       !view_.busy && !busy(view_.progress.state));
+        });
         Grid::SetRow(list_, 1);
         records_.Children().Append(list_);
         content_.Children().Append(records_);
@@ -549,16 +624,42 @@ private:
     void render(const bg::Presentation& presentation) {
         const auto previous = view_.progress.state;
         const auto previousJob = view_.job.id;
+        auto previousPrompts = std::move(view_.backupPrompts);
         view_ = presentation;
+        if (previousPrompts != view_.backupPrompts) {
+            backupPrompts_.Children().Clear();
+            for (const auto& prompt : view_.backupPrompts) {
+                InfoBar bar;
+                bar.Title(hstring(L"「" + wide(prompt.name) + L"」已连接"));
+                bar.Message(hstring(L"备份 " + std::to_wstring(prompt.folders) + L" 个文件夹？"));
+                bar.IsClosable(false);
+                bar.IsOpen(true);
+                StackPanel actions;
+                actions.Orientation(Orientation::Horizontal);
+                actions.Spacing(8);
+                actions.Children().Append(button(L"立即备份", [this, id = prompt.id] { respond(id, true); }));
+                actions.Children().Append(button(L"稍后", [this, id = prompt.id] { respond(id, false); }));
+                bar.Content(actions);
+                backupPrompts_.Children().Append(bar);
+                if (std::none_of(previousPrompts.begin(), previousPrompts.end(), [&](const auto& prior) { return prior.id == prompt.id; }))
+                    notifyConnectedDisk(prompt);
+            }
+        }
         const auto& p = view_.progress;
         const bool active = view_.busy || busy(p.state);
         const bool configured = !view_.job.id.empty();
         const bool connected = view_.volume.has_value();
         using S = bg::SyncState;
-        status_.Text(hstring(title(p.state)));
+        const auto waiting = std::any_of(view_.backupPrompts.begin(), view_.backupPrompts.end(), [&](const auto& prompt) {
+            return prompt.disk == view_.job.volume;
+        });
+        const auto stateTitle = waiting ? L"等待确认备份" :
+            (p.state == S::disconnected && view_.selectedDiskConnected ? L"硬盘已连接" : title(p.state));
+        status_.Text(hstring(stateTitle));
         std::wstring text = wide(p.message);
         if (!configured) text = L"选择要备份的文件夹和外置硬盘。";
-        else if (text.empty() && p.state == S::disconnected) text = L"连接登记过的备份硬盘后继续。";
+        else if (text.empty() && p.state == S::disconnected)
+            text = view_.selectedDiskConnected ? L"可立即备份或校验。" : L"连接登记过的备份硬盘后继续。";
         else if (text.empty() && p.state == S::takeoverRequired) text = L"先预览并对齐本机文件夹，再接管自动同步。";
         else if (text.empty() && p.state == S::checking) text = L"已检查 " + std::to_wstring(p.examined) + L" 项";
         else if (text.empty() && p.state == S::syncing) text = L"剩余 " + std::to_wstring(p.planned - p.processed) + L" 项";
@@ -570,6 +671,10 @@ private:
         const bool determinate = p.state == S::syncing && p.planned > 0;
         statusProgress_.IsIndeterminate(active && !determinate);
         if (determinate) statusProgress_.Value(100.0 * p.processed / p.planned);
+        const bool estimating = p.state == S::checking || p.state == S::verifying;
+        timing_.Visibility(determinate || estimating ? Visibility::Visible : Visibility::Collapsed);
+        if (determinate) timing_.Text(hstring(backupTiming(p)));
+        else if (estimating) timing_.Text(L"剩余时间估算中");
         route_.Text(configured ? (view_.job.restoreOnly ? L"已有备份" : view_.job.source.wstring()) + L"\n↓\n" + view_.job.target.wstring() : L"");
         metrics_.Text(configured ? L"已管理 " + std::to_wstring(p.tracked) + L" 项  ·  最新副本写入 " +
             quantity(p.latestWritten) + L"  ·  历史写入 " + quantity(p.historyWritten) : L"");
@@ -580,14 +685,18 @@ private:
             disk_.Text(wide(disk.label.empty() ? bg::utf8(disk.mount) : disk.label) + L" · " + wide(view_.job.format) + L" · " + medium);
             free_.Text(L"可用 " + quantity(static_cast<int64_t>(disk.free)));
             capacity_.Value(disk.total ? 100.0 * (disk.total - disk.free) / disk.total : 0);
-        } else { disk_.Text(configured ? L"硬盘未连接" : L"尚未选择硬盘"); free_.Text(L""); }
+        } else {
+            disk_.Text(view_.selectedDiskConnected ? L"硬盘已连接" : (configured ? L"硬盘未连接" : L"尚未选择硬盘"));
+            free_.Text(L"");
+        }
         capacity_.Visibility(connected ? Visibility::Visible : Visibility::Collapsed);
-        sync_.IsEnabled(connected && !active && !view_.job.restoreOnly && p.state != S::paused && p.state != S::takeoverRequired);
+        sync_.IsEnabled((connected || view_.selectedDiskConnected) && !active && !view_.job.restoreOnly &&
+                       p.state != S::paused && p.state != S::takeoverRequired);
         verify_.IsEnabled(sync_.IsEnabled());
         pause_.IsEnabled(connected && !view_.job.restoreOnly && p.state != S::takeoverRequired);
         pause_.Label(p.state == S::paused ? L"继续" : L"暂停");
         pause_.Icon(SymbolIcon(p.state == S::paused ? Symbol::Play : Symbol::Pause));
-        eject_.IsEnabled(connected);
+        eject_.IsEnabled(connected || view_.selectedDiskConnected);
         setup_.IsEnabled(!active);
         open_.IsEnabled(!active);
         takeover_.IsEnabled(connected && !active);
@@ -595,10 +704,11 @@ private:
         existingButton_.Visibility(!configured ? Visibility::Visible : Visibility::Collapsed);
         takeoverButton_.Visibility(connected && (p.state == S::takeoverRequired || view_.job.restoreOnly) ? Visibility::Visible : Visibility::Collapsed);
         explorer_.Visibility(connected ? Visibility::Visible : Visibility::Collapsed);
-        restoreCurrent_.IsEnabled(connected && !active);
-        restoreSelected_.IsEnabled(connected && !active && list_.SelectedIndex() >= 0);
+        restoreCurrent_.IsEnabled((connected || view_.selectedDiskConnected) && !active);
+        restoreSelected_.IsEnabled((connected || view_.selectedDiskConnected) && !active && list_.SelectedIndex() >= 0);
         automatic_.Visibility(configured && !view_.job.restoreOnly ? Visibility::Visible : Visibility::Collapsed);
         rendering_ = true;
+        askOnConnect_.IsOn(view_.askOnConnect);
         std::vector<std::string> ids, labels;
         std::wstring states;
         std::optional<bg::FolderMapping> selected;
@@ -800,7 +910,7 @@ private:
                     form.Children().Append(label(L"原备份位置  " + wide(row.previous)));
             }
             ToggleSwitch automatic, eject, login;
-            automatic.Header(box_value(L"连接后自动备份"));
+            automatic.Header(box_value(L"允许自动同步"));
             automatic.IsOn(true);
             eject.Header(box_value(L"全部完成后自动推出硬盘"));
             eject.IsOn(true);
@@ -958,16 +1068,16 @@ private:
     HWND hwnd_{};
     UINT taskbarCreated_{};
     DispatcherQueue dispatcher_{nullptr};
-    DispatcherQueueTimer timer_{nullptr};
     Grid root_{nullptr}, content_{nullptr}, records_{nullptr};
     ScrollViewer overview_{nullptr};
     TextBlock disk_{nullptr}, free_{nullptr}, status_{nullptr}, detail_{nullptr}, route_{nullptr}, metrics_{nullptr}, recordTitle_{nullptr};
-    TextBlock folderStates_{nullptr};
+    TextBlock folderStates_{nullptr}, timing_{nullptr};
+    StackPanel backupPrompts_{nullptr};
     ProgressBar capacity_{nullptr}, statusProgress_{nullptr};
     AppBarButton sync_{nullptr}, pause_{nullptr}, eject_{nullptr}, setup_{nullptr}, open_{nullptr}, verify_{nullptr}, takeover_{nullptr};
     Button configureButton_{nullptr}, existingButton_{nullptr}, takeoverButton_{nullptr}, explorer_{nullptr};
     Button restoreCurrent_{nullptr}, restoreSelected_{nullptr};
-    ToggleSwitch automatic_{nullptr}, automaticEject_{nullptr}, enabled_{nullptr};
+    ToggleSwitch automatic_{nullptr}, automaticEject_{nullptr}, enabled_{nullptr}, askOnConnect_{nullptr};
     ComboBox folders_{nullptr}, diskType_{nullptr}, sourceDiskType_{nullptr}, changeKind_{nullptr};
     InfoBar alert_{nullptr};
     ListView list_{nullptr};

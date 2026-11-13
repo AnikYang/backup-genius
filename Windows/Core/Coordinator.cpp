@@ -46,16 +46,21 @@ BackupCoordinator::Binding BackupCoordinator::Binding::load(const Json& json) {
     return result;
 }
 BackupCoordinator::BackupCoordinator(fs::path storage, Progress progress, bool allowInternal,
-                                     std::function<void(SetInterruption)> fault)
-    : root_(std::move(storage)), notify_(std::move(progress)), allowInternal_(allowInternal), fault_(std::move(fault)) {
-    legacy_ = std::make_unique<SyncEngine>(root_, [this](const auto&) { publish(false); }, allowInternal_);
+                                     std::function<void(SetInterruption)> fault, std::function<void()> changesReady)
+    : root_(std::move(storage)), notify_(std::move(progress)), changesReady_(std::move(changesReady)),
+      allowInternal_(allowInternal), fault_(std::move(fault)) {
+    legacy_ = std::make_unique<SyncEngine>(root_, [this](const auto& value) {
+        if (value.progress.writeBytesPerSecond) publishTransfer(value.job.id, value.progress);
+        else publish(false);
+    }, allowInternal_, Fault{}, std::string{}, changesReady_);
 }
 void BackupCoordinator::start() {
     if (settings_) return;
-    legacy_->start();
+    legacy_->start(false);
     root_ = fs::canonical(root_);
     settings_ = std::make_unique<Index>(root_ / "settings.sqlite");
     host_ = identifier(settings_->get("settings", "host"));
+    askOnConnect_ = settings_->get("settings", "askOnConnect") != false;
     for (const auto& [id, value] : settings_->all("sets")) {
         auto binding = Binding::load(value);
         bindings_[identifier(id)] = binding;
@@ -70,7 +75,7 @@ void BackupCoordinator::start() {
         media_[key] = value == "ssd" ? StorageMedium::ssd : StorageMedium::hdd;
     }
     for (auto job : all()) job->setMedia(media_);
-    reconnect();
+    refreshConnections();
     publish();
 }
 bool BackupCoordinator::offerGuide() {
@@ -105,6 +110,16 @@ Presentation BackupCoordinator::presentation() const {
     if (!selected || selected_.empty())
         selected = !legacy_->presentation().job.id.empty() || engines_.empty() ? legacy_.get() : engines_.begin()->second.get();
     auto view = selected->presentation();
+    view.askOnConnect = askOnConnect_;
+    view.selectedDiskConnected = connections_.contains(view.job.volume);
+    for (const auto& [disk, connection] : connections_) if (!connection.prompt.empty()) {
+        size_t count = 0;
+        for (auto job : all()) {
+            const auto& entry = job->presentation().job;
+            if (entry.volume == disk && writable(entry)) ++count;
+        }
+        if (count) view.backupPrompts.push_back({connection.prompt, disk, connection.name, count});
+    }
     if (view.volume) {
         const auto setting = media_.find(folded(view.volume->device.id));
         if (setting != media_.end()) view.mediumOverride = setting->second;
@@ -122,6 +137,7 @@ Presentation BackupCoordinator::presentation() const {
     });
     if (auto active = active_.load(); busy_ && active && active->presentation().job.volume == view.job.volume) {
         view.progress = active->presentation().progress;
+        view.runningJob = active->presentation().job.id;
         if (view.progress.state == SyncState::ready) view.progress.state = SyncState::checking;
     } else if (!view.job.set.empty() && view.volume && view.progress.state != SyncState::takeoverRequired &&
                view.progress.state != SyncState::paused && diskProgress_.contains(view.job.volume)) {
@@ -132,21 +148,41 @@ Presentation BackupCoordinator::presentation() const {
     return view;
 }
 void BackupCoordinator::publish(bool force) {
+    std::lock_guard lock(publishedMutex_);
     const auto time = Clock::now();
     if (notify_ && (force || time - lastPublished_ >= std::chrono::milliseconds(200))) {
+        auto view = presentation();
+        if (!view.runningJob.empty() && view.runningJob == publishedView_.runningJob &&
+            view.progress.state == SyncState::syncing && publishedView_.progress.state == SyncState::syncing) {
+            view.progress.writeBytesPerSecond = publishedView_.progress.writeBytesPerSecond;
+            view.progress.estimatedSecondsRemaining = publishedView_.progress.estimatedSecondsRemaining;
+        }
         lastPublished_ = time;
-        notify_(presentation());
+        publishedView_ = std::move(view);
+        notify_(publishedView_);
     }
+}
+void BackupCoordinator::publishTransfer(std::string_view job, const SyncProgress& progress) {
+    std::lock_guard lock(publishedMutex_);
+    const auto time = Clock::now();
+    if (!notify_ || publishedView_.runningJob != job || progress.state != SyncState::syncing ||
+        time - lastPublished_ < std::chrono::milliseconds(200)) return;
+    lastPublished_ = time;
+    publishedView_.progress = progress;
+    notify_(publishedView_);
 }
 void BackupCoordinator::select(std::string id) { if (engine(id)) { selected_ = std::move(id); publish(); } }
 void BackupCoordinator::loadEngines(std::string_view set, const Binding& binding) {
     for (const auto& id : binding.jobs) if (!engines_.contains(id)) {
         auto job = std::make_unique<SyncEngine>(root_ / "collections" / path(set) / path(id),
-            [this](const auto&) { publish(false); }, allowInternal_, Fault{}, host_);
+            [this](const auto& value) {
+                if (value.progress.writeBytesPerSecond) publishTransfer(value.job.id, value.progress);
+                else publish(false);
+            }, allowInternal_, Fault{}, host_, changesReady_);
         auto& member = *job;
         engines_[id] = std::move(job);
         member.setMedia(media_);
-        member.start();
+        member.start(false);
     }
 }
 void BackupCoordinator::finalize(const BackupSet& set, const Binding& binding, const std::vector<BackupJob>& jobs) {
@@ -180,36 +216,68 @@ void BackupCoordinator::attach(const BackupSet& set, BackupSetStore& store) {
     for (const auto& map : set.mappings) if (auto job = engine(map.job))
         job->bindMember(store.volume, relativeToRoot(map.folder));
 }
-void BackupCoordinator::reconnect(bool updateVolume) {
+bool BackupCoordinator::writable(const BackupJob& job) const {
+    const auto map = mapping(job);
+    return !job.id.empty() && !job.restoreOnly && (!map || map->enabled);
+}
+std::optional<Volume> BackupCoordinator::connectedVolume(std::string_view disk, const fs::path& previous) {
+    try {
+        auto volume = allowInternal_ ? std::optional(inspect(previous)) : findMountedVolume(disk);
+        if (volume && volume->id == disk && (allowInternal_ || volume->external)) return volume;
+    } catch (...) {}
+    return {};
+}
+void BackupCoordinator::considerConnection(const Volume& volume) {
+    if (ejected_.contains(volume.id)) return;
+    const auto name = volume.label.empty() ? utf8(volume.mount) : volume.label;
+    const auto [it, inserted] = connections_.try_emplace(volume.id, Connection{volume.mount, name, !askOnConnect_, {}});
+    it->second.mount = volume.mount;
+    it->second.name = name;
+    if (inserted && askOnConnect_) it->second.prompt = uuid();
+}
+void BackupCoordinator::refreshConnections() {
+    const auto& job = legacy_->presentation().job;
+    if (!job.id.empty()) {
+        const auto volume = connectedVolume(job.volume, job.target);
+        if (volume) {
+            if (!job.restoreOnly) considerConnection(*volume);
+            if (!ejected_.contains(job.volume) && (job.restoreOnly || connections_.at(job.volume).allowed))
+                legacy_->refreshConnection();
+        } else {
+            connections_.erase(job.volume);
+            confirmedDisks_.erase(job.volume);
+            ejected_.erase(job.volume);
+            legacy_->disconnect();
+        }
+    }
+    reconnect();
+}
+void BackupCoordinator::reconnect() {
     for (auto it = bindings_.begin(); it != bindings_.end();) {
         const auto id = it->first;
         const auto binding = it->second;
         ++it;
-        auto current = stores_.find(id);
-        if (current != stores_.end()) {
-            try {
-                current->second->disk.check();
-                if (!updateVolume && settings_->get("setPending", id).is_null()) continue;
-            } catch (...) { stores_.erase(current); }
-        }
-        std::optional<Volume> volume;
-        try {
-            auto seen = inspect(binding.mount);
-            if (seen.id == binding.volume) volume = std::move(seen);
-        } catch (...) {}
-        if (!volume) if (auto mount = findVolume(binding.volume)) {
-            try { volume = inspect(*mount); } catch (...) {}
-        }
+        auto volume = connectedVolume(binding.volume, binding.mount);
         if (!volume) {
             stores_.erase(id);
             ejected_.erase(binding.volume);
-            for (const auto& job : binding.jobs) if (auto member = engine(job)) member->bindMember({});
+            connections_.erase(binding.volume);
+            confirmedDisks_.erase(binding.volume);
+            for (const auto& job : binding.jobs) if (auto member = engine(job)) member->disconnect();
             continue;
         }
         if (ejected_.contains(binding.volume)) continue;
+        if (std::any_of(binding.jobs.begin(), binding.jobs.end(), [&](const auto& id) {
+            const auto member = engine(id);
+            return member && writable(member->presentation().job);
+        })) {
+            considerConnection(*volume);
+            if (!connections_.at(binding.volume).allowed) continue;
+        }
         try {
             require(allowInternal_ || volume->external, "请选择外置备份硬盘");
             auto& store = stores_[id];
+            if (store && store->volume.mount != volume->mount) store.reset();
             if (!store) store = std::make_unique<BackupSetStore>(*volume, fault_);
             store->volume = *volume;
             const auto set = store->recover();
@@ -242,10 +310,28 @@ void BackupCoordinator::reconnect(bool updateVolume) {
         }
     }
 }
-void BackupCoordinator::volumesDidChange() {
+void BackupCoordinator::volumesDidChange(const std::vector<fs::path>& mounts, bool removed) {
     start();
-    ejected_.clear();
-    reconnect(true);
+    const auto matches = [&](const fs::path& mount) {
+        return std::any_of(mounts.begin(), mounts.end(), [&](const auto& root) {
+            return folded(utf8(root)) == folded(utf8(mount));
+        });
+    };
+    if (removed) {
+        std::set<std::string> disconnected;
+        for (const auto& [disk, connection] : connections_) if (matches(connection.mount)) disconnected.insert(disk);
+        for (const auto& disk : disconnected) {
+            connections_.erase(disk);
+            confirmedDisks_.erase(disk);
+            for (auto job : all()) if (job->presentation().job.volume == disk) job->disconnect();
+            for (const auto& [id, binding] : bindings_) if (binding.volume == disk) stores_.erase(id);
+        }
+    } else {
+        std::erase_if(ejected_, [&](const auto& entry) { return matches(entry.second); });
+        for (auto job : all()) if (!ejected_.contains(job->presentation().job.volume)) job->allowReconnect();
+    }
+    refreshConnections();
+    publish();
     poll();
 }
 SetupPreview BackupCoordinator::previewSetup(const fs::path& disk, const std::vector<fs::path>& sources) {
@@ -350,6 +436,7 @@ void BackupCoordinator::confirmSetup(std::string_view id, const std::map<std::st
     store.apply({old.revision, set, additions, moves});
     finalize(set, binding, jobs);
     attach(set, store);
+    connections_[volume.id] = {volume.mount, volume.label, true, {}};
     if (!jobs.empty()) selected_ = jobs.front().id;
     preview_.reset();
     previewSet_.reset();
@@ -401,6 +488,65 @@ void BackupCoordinator::setEnabled(bool enabled) {
     publish();
 }
 void BackupCoordinator::setAutomatic(bool value) { selected().setAutomatic(value); publish(); }
+fs::path BackupCoordinator::restore(const fs::path& out, std::string_view version) {
+    auto& member = selected();
+    const auto job = member.presentation().job;
+    if (!member.presentation().volume && !job.set.empty() && connections_.contains(job.volume)) {
+        const auto volume = connectedVolume(job.volume, connections_.at(job.volume).mount);
+        require(volume.has_value(), "硬盘未连接");
+        openExisting(volume->mount / path(backupRoot));
+        selected_ = job.id;
+    }
+    return member.restore(out, version);
+}
+void BackupCoordinator::confirmTakeover(std::string_view id, const std::map<std::string, AlignmentChoice>& choices) {
+    auto& member = selected();
+    member.confirmTakeover(id, choices);
+    if (const auto& volume = member.presentation().volume) {
+        connections_[volume->id] = {volume->mount, volume->label, true, {}};
+    }
+    publish();
+    poll();
+}
+void BackupCoordinator::setAskOnConnect(bool value) {
+    start();
+    settings_->put("settings", "askOnConnect", value);
+    askOnConnect_ = value;
+    if (!value) {
+        for (auto& [_, connection] : connections_) if (!connection.prompt.empty()) {
+            connection.allowed = true;
+            connection.prompt.clear();
+        }
+        refreshConnections();
+    }
+    publish();
+    if (!value) poll();
+}
+void BackupCoordinator::respondToBackupPrompt(std::string_view id, bool backup) {
+    refreshConnections();
+    const auto found = std::find_if(connections_.begin(), connections_.end(), [&](const auto& entry) {
+        return !id.empty() && entry.second.prompt == id;
+    });
+    if (found == connections_.end()) { publish(); return; }
+    const auto disk = found->first;
+    found->second.prompt.clear();
+    found->second.allowed = backup;
+    if (backup) {
+        if (selected().presentation().job.volume != disk) {
+            for (auto member : all()) {
+                const auto& job = member->presentation().job;
+                if (job.volume == disk && writable(job)) { selected_ = job.id; break; }
+            }
+        }
+        confirmedDisks_.insert(disk);
+        if (!paused_) {
+            refreshConnections();
+            confirmedDisks_.erase(disk);
+            if (connections_.contains(disk)) runDisk(disk, false, nullptr);
+        }
+    }
+    publish();
+}
 void BackupCoordinator::setEjectAfterBackup(bool value) {
     const auto selectedJob = selected().presentation().job;
     for (auto job : all()) if (job->presentation().job.id == selectedJob.id ||
@@ -450,11 +596,12 @@ void BackupCoordinator::alignFolderName(SyncEngine& member) {
 }
 void BackupCoordinator::poll() {
     start();
-    reconnect();
     std::map<std::string, std::map<std::string, bool>> requests;
     for (auto job : all()) {
         const auto& entry = job->presentation().job;
-        if (const auto map = mapping(entry); map && !map->enabled) continue;
+        const auto connection = connections_.find(entry.volume);
+        if (!writable(entry) || connection == connections_.end() || !connection->second.allowed ||
+            !job->presentation().volume || paused_) continue;
         if (const auto due = job->poll(false); due && !paused_)
             requests[entry.volume][entry.id] = *due;
     }
@@ -462,7 +609,14 @@ void BackupCoordinator::poll() {
 }
 SyncProgress BackupCoordinator::sync(bool verify) {
     start();
-    return runDisk(selected().presentation().job.volume, verify, nullptr);
+    const auto disk = selected().presentation().job.volume;
+    if (!connections_.contains(disk)) refreshConnections();
+    if (const auto connection = connections_.find(disk); connection != connections_.end()) {
+        connection->second.allowed = true;
+        connection->second.prompt.clear();
+        refreshConnections();
+    }
+    return runDisk(disk, verify, nullptr);
 }
 SyncProgress BackupCoordinator::runDisk(std::string_view diskID, bool verify, const std::map<std::string, bool>* requests) {
     SyncProgress result;
@@ -519,13 +673,22 @@ void BackupCoordinator::requestPause() {
 }
 void BackupCoordinator::pause() {
     requestPause();
-    for (auto job : all()) job->pause();
+    for (auto job : all()) if (job->presentation().volume) job->pause();
     publish();
 }
 void BackupCoordinator::resume() {
     paused_ = false;
     for (auto job : all()) job->clearPause();
-    sync();
+    if (!confirmedDisks_.empty()) {
+        auto confirmed = std::exchange(confirmedDisks_, {});
+        refreshConnections();
+        for (const auto& disk : confirmed) if (connections_.contains(disk)) runDisk(disk, false, nullptr);
+        publish();
+        return;
+    }
+    const auto connection = connections_.find(selected().presentation().job.volume);
+    if (connection != connections_.end() && connection->second.allowed) sync();
+    publish();
 }
 void BackupCoordinator::safeEject() { ejectDisk(selected().presentation().job.volume); publish(); }
 void BackupCoordinator::ejectDisk(std::string_view diskID) {
@@ -535,15 +698,21 @@ void BackupCoordinator::ejectDisk(std::string_view diskID) {
         if (job->presentation().volume) volume = job->presentation().volume;
         members.push_back(job);
     }
+    if (!volume) {
+        if (const auto connection = connections_.find(std::string(diskID)); connection != connections_.end())
+            volume = connectedVolume(diskID, connection->second.mount);
+    }
     require(volume.has_value(), "硬盘未连接");
     try {
         for (auto job : members) job->releaseForEjection();
         for (const auto& [id, binding] : bindings_) if (binding.volume == diskID) stores_.erase(id);
         eject(*volume);
-        ejected_.insert(std::string(diskID));
+        ejected_[std::string(diskID)] = volume->mount;
+        connections_.erase(std::string(diskID));
+        confirmedDisks_.erase(std::string(diskID));
     } catch (...) {
         for (auto job : members) job->allowReconnect();
-        reconnect(true);
+        refreshConnections();
         throw;
     }
     paused_ = false;

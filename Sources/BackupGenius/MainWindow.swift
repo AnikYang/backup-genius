@@ -75,7 +75,22 @@ func byteCount(_ count: Int64) -> String {
     count == 0 ? "0 B" : ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
 }
 
+func backupTiming(_ progress: SyncProgress) -> String {
+    let rate = progress.writeBytesPerSecond.map { "\(byteCount(Int64(min(max(0, $0), 1e18))))/s" } ?? "测量中"
+    if progress.processed >= progress.planned { return "写入速度 \(rate) · 正在收尾" }
+    guard let seconds = progress.estimatedSecondsRemaining, seconds.isFinite else {
+        return "写入速度 \(rate) · 剩余时间估算中"
+    }
+    let formatter = DateComponentsFormatter()
+    formatter.unitsStyle = .abbreviated
+    formatter.allowedUnits = seconds >= 3600 ? [.hour, .minute] : (seconds >= 60 ? [.minute, .second] : [.second])
+    formatter.maximumUnitCount = 2
+    let duration = formatter.string(from: max(1, min(seconds.rounded(.up), 365 * 86400))) ?? "估算中"
+    return "写入速度 \(rate) · 本文件夹约剩 \(duration)"
+}
+
 struct MainWindow: View {
+    @Environment(\.openWindow) private var openWindow
     @Bindable var model: AppModel
 
     var body: some View {
@@ -90,7 +105,7 @@ struct MainWindow: View {
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 180, ideal: 216, max: 260)
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                SidebarDisk(job: model.job, volume: model.volume, state: model.progress.state)
+                SidebarDisk(job: model.job, volume: model.volume, state: model.progress.state, connected: model.selectedDiskConnected)
             }
         } detail: {
             Group {
@@ -164,6 +179,13 @@ struct MainWindow: View {
             }
         }
         .navigationSplitViewStyle(.balanced)
+        .onAppear {
+            let action = openWindow
+            model.openBackupWindow = {
+                action(id: "main")
+                NSApp.activate()
+            }
+        }
         .onChange(of: model.page) { _, _ in model.loadRecords() }
         .sheet(item: $model.setup) { mode in
             switch mode {
@@ -186,6 +208,7 @@ private struct SidebarDisk: View {
     let job: BackupJob?
     let volume: VolumeInfo?
     let state: SyncState
+    let connected: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -218,6 +241,7 @@ private struct SidebarDisk: View {
 
     private var connectionStatus: String {
         if let volume { return "\(volume.format.name) · 已连接" }
+        if connected { return "已连接" }
         if state == .ejected { return "已推出" }
         if state == .ejecting { return "正在推出" }
         return job == nil ? "尚未选择" : "未连接"
@@ -232,6 +256,17 @@ struct Overview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     status
+                    ForEach(model.backupPrompts) { prompt in
+                        HStack {
+                            Label("「\(prompt.volumeName)」已连接，备份 \(prompt.folderCount) 个文件夹？", systemImage: "externaldrive")
+                            Spacer()
+                            Button("稍后") { model.respondToBackupPrompt(prompt.id, backup: false) }
+                            Button("立即备份") { model.respondToBackupPrompt(prompt.id, backup: true) }
+                                .buttonStyle(.borderedProminent)
+                        }
+                        .padding(12)
+                        .background(.background.secondary, in: .rect(cornerRadius: 10))
+                    }
                     if job.setID != nil {
                         ForEach(model.folders.filter { $0.job.setID == job.setID }) { folder in
                             Button { model.selectFolder(folder.id) } label: {
@@ -295,7 +330,7 @@ struct Overview: View {
             VStack(spacing: 8) {
                 Text("连接硬盘，即可备份")
                     .font(.largeTitle.weight(.semibold))
-                Text("选好外置硬盘和要备份的文件夹。下次连接时，Backup Genius 会检查变化并更新备份。")
+                Text("选好外置硬盘和要备份的文件夹。再次连接已登记的硬盘时，Backup Genius 会提示你开始备份。")
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -330,7 +365,7 @@ struct Overview: View {
                     .background(state.color.opacity(0.12), in: .rect(cornerRadius: 15))
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(model.ejecting ? "正在安全推出" : state.title)
+                    Text(model.ejecting ? "正在安全推出" : overviewTitle(state))
                         .font(.title2.weight(.semibold))
                     Text(statusDetail)
                         .font(.subheadline)
@@ -350,6 +385,11 @@ struct Overview: View {
                         .progressViewStyle(.linear)
                         .accessibilityLabel(state.title)
                 }
+                if !model.ejecting && (state == .checking || state == .verifying || (state == .syncing && progress.planned > 0)) {
+                    Text(state == .syncing ? backupTiming(progress) : "剩余时间估算中")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
                 if let path = progress.currentPath {
                     Text(path)
                         .font(.caption)
@@ -368,10 +408,11 @@ struct Overview: View {
         if let message = progress.message { return message }
         switch progress.state {
         case .disconnected:
+            if model.selectedDiskConnected { return "可立即备份或校验。" }
             return "连接 \(model.job?.volumeName ?? "备份硬盘") 以继续。"
         case .ready:
             return model.job?.restoreOnly == true ? "可浏览历史版本和恢复当前备份。" :
-                (model.job?.automatic == true ? "正在等待自动检查。" : "可从工具栏手动开始同步。")
+                (model.backupPrompts.isEmpty && model.job?.automatic == true ? "正在等待备份。" : "可手动开始备份。")
         case .checking:
             return "已检查 \(progress.examined.formatted()) 项"
         case .verifying:
@@ -392,6 +433,13 @@ struct Overview: View {
         case .ejected: return "重新连接硬盘即可继续备份。"
         case .unconfigured: return "选择要备份的文件夹。"
         }
+    }
+
+    private func overviewTitle(_ state: SyncState) -> String {
+        if let disk = model.job?.volumeID.uppercased(), model.backupPrompts.contains(where: { $0.volumeID == disk }) {
+            return "等待确认备份"
+        }
+        return state == .disconnected && model.selectedDiskConnected ? "硬盘已连接" : state.title
     }
 
     private func route(_ job: BackupJob) -> some View {

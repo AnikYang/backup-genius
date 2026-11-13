@@ -5,6 +5,7 @@
 #include "BackupSet.h"
 #include <atomic>
 #include <chrono>
+#include <mutex>
 
 namespace bg {
 enum class SyncState { unconfigured, disconnected, ready, checking, syncing, recovering, verifying,
@@ -15,6 +16,7 @@ struct SyncProgress {
     int64_t sourceRead{}, targetRead{}, latestWritten{}, historyWritten{};
     int64_t sourceReadRequests{}, targetReadRequests{}, latestWriteRequests{}, ioBufferBudget{};
     double checkingSeconds{}, elapsedSeconds{};
+    std::optional<double> writeBytesPerSecond, estimatedSecondsRemaining;
     std::string message, currentPath;
 };
 struct BackupJob {
@@ -30,6 +32,11 @@ struct FolderStatus {
     std::optional<FolderMapping> mapping;
     SyncProgress progress;
 };
+struct BackupPrompt {
+    std::string id, disk, name;
+    size_t folders{};
+    bool operator==(const BackupPrompt&) const = default;
+};
 struct Presentation {
     BackupJob job;
     std::optional<Volume> volume;
@@ -37,6 +44,9 @@ struct Presentation {
     std::vector<FolderStatus> folders;
     std::string runningFolder;
     bool busy{};
+    bool askOnConnect{true}, selectedDiskConnected{};
+    std::vector<BackupPrompt> backupPrompts;
+    std::string runningJob;
     std::optional<StorageDeviceInfo> sourceDevice;
     std::optional<StorageMedium> mediumOverride, sourceMediumOverride;
 };
@@ -60,9 +70,12 @@ using Progress = std::function<void(const Presentation&)>;
 // Calls other than requestPause are serialized on the application's worker.
 class SyncEngine {
 public:
-    explicit SyncEngine(fs::path storage, Progress = {}, bool allowInternal = false, Fault = {}, std::string host = {});
+    explicit SyncEngine(fs::path storage, Progress = {}, bool allowInternal = false, Fault = {}, std::string host = {},
+                        std::function<void()> changesReady = {});
     ~SyncEngine();
-    void start();
+    void start(bool connect = true);
+    void refreshConnection();
+    void disconnect();
     void configure(const fs::path& source, const fs::path& target, bool automatic);
     void openExisting(const fs::path& target);
     void setAutomatic(bool value);
@@ -108,6 +121,7 @@ private:
     std::unique_ptr<DirectoryWatch> sourceWatch_, targetWatch_;
     std::unique_ptr<Draft> draft_;
     Progress notify_;
+    std::function<void()> changesReady_;
     Fault fault_;
     std::string host_;
     std::optional<Volume> mappedVolume_;
@@ -116,6 +130,8 @@ private:
     Presentation view_;
     bool allowInternal_, suppress_{}, sourceGap_{}, verifyAttempted_{};
     std::atomic_bool paused_{};
-    std::chrono::steady_clock::time_point published_{}, lastPollScan_{}, lastAttempt_{}, lastMaintenance_{};
+    std::mutex publishedMutex_;
+    Presentation publishedView_;
+    std::chrono::steady_clock::time_point published_{}, lastPollScan_{}, lastMaintenance_{};
 };
 }

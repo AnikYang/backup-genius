@@ -46,9 +46,8 @@ struct BackupGeniusApp: App {
         MenuBarExtra {
             MenuControls(model: model)
         } label: {
-            Label("Backup Genius", systemImage: model.displayedProgress.state == .needsAttention ?
-                  "externaldrive.badge.exclamationmark" : "externaldrive")
-                .accessibilityLabel("Backup Genius，\(model.displayedProgress.state.title)")
+            Label("Backup Genius", systemImage: model.menuSymbol)
+                .accessibilityLabel("Backup Genius，\(model.menuStatus)")
         }
         .menuBarExtraStyle(.menu)
 
@@ -108,6 +107,9 @@ final class AppModel {
     var runningFolder: UUID?
     var diskProgress: [String: SyncProgress] = [:]
     var media: [String: StorageMedium] = [:]
+    var askOnConnect = true
+    var backupPrompts: [BackupPrompt] = []
+    var connectedDisks = Set<String>()
     var busy = false
     var job: BackupJob?
     var volume: VolumeInfo?
@@ -128,6 +130,11 @@ final class AppModel {
     @ObservationIgnored private var observer: Task<Void, Never>?
     @ObservationIgnored private var notifications: [NSObjectProtocol] = []
     @ObservationIgnored private var loadRecordsTask: Task<Void, Never>?
+    @ObservationIgnored var openBackupWindow: (() -> Void)?
+    @ObservationIgnored private lazy var backupNotifications = BackupNotifications(
+        respond: { [weak self] id, backup in self?.respondToBackupPrompt(id, backup: backup) },
+        showWindow: { [weak self] in self?.openBackupWindow?() }
+    )
 
     init() {
         let appSupport = URL.applicationSupportDirectory.appending(path: "Backup Genius", directoryHint: .isDirectory)
@@ -137,8 +144,12 @@ final class AppModel {
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification,
                      NSWorkspace.didRenameVolumeNotification, NSWorkspace.didWakeNotification] {
-            notifications.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in
-                Task { await coordinator.volumesDidChange(connected: name == NSWorkspace.didMountNotification) }
+            notifications.append(center.addObserver(forName: name, object: nil, queue: .main) { event in
+                let path = event.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL ??
+                    (event.userInfo?["NSDevicePath"] as? String).map { URL(filePath: $0) }
+                let mounted = name == NSWorkspace.didMountNotification ? path : nil
+                let unmounted = name == NSWorkspace.didUnmountNotification ? path : nil
+                Task { await coordinator.volumesDidChange(mounted: mounted, unmounted: unmounted) }
             })
         }
         refreshLoginStatus()
@@ -150,6 +161,14 @@ final class AppModel {
                 self.diskProgress = snapshot.diskProgress
                 self.media = snapshot.media
                 self.busy = snapshot.busy
+                self.askOnConnect = snapshot.askOnConnect
+                self.connectedDisks = snapshot.connectedDisks
+                if self.backupPrompts.map(\.id) != snapshot.backupPrompts.map(\.id) {
+                    self.backupPrompts = snapshot.backupPrompts
+                    self.backupNotifications.update(snapshot.backupPrompts)
+                } else if !snapshot.backupPrompts.isEmpty {
+                    self.backupPrompts = snapshot.backupPrompts
+                }
                 let selected = snapshot.folders.first(where: { $0.id == self.selectedFolder }) ?? snapshot.folders.first
                 await self.show(selected)
             }
@@ -193,7 +212,7 @@ final class AppModel {
         if let runningFolder, let current = folders.first(where: { $0.id == runningFolder }),
            current.job.volumeID == job.volumeID {
             var state = current.snapshot.progress
-            state.message = "\(current.title) · \(state.state.title)"
+            if state.message == nil { state.message = current.title }
             if busy, !state.state.busy { state.state = .checking }
             return state
         }
@@ -204,15 +223,23 @@ final class AppModel {
 
     var selectedMapping: FolderMapping? { folders.first(where: { $0.id == selectedFolder })?.mapping }
 
+    var menuStatus: String { backupPrompts.isEmpty ? displayedProgress.state.title : "等待确认备份" }
+    var menuSymbol: String {
+        if !backupPrompts.isEmpty || displayedProgress.state == .needsAttention { return "externaldrive.badge.exclamationmark" }
+        return "externaldrive"
+    }
+
     var canSync: Bool {
-        job?.restoreOnly == false && selectedMapping?.enabled != false && !busy && (volume != nil || progress.state == .needsAttention) &&
+        job?.restoreOnly == false && selectedMapping?.enabled != false && !busy &&
+            (volume != nil || selectedDiskConnected || progress.state == .needsAttention) &&
             !progress.state.busy && progress.state != .takeoverRequired &&
             progress.state != .paused && !restoring && !ejecting
     }
+    var selectedDiskConnected: Bool { job.map { connectedDisks.contains($0.volumeID.uppercased()) } ?? false }
     var canPause: Bool { job?.restoreOnly == false && volume != nil && !restoring && !ejecting }
     var ejecting: Bool { ejectRequested || progress.state == .ejecting }
-    var canEject: Bool { volume != nil && !restoring && !ejecting }
-    var canRestore: Bool { volume != nil && !busy && !progress.state.busy && !restoring && !ejecting }
+    var canEject: Bool { (volume != nil || selectedDiskConnected) && !restoring && !ejecting }
+    var canRestore: Bool { (volume != nil || selectedDiskConnected) && !busy && !progress.state.busy && !restoring && !ejecting }
 
     func sync() {
         guard canSync, let id = job?.id else { return }
@@ -292,6 +319,28 @@ final class AppModel {
             do { try await coordinator.setAutomatic(value, job: id) }
             catch { self.error = error.localizedDescription }
         }
+    }
+
+    func setAskOnConnect(_ value: Bool) {
+        Task {
+            do {
+                try await coordinator.setAskOnConnect(value)
+                if value { await backupNotifications.requestPermission() }
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+
+    func requestBackupNotificationPermission() async {
+        if askOnConnect { await backupNotifications.requestPermission() }
+    }
+
+    func respondToBackupPrompt(_ id: UUID, backup: Bool) {
+        if backup, let prompt = backupPrompts.first(where: { $0.id == id }), job?.volumeID.uppercased() != prompt.volumeID,
+           let folder = folders.first(where: { $0.job.volumeID.uppercased() == prompt.volumeID &&
+               !$0.job.restoreOnly && $0.mapping?.enabled != false }) {
+            selectFolder(folder.id)
+        }
+        Task { await coordinator.respondToBackupPrompt(id, backup: backup) }
     }
 
     func setEjectAfterBackup(_ value: Bool) {
@@ -377,11 +426,21 @@ struct MenuControls: View {
     let model: AppModel
 
     var body: some View {
-        Text(model.displayedProgress.state.title)
+        Text(model.menuStatus)
+        if model.displayedProgress.state == .syncing && model.displayedProgress.planned > 0 {
+            Text(backupTiming(model.displayedProgress))
+        }
         if let job = model.job {
             Text("\(model.volume?.name ?? job.volumeName) · \(job.format.name)")
         }
         Divider()
+        ForEach(model.backupPrompts) { prompt in
+            Menu(prompt.volumeName) {
+                Button("立即备份") { model.respondToBackupPrompt(prompt.id, backup: true) }
+                Button("稍后") { model.respondToBackupPrompt(prompt.id, backup: false) }
+            }
+        }
+        if !model.backupPrompts.isEmpty { Divider() }
         Button("打开 Backup Genius") {
             openWindow(id: "main")
             NSApp.activate()

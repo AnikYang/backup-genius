@@ -78,7 +78,8 @@ public:
     Json batch() const;
     void commit(Json batch, const std::unordered_map<std::string, Patch>& patches = {},
                 const std::function<void()>& validate = {}, bool align = false,
-                const std::unordered_map<std::string, std::optional<Stamp>>& expected = {});
+                const std::unordered_map<std::string, std::optional<Stamp>>& expected = {},
+                const std::function<void(size_t)>& onWrite = {});
     void prune(Time);
     void bind(std::string_view sourceIdentity);
     Bytes chunk(std::string_view hash, const Json& additional = Json::array());
@@ -98,7 +99,7 @@ private:
     static Tree locate(const Tree&);
     Json readBatch(std::string_view path);
     void replay(const Json&, bool align);
-    void apply(Json&, const std::unordered_map<std::string, Patch>&);
+    void apply(Json&, const std::unordered_map<std::string, Patch>&, const std::function<void(size_t)>&);
     void rollback(const Json& edit, const Json& additional);
     void clean();
     std::string commitPath(int64_t generation) const;
@@ -108,10 +109,11 @@ private:
 
 class PackWriter {
 public:
-    PackWriter(Repository&, std::string id);
+    PackWriter(Repository&, std::string id, std::function<void(size_t)> onWrite = {});
     void add(std::string_view hash, std::string_view bytes);
     bool contains(std::string_view hash);
-    Json saveFile(const Tree&, std::string_view path, const Stamp&, std::string_view known, int64_t& bytesRead);
+    Json saveFile(const Tree&, std::string_view path, const Stamp&, std::string_view known, int64_t& bytesRead,
+                  const std::function<void(size_t)>& onRead = {});
     Json finish();
     int64_t bytes() const { return length_; }
 private:
@@ -123,5 +125,6 @@ private:
     int64_t length_{};
     Bytes buffered_;
     int64_t bufferedOffset_{};
+    std::function<void(size_t)> onWrite_;
 };
 }

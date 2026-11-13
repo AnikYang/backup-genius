@@ -135,6 +135,7 @@ struct Volume {
 };
 Volume inspect(const fs::path&);
 std::optional<fs::path> findVolume(std::string_view id);
+std::optional<Volume> findMountedVolume(std::string_view id);
 void eject(const Volume&);
 Bytes hashFile(const File&, int64_t size, int64_t* readBytes = nullptr,
                size_t window = IOProfile::window(StorageMedium::unknown), int64_t* requests = nullptr);

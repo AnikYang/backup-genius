@@ -57,7 +57,8 @@ final class PatchData: @unchecked Sendable {
 
     func writeRequests(window: Int) -> Int { runs(window: window).count }
 
-    func apply(to file: FD, window: Int, afterFirstBlock: (() throws -> Void)? = nil) throws {
+    func apply(to file: FD, window: Int, onWrite: ((Int) -> Void)? = nil,
+               afterFirstBlock: (() throws -> Void)? = nil) throws {
         for range in runs(window: window, splitFirst: afterFirstBlock != nil) {
             let first = slices[range.lowerBound], last = slices[range.upperBound - 1]
             let length = Int(last.offset - first.offset) + last.length
@@ -70,6 +71,7 @@ final class PatchData: @unchecked Sendable {
                 data = buffer
             }
             try file.write(data, at: Int64(first.block) * Int64(blockSize))
+            onWrite?(data.count)
             if range.lowerBound == 0 { try afterFirstBlock?() }
         }
     }
@@ -99,14 +101,14 @@ struct Transfer: Sendable {
     let existingFilesPolicy: ExistingFilesPolicy
     var profile = IOProfile(source: .unknown, target: .unknown)
 
-    func prepare(_ work: Work) throws -> Prepared {
+    func prepare(_ work: Work, onIO: @escaping (Int, Int) -> Void) throws -> Prepared {
         switch work.kind {
         case .remove:
             return try prepareRemoval(work)
         case .move:
             return try prepareMove(work)
         case .sync:
-            return try prepareSync(work)
+            return try prepareSync(work, onIO: onIO)
         }
     }
 
@@ -162,7 +164,7 @@ struct Transfer: Sendable {
         return Prepared(edit: edit)
     }
 
-    private func prepareSync(_ work: Work) throws -> Prepared {
+    private func prepareSync(_ work: Work, onIO: @escaping (Int, Int) -> Void) throws -> Prepared {
         guard let stamp = work.stamp, try source.entry(work.path) == stamp else { throw BackupError.unstable(work.path) }
         _ = try target.directory(pathParent(work.path))
         let before = try target.entry(work.path)
@@ -180,7 +182,7 @@ struct Transfer: Sendable {
         }
         switch stamp.kind {
         case .regular:
-            return try prepareFile(work, stamp: stamp, before: before, adopting: adopting)
+            return try prepareFile(work, stamp: stamp, before: before, adopting: adopting, onIO: onIO)
         case .directory, .symlink:
             return try prepareEntry(work, stamp: stamp, before: before, adopting: adopting)
         case .unsupported:
@@ -268,7 +270,8 @@ struct Transfer: Sendable {
         return Prepared(edit: edit, archive: version, adoption: adopting ? .updatedEntry : nil)
     }
 
-    private func prepareFile(_ work: Work, stamp: FileStamp, before: FileStamp?, adopting: Bool) throws -> Prepared {
+    private func prepareFile(_ work: Work, stamp: FileStamp, before: FileStamp?, adopting: Bool,
+                             onIO: @escaping (Int, Int) -> Void) throws -> Prepared {
         let requireIdentical = adopting && existingFilesPolicy == .reuseIdentical
         let conflict = BackupError.message("同名文件内容不同，已保留硬盘上的副本：\(work.path)")
         if requireIdentical && before?.size != stamp.size { throw conflict }
@@ -290,6 +293,7 @@ struct Transfer: Sendable {
                 base = try oldFile.fileHashes(size: before.size, window: profile.targetWindow) {
                     result.targetBytes += Int64($0)
                     result.targetReadRequests += 1
+                    onIO($0, 0)
                 }
                 if !adopting {
                     originalAttrs = try oldFile.attributes(before, rich: rich)
@@ -337,6 +341,7 @@ struct Transfer: Sendable {
                     result.latestBytes += Int64(data.count)
                     result.latestWriteRequests += 1
                 }
+                onIO(data.count, newFile == nil ? 0 : data.count)
             }
         } catch {
             if (try? input.stamp()) != stamp { throw BackupError.unstable(work.path) }
@@ -374,7 +379,7 @@ struct Transfer: Sendable {
                 throw BackupError.posix("无法准备克隆文件", work.path)
             }
             let clone = try target.file(temp, writable: true)
-            try patch.apply(to: clone, window: profile.targetWindow)
+            try patch.apply(to: clone, window: profile.targetWindow, onWrite: { onIO(0, $0) })
             try clone.resize(stamp.size)
             try clone.apply(attrs, rich: true)
             try clone.flush()

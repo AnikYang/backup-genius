@@ -27,6 +27,8 @@ struct WorkPlan {
     var examined = 0
     var unmanaged: Int?
     var existingWork = 0
+
+    var estimatedWork: Double { waves.reduce(0) { sum, wave in wave.reduce(sum) { $0 + $1.estimatedWork } } }
 }
 
 // SwiftPM's .build directory is reproducible. A same-named ordinary hidden

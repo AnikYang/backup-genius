@@ -484,7 +484,8 @@ Json Repository::batch() const {
     return result;
 }
 void Repository::commit(Json next, const std::unordered_map<std::string, Patch>& patches, const std::function<void()>& validate,
-                        bool align, const std::unordered_map<std::string, std::optional<Stamp>>& expected) {
+                        bool align, const std::unordered_map<std::string, std::optional<Stamp>>& expected,
+                        const std::function<void(size_t)>& onWrite) {
     tree.check();
     const auto takeover = next.value("takeover", false);
     const auto& edits = next.at("edits");
@@ -514,7 +515,7 @@ void Repository::commit(Json next, const std::unordered_map<std::string, Patch>&
                 found->second->kind == Kind::directory && actual->identity == found->second->identity),
                 "提交前目标文件已变化");
         }
-        apply(edit, patches);
+        apply(edit, patches, onWrite);
         if (edit.at("method") != "record" && edit.at("method") != "archive") {
             if (tree.entry(parent(rel))) tree.flushDirectory(parent(rel));
             if (exists(edit, "from")) tree.flushDirectory(parent(edit.at("from").get<std::string>()));
@@ -528,7 +529,8 @@ void Repository::commit(Json next, const std::unordered_map<std::string, Patch>&
     tree.remove(pendingPath);
     tree.flushDirectory(journalPath);
 }
-void Repository::apply(Json& edit, const std::unordered_map<std::string, Patch>& patches) {
+void Repository::apply(Json& edit, const std::unordered_map<std::string, Patch>& patches,
+                       const std::function<void(size_t)>& onWrite) {
     const auto method = edit.at("method").get<std::string>();
     const auto rel = edit.at("path").get<std::string>();
     if (method == "record" || method == "archive") return;
@@ -545,6 +547,7 @@ void Repository::apply(Json& edit, const std::unordered_map<std::string, Patch>&
         for (const auto& [offset, length] : patch.writes(size, static_cast<bool>(fault_))) {
             auto bytes = spool->read(cursor, length);
             dest.write(offset, bytes);
+            if (onWrite) onWrite(bytes.size());
             cursor += static_cast<int64_t>(bytes.size());
             if (first && fault_) fault_(Interruption::firstBlock);
             first = false;
@@ -810,7 +813,8 @@ void Repository::prune(Time time) {
     clean();
 }
 
-PackWriter::PackWriter(Repository& repo, std::string id) : repo_(repo), id_(std::move(id)) {}
+PackWriter::PackWriter(Repository& repo, std::string id, std::function<void(size_t)> onWrite)
+    : repo_(repo), id_(std::move(id)), onWrite_(std::move(onWrite)) {}
 bool PackWriter::contains(std::string_view hash) {
     auto key = base64(hash);
     return locations_.contains(key) || !repo_.index.get("chunk", key).is_null();
@@ -825,7 +829,8 @@ void PackWriter::add(std::string_view hash, std::string_view bytes) {
     locations_[key] = Json{{"hash", key}, {"pack", id_}, {"offset", length_}, {"length", bytes.size()}};
     length_ += static_cast<int64_t>(bytes.size());
 }
-Json PackWriter::saveFile(const Tree& tree, std::string_view rel, const Stamp& stamp, std::string_view known, int64_t& bytesRead) {
+Json PackWriter::saveFile(const Tree& tree, std::string_view rel, const Stamp& stamp, std::string_view known,
+                          int64_t& bytesRead, const std::function<void(size_t)>& onRead) {
     auto file = tree.file(rel);
     require(file.stamp() == stamp, "归档前文件已更改");
     Bytes hashes;
@@ -837,6 +842,7 @@ Json PackWriter::saveFile(const Tree& tree, std::string_view rel, const Stamp& s
         else {
             auto data = file.read(offset, length);
             bytesRead += static_cast<int64_t>(data.size());
+            if (onRead) onRead(data.size());
             auto hash = sha256(data);
             require(expected.empty() || expected == hash, "归档时发现目标内容已更改");
             if (!contains(hash)) add(hash, data);
@@ -861,6 +867,7 @@ Json PackWriter::finish() {
 void PackWriter::flushBuffer() {
     if (!buffered_.empty()) {
         file_->write(bufferedOffset_, buffered_);
+        if (onWrite_) onWrite_(buffered_.size());
         buffered_.clear();
     }
 }

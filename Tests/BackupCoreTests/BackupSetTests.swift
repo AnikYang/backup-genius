@@ -23,8 +23,8 @@ private final class SetFixture {
         return source
     }
 
-    func coordinator(_ eject: @escaping @Sendable (URL) throws -> DiskEjectAction = BackupDisk.prepare) -> BackupCoordinator {
-        BackupCoordinator(storage: state, prepareEjection: eject)
+    func coordinator(monitor: Bool = false, _ eject: @escaping @Sendable (URL) throws -> DiskEjectAction = BackupDisk.prepare) -> BackupCoordinator {
+        BackupCoordinator(storage: state, monitor: monitor, prepareEjection: eject)
     }
 
     func track(_ set: BackupSet) { jobs.formUnion(set.mappings.map(\.job)) }
@@ -53,6 +53,85 @@ private final class SetFault: @unchecked Sendable {
 }
 
 extension BackupCoreTests {
+    @Test("Transfer timing uses actual writes and waits for a useful work sample")
+    func transferTiming() {
+        let meter = TransferProgress(total: 1000, at: 0)
+        var progress = SyncProgress(state: .syncing)
+        meter.beginBatch(500)
+        meter.record(read: 100, written: 100)
+        #expect(!meter.sample(at: 0.1, progress: &progress))
+        #expect(meter.sample(at: 0.5, progress: &progress))
+        #expect(progress.writeBytesPerSecond == 200)
+        #expect(progress.estimatedSecondsRemaining == nil)
+        meter.record(read: 100)
+        #expect(meter.sample(at: 1.1, progress: &progress))
+        #expect(progress.writeBytesPerSecond == 0)
+        #expect(progress.estimatedSecondsRemaining != nil)
+        #expect(meter.sample(at: 3.2, progress: &progress))
+        #expect(progress.estimatedSecondsRemaining == nil)
+        meter.finishBatch()
+        meter.beginBatch(500)
+        meter.finishBatch()
+        #expect(meter.sample(at: 3.5, progress: &progress))
+        #expect(progress.estimatedSecondsRemaining == nil)
+    }
+
+    @Test("A known disk needs a fresh choice before any automatic backup", .enabled(if: ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_APFS"] != nil))
+    func backupPromptOnConnection() async throws {
+        let fixture = try SetFixture(.apfs)
+        let first = try fixture.source("First")
+        let second = try fixture.source("Second")
+        let original = fixture.coordinator(monitor: true)
+        try await original.start()
+        let preview = try await original.previewSetup(volumeRoot: fixture.mount, sources: [first, second])
+        let set = try await original.confirmSetup(preview.id, automatic: true, ejectAfterBackup: false)
+        fixture.track(set)
+        await original.sync(set.mappings[0].job)
+        await original.finishAndClose()
+
+        let current = fixture.coordinator(monitor: true)
+        try await current.start()
+        let prompt = try #require(await current.presentation.backupPrompts.first)
+        #expect(prompt.folderCount == 2)
+        #expect(await current.presentation.folders.allSatisfy { $0.snapshot.volume == nil })
+        await current.volumesDidChange(mounted: fixture.mount)
+        await current.volumesDidChange()
+        #expect(await current.presentation.backupPrompts.map(\.id) == [prompt.id])
+        await current.pause()
+        await current.resume(set.mappings[0].job)
+        #expect(await current.presentation.folders.allSatisfy { $0.snapshot.volume == nil })
+        await current.respondToBackupPrompt(prompt.id, backup: false)
+        await current.volumesDidChange(mounted: fixture.mount)
+        await current.volumesDidChange()
+        #expect(await current.presentation.backupPrompts.isEmpty)
+        await current.respondToBackupPrompt(prompt.id, backup: true)
+        let next = Data("updated".utf8)
+        try next.write(to: first.appending(path: "payload.bin"))
+        let copy = fixture.mount.appending(path: "BackupGenius/First/payload.bin")
+        #expect(try Data(contentsOf: copy) == Data("first".utf8))
+        let restoreFolder = fixture.root.appending(path: "Restore", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: restoreFolder, withIntermediateDirectories: true)
+        let restored = try await current.restore(set.mappings[0].job, version: nil, to: restoreFolder)
+        #expect(try Data(contentsOf: restored.appending(path: "payload.bin")) == Data("first".utf8))
+        #expect(try Data(contentsOf: copy) == Data("first".utf8))
+
+        await current.volumesDidChange(unmounted: fixture.mount)
+        await current.volumesDidChange()
+        let newPrompt = try #require(await current.presentation.backupPrompts.first)
+        #expect(newPrompt.id != prompt.id)
+        await current.respondToBackupPrompt(prompt.id, backup: true)
+        #expect(await current.presentation.backupPrompts.map(\.id) == [newPrompt.id])
+        await current.respondToBackupPrompt(newPrompt.id, backup: true)
+        for _ in 0..<100 {
+            if try Data(contentsOf: copy) == next,
+               await current.presentation.diskProgress.values.contains(where: { $0.state == .upToDate }) { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(try Data(contentsOf: copy) == next)
+        #expect(await current.presentation.backupPrompts.isEmpty)
+        await current.finishAndClose()
+    }
+
     @Test("Mount discovery matches disk identity before opening a filesystem",
           .enabled(if: ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_APFS"] != nil &&
                    ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_EXFAT"] != nil))

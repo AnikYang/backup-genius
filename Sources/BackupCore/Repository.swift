@@ -373,7 +373,8 @@ final class Repository {
         DiskBatch(id: UUID(), generation: try catalog.generation + 1)
     }
 
-    func commit(_ input: DiskBatch, patches: [String: PatchData], beforeApply: () throws -> Void) throws {
+    func commit(_ input: DiskBatch, patches: [String: PatchData], onWrite: ((Int) -> Void)? = nil,
+                beforeApply: () throws -> Void) throws {
         var batch = input
         guard !batch.edits.isEmpty || !batch.pruned.isEmpty || !batch.retiredPacks.isEmpty || batch.takeover == true else { return }
         try protectIdentity(in: batch)
@@ -412,7 +413,7 @@ final class Repository {
                 }
                 attempted += 1
                 let patch = patches[batch.edits[index].path]
-                try apply(&batch.edits[index], patch: patch)
+                try apply(&batch.edits[index], patch: patch, onWrite: onWrite)
             }
             try flushParents(batch.edits)
             try interruption?(.applied)
@@ -474,7 +475,7 @@ final class Repository {
         }
     }
 
-    private func apply(_ edit: inout DiskEdit, patch: PatchData?) throws {
+    private func apply(_ edit: inout DiskEdit, patch: PatchData?, onWrite: ((Int) -> Void)?) throws {
         switch edit.method {
         case .record, .archive:
             return
@@ -486,9 +487,9 @@ final class Repository {
             let file = try tree.file(edit.path, writable: true)
             guard try file.stamp() == edit.before else { throw BackupError.unstable(edit.path) }
             if let interruption {
-                try patch.apply(to: file, window: ioProfile.targetWindow) { try interruption(.firstBlock) }
+                try patch.apply(to: file, window: ioProfile.targetWindow, onWrite: onWrite) { try interruption(.firstBlock) }
             } else {
-                try patch.apply(to: file, window: ioProfile.targetWindow)
+                try patch.apply(to: file, window: ioProfile.targetWindow, onWrite: onWrite)
             }
             try file.resize(next.source.size)
             try file.apply(next.attributes, rich: false)
@@ -806,11 +807,13 @@ final class PackWriter {
     private var offset: Int64 = 0
     private var buffered = Data()
     private var bufferedOffset: Int64 = 0
+    private let onWrite: ((Int) -> Void)?
     private(set) var bytes: Int64 = 0
 
-    init(repository: Repository, id: UUID) {
+    init(repository: Repository, id: UUID, onWrite: ((Int) -> Void)? = nil) {
         self.repository = repository
         self.id = id
+        self.onWrite = onWrite
     }
 
     func contains(_ hash: Data) throws -> Bool {
@@ -835,6 +838,7 @@ final class PackWriter {
     private func flushBuffer() throws {
         if !buffered.isEmpty {
             try file!.write(buffered, at: bufferedOffset)
+            onWrite?(buffered.count)
             buffered.removeAll(keepingCapacity: true)
         }
     }

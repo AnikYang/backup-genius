@@ -59,7 +59,7 @@ struct SetupView: View {
                     Section("规则") {
                         LabeledContent("同步方向", value: "Mac → 外置硬盘")
                         LabeledContent("旧版保留", value: "\(BackupJob.retentionDays) 天")
-                        Toggle("连接后自动同步", isOn: $automatic)
+                        Toggle("允许自动同步", isOn: $automatic)
                         Toggle("备份完成后自动推出硬盘", isOn: $ejectAfterBackup)
                         ExistingFilesOptions(policy: $existingFiles)
                         Toggle("登录时启动", isOn: $login)
@@ -454,8 +454,14 @@ struct AppSettings: View {
                 }
             }
             Section("备份") {
+                Picker("连接已登记硬盘时", selection: Binding(
+                    get: { model.askOnConnect }, set: { model.setAskOnConnect($0) }
+                )) {
+                    Text("询问是否备份").tag(true)
+                    Text("按任务设置自动备份").tag(false)
+                }
                 if let job = model.job {
-                    Toggle("连接硬盘后自动同步", isOn: Binding(
+                    Toggle("允许此任务自动同步", isOn: Binding(
                         get: { model.job?.automatic ?? false }, set: { model.setAutomatic($0) }
                     ))
                     .disabled(job.restoreOnly)

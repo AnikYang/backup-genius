@@ -82,6 +82,8 @@ public final class SyncEngine: @unchecked Sendable {
     private var volumeChangedWhileEjecting = false
     private var progress = SyncProgress()
     private var lastPublished: Double = 0
+    private let transferQueue = DispatchQueue(label: "backupgenius.progress", qos: .utility)
+    private var transferTimer: DispatchSourceTimer?
     private var host = UUID()
     private let sharedHost: UUID?
     private var automaticHandler: (@Sendable (Bool) -> Void)?
@@ -145,24 +147,53 @@ public final class SyncEngine: @unchecked Sendable {
 
     private func publish(force: Bool = true) {
         let now = ProcessInfo.processInfo.systemUptime
-        guard force || now - lastPublished >= 0.2 else { return }
-        lastPublished = now
-        let snapshot = BackupPresentation(job: job, volume: repository?.volume, progress: progress,
-                                          organizedStorage: repository?.tree.controlTree != nil, sourceDevice: sourceDevice?.1)
         publishedLock.withLock {
+            guard force || now - lastPublished >= 0.2 else { return }
+            var current = progress
+            if current.state == .syncing, subscribers.latest.progress.state == .syncing {
+                current.writeBytesPerSecond = subscribers.latest.progress.writeBytesPerSecond
+                current.estimatedSecondsRemaining = subscribers.latest.progress.estimatedSecondsRemaining
+            }
+            let snapshot = BackupPresentation(job: job, volume: repository?.volume, progress: current,
+                                              organizedStorage: repository?.tree.controlTree != nil, sourceDevice: sourceDevice?.1)
+            lastPublished = now
             subscribers.latest = snapshot
-            for stream in subscribers.streams.values { stream.yield(snapshot.progress) }
+            for stream in subscribers.streams.values { stream.yield(current) }
+        }
+    }
+
+    private func startTransferProgress(_ meter: TransferProgress) {
+        let timer = DispatchSource.makeTimerSource(queue: transferQueue)
+        timer.schedule(deadline: .now() + .milliseconds(400), repeating: .milliseconds(400), leeway: .milliseconds(50))
+        timer.setEventHandler { [weak self] in self?.sampleTransferProgress(meter) }
+        transferTimer = timer
+        timer.resume()
+    }
+
+    private func sampleTransferProgress(_ meter: TransferProgress) {
+        publishedLock.withLock {
+            let now = ProcessInfo.processInfo.systemUptime
+            let old = subscribers.latest
+            var current = old.progress
+            guard current.state == .syncing, now - lastPublished >= 0.2,
+                  meter.sample(at: now, progress: &current) else { return }
+            lastPublished = now
+            subscribers.latest = BackupPresentation(job: old.job, volume: old.volume, progress: current,
+                                                      organizedStorage: old.organizedStorage, sourceDevice: old.sourceDevice)
+            for stream in subscribers.streams.values { stream.yield(current) }
         }
     }
 
     private var configURL: URL { storage.appending(path: "job.json") }
 
-    public func start() async throws {
+    public func start(connect: Bool = true) async throws {
         try await perform { engine in
             do {
                 try engine.load()
-                try engine.refresh()
-                engine.schedule(force: true)
+                if connect {
+                    try engine.refresh()
+                    engine.schedule(force: true)
+                }
             } catch {
                 engine.fail(error)
                 throw error
@@ -182,11 +213,6 @@ public final class SyncEngine: @unchecked Sendable {
             let loaded = try JSONDecoder().decode(BackupJob.self, from: Data(contentsOf: configURL))
             try setJob(loaded)
         }
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + .seconds(60), repeating: .seconds(60), leeway: .seconds(10))
-        timer.setEventHandler { [weak self] in self?.periodic() }
-        self.timer = timer
-        timer.resume()
         started = true
     }
 
@@ -218,6 +244,20 @@ public final class SyncEngine: @unchecked Sendable {
                 try pruneIfDue(repository)
             }
         } catch { fail(error) }
+    }
+
+    private func startMaintenance() {
+        guard timer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .seconds(60), repeating: .seconds(60), leeway: .seconds(10))
+        timer.setEventHandler { [weak self] in self?.periodic() }
+        self.timer = timer
+        timer.resume()
+    }
+
+    private func stopMaintenance() {
+        timer?.cancel()
+        timer = nil
     }
 
     public func configure(source: URL, target: URL, automatic: Bool = true, reuseMatchingFiles: Bool = false) async throws -> BackupJob {
@@ -318,7 +358,7 @@ public final class SyncEngine: @unchecked Sendable {
         takeover = nil
         self.job = job
         catalog = index
-        progress = SyncProgress()
+        progress = SyncProgress(state: .disconnected)
         progress.trackedFiles = try index.fileCount()
         progress.lastSuccess = try date("lastSuccess", catalog: index)
         progress.lastRunID = try index.latestRunID()
@@ -574,24 +614,48 @@ public final class SyncEngine: @unchecked Sendable {
     }
 
     public func volumesDidChange() {
-        queue.async { [weak self] in
-            guard let self, self.started else { return }
-            if self.ejectionTask != nil {
-                self.volumeChangedWhileEjecting = true
-                return
-            }
-            self.suppressConnection = false
-            do {
-                if try self.refresh(updateVolume: true) { self.schedule(force: true) }
-            } catch { self.fail(error) }
+        queue.async { [weak self] in self?.updateConnection() }
+    }
+
+    func refreshConnection(available: Bool = true) async {
+        try? await perform { $0.updateConnection(available: available) }
+    }
+
+    private func updateConnection(available: Bool = true) {
+        guard started else { return }
+        if ejectionTask != nil {
+            volumeChangedWhileEjecting = true
+            return
         }
+        suppressConnection = false
+        if !available {
+            try? persistEvents(flush: false)
+            stopMaintenance()
+            repository = nil
+            targetMonitor = nil
+            sourceMonitor = nil
+            sourceScope = nil
+            targetScope = nil
+            storageScope = nil
+            mappedVolume = nil
+            scheduled?.cancel()
+            forceAutomatic = false
+            if progress.state != .ejected {
+                progress.state = .disconnected
+                progress.message = nil
+            }
+            publish()
+            return
+        }
+        do {
+            if try refresh(updateVolume: true) { schedule(force: true) }
+        } catch { fail(error) }
     }
 
     @discardableResult
     private func refresh(updateVolume: Bool = false) throws -> Bool {
         guard ejectionTask == nil, !suppressConnection else { return false }
         guard let job, let catalog else { publish(); return false }
-        if !job.restoreOnly, let source = try? sourceTree(job) { try startSourceMonitor(source, catalog: catalog) }
         if let repository, (try? repository.tree.checkRoot()) != nil {
             if updateVolume, let volume = try? inspect(repository.tree.url) {
                 try updateTargetLocation(job, tree: repository.tree, volume: volume)
@@ -601,8 +665,12 @@ public final class SyncEngine: @unchecked Sendable {
             return false
         }
         repository = nil
+        stopMaintenance()
         targetMonitor = nil
         guard let (tree, volume) = try findTarget(job) else {
+            try? persistEvents(flush: false)
+            sourceMonitor = nil
+            sourceScope = nil
             targetScope = nil
             storageScope = nil
             if progress.state != .ejected {
@@ -612,6 +680,7 @@ public final class SyncEngine: @unchecked Sendable {
             }
             return false
         }
+        if !job.restoreOnly, let source = try? sourceTree(job) { try startSourceMonitor(source, catalog: catalog) }
         let disk = job.setID == nil ? try storageDisk(job, tree: tree, volume: volume) : nil
         let located = job.setID == nil ? try Repository.locatedTree(tree, volume: volume, disk: disk) : tree
         let next = try Repository(tree: located, volume: volume, job: job, catalog: catalog, host: host, interruption: interruption)
@@ -643,6 +712,7 @@ public final class SyncEngine: @unchecked Sendable {
             progress.lastRunID = try catalog.latestRunID()
             progress.state = try requiresTakeover(next, job: job) ? .takeoverRequired : (isPaused ? .paused : .ready)
             progress.message = nil
+            startMaintenance()
             publish()
             return true
         } catch {
@@ -781,7 +851,7 @@ public final class SyncEngine: @unchecked Sendable {
     public func pause() {
         setPaused(true)
         queue.async { [weak self] in
-            guard let self, self.job != nil else { return }
+            guard let self, self.repository != nil else { return }
             self.progress.state = .paused
             self.progress.message = nil
             self.publish()
@@ -792,13 +862,18 @@ public final class SyncEngine: @unchecked Sendable {
         setPaused(false)
         queue.async { [weak self] in
             guard let self else { return }
+            if let handler = self.automaticHandler {
+                if self.repository != nil { handler(false) }
+                if self.progress.state == .paused {
+                    self.progress.state = self.repository == nil ? .disconnected : .ready
+                    self.publish()
+                }
+                return
+            }
             self.suppressConnection = false
             do {
                 try self.refresh()
-                if self.repository != nil {
-                    if let handler = self.automaticHandler { handler(false) }
-                    else { _ = try self.run(verify: false) }
-                }
+                if self.repository != nil { _ = try self.run(verify: false) }
             } catch { self.fail(error) }
         }
     }
@@ -819,6 +894,7 @@ public final class SyncEngine: @unchecked Sendable {
             }
             if volume != nil, engine.mappedVolume == nil { engine.suppressConnection = false }
             engine.mappedVolume = volume
+            if let volume { engine.repository?.updateVolume(volume) }
             if engine.job?.target != job.target || engine.job?.source != job.source ||
                 engine.job?.volumeName != job.volumeName {
                 try JSONEncoder().encode(job).write(to: engine.configURL, options: .atomic)
@@ -868,6 +944,7 @@ public final class SyncEngine: @unchecked Sendable {
                 try repository.tree.root.flush(directory: true)
             }
             engine.repository = nil
+            engine.stopMaintenance()
             engine.targetMonitor = nil
             engine.sourceMonitor = nil
             engine.targetScope = nil
@@ -907,6 +984,7 @@ public final class SyncEngine: @unchecked Sendable {
         try repository.tree.root.flush(directory: true)
         let eject = try prepareEjection(repository.volume.mount)
         self.repository = nil
+        stopMaintenance()
         targetMonitor = nil
         targetScope = nil
         storageScope = nil
@@ -954,7 +1032,7 @@ public final class SyncEngine: @unchecked Sendable {
         await eject?.value
         _ = try? await perform { engine in
             engine.scheduled?.cancel()
-            engine.timer?.cancel()
+            engine.stopMaintenance()
             engine.sourceMonitor = nil
             engine.targetMonitor = nil
             engine.repository = nil
@@ -1128,6 +1206,7 @@ public final class SyncEngine: @unchecked Sendable {
         } else {
             if let repository, (try? repository.tree.checkRoot()) == nil {
                 self.repository = nil
+                stopMaintenance()
                 targetMonitor = nil
                 targetScope = nil
                 progress.state = .disconnected
@@ -1204,8 +1283,16 @@ public final class SyncEngine: @unchecked Sendable {
         progress.planned = plan.waves.reduce(0) { $0 + $1.count }
         progress.skipped = max(0, oldCount - plan.existingWork)
         progress.state = .syncing
+        progress.currentPath = plan.waves.first?.first?.path
         publish()
 
+        let meter = TransferProgress(total: plan.estimatedWork, at: ProcessInfo.processInfo.systemUptime)
+        if progress.planned > 0 { startTransferProgress(meter) }
+        defer {
+            transferTimer?.cancel()
+            transferTimer = nil
+            transferQueue.sync {}
+        }
         var problems = plan.problems
         var targetRetry = Set<String>()
         let transfer = Transfer(source: source, target: repository.tree, scratch: scratch, volume: repository.volume,
@@ -1215,8 +1302,10 @@ public final class SyncEngine: @unchecked Sendable {
                 if isPaused { throw BackupError.paused }
                 let items = Array(wave[start..<min(start + IOProfile.batchSize, wave.count)])
                 progress.currentPath = items.first?.path
-                try runBatch(items, run: run, transfer: transfer, repository: repository,
+                meter.beginBatch(items.reduce(0) { $0 + $1.estimatedWork })
+                try runBatch(items, run: run, transfer: transfer, repository: repository, meter: meter,
                              problems: &problems, targetRetry: &targetRetry)
+                meter.finishBatch()
                 progress.processed += items.count
                 publish(force: false)
             }
@@ -1263,19 +1352,21 @@ public final class SyncEngine: @unchecked Sendable {
         return completed
     }
 
-    private func runBatch(_ items: [Work], run: BackupRunTag, transfer: Transfer, repository: Repository,
+    private func runBatch(_ items: [Work], run: BackupRunTag, transfer: Transfer, repository: Repository, meter: TransferProgress,
                           problems: inout [String: String], targetRetry: inout Set<String>) throws {
         let results = PreparationResults(count: items.count)
         let workers = min(items.count, transfer.profile.workers)
         DispatchQueue.concurrentPerform(iterations: workers) { worker in
             for index in stride(from: worker, to: items.count, by: workers) {
-                results.set(Result { try transfer.prepare(items[index]) }, at: index)
+                results.set(Result {
+                    try transfer.prepare(items[index]) { meter.record(read: $0, written: $1) }
+                }, at: index)
             }
         }
 
         var batch = try repository.newBatch()
         batch.run = run
-        let writer = PackWriter(repository: repository, id: batch.id)
+        let writer = PackWriter(repository: repository, id: batch.id) { meter.record(written: $0) }
         var patches: [String: PatchData] = [:]
         var applying: [Work] = []
         var adoptedEntries = 0
@@ -1306,6 +1397,7 @@ public final class SyncEngine: @unchecked Sendable {
                     edit.archive = try repository.archive(edit, old: item.old, knownHashes: prepared.oldHashes, writer: writer) {
                         progress.targetReadBytes += Int64($0)
                         progress.targetReadRequests += 1
+                        meter.record(read: $0)
                     }
                 }
                 if let patch = prepared.patch { patches[edit.path] = patch }
@@ -1324,7 +1416,7 @@ public final class SyncEngine: @unchecked Sendable {
         batch.chunks = try writer.finish()
         progress.historyWrittenBytes += writer.bytes
         do {
-            try repository.commit(batch, patches: patches) {
+            try repository.commit(batch, patches: patches, onWrite: { meter.record(written: $0) }) {
                 try transfer.source.checkRoot()
                 let exclusions = SourceExclusions(source: transfer.source)
                 for item in applying {

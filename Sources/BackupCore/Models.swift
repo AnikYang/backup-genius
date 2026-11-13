@@ -80,6 +80,8 @@ public struct SyncProgress: Codable, Sendable {
     public var ioBufferBudget = 0
     public var checkingSeconds: Double = 0
     public var elapsedSeconds: Double = 0
+    public var writeBytesPerSecond: Double?
+    public var estimatedSecondsRemaining: Double?
     public var lastSuccess: Date?
     public var currentPath: String?
     public var message: String?
