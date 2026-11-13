@@ -114,6 +114,125 @@ private func diskutil(_ arguments: [String]) throws -> Data {
 
 @Suite(.serialized)
 struct BackupCoreTests {
+    @Test("Point retention preserves the latest point and recreates pruned chunks")
+    func pointRetention() async throws {
+        let fixture = try Fixture(.exfat)
+        try fixture.write("file", files("old point"))
+        let trip = Tripwire()
+        let engine = fixture.engine(fault: { try trip.trigger($0) })
+        _ = try await baseline(engine, fixture)
+        try fixture.write("file", files("new point"))
+        try await engine.simulate(source: Changes(fullScan: true))
+        _ = try await engine.syncNow()
+        let latest = try #require(await engine.restorePoints().first)
+        trip.arm(.pointPruning)
+        do {
+            try await engine.maintenance(now: .now.addingTimeInterval(31 * 86400))
+            Issue.record("Expected an interrupted point cleanup")
+        } catch {}
+        try await engine.maintenance(now: .now.addingTimeInterval(31 * 86400))
+        let restored = try await engine.restore(point: latest.id, to: fixture.restore)
+        #expect(try fixture.read("file", folder: restored) == files("new point"))
+        try fixture.write("file", files("old point"))
+        try await engine.simulate(source: Changes(fullScan: true))
+        #expect(try await engine.syncNow().state == .upToDate)
+        let reused = try #require(await engine.restorePoints().first)
+        let oldAgain = try await engine.restore(point: reused.id, to: fixture.restore)
+        #expect(try fixture.read("file", folder: oldAgain) == files("old point"))
+        await engine.finishAndClose()
+    }
+
+    @Test("Disk measurement uses only a bounded temporary file and cleans it")
+    func diskMeasurement() async throws {
+        let fixture = try Fixture()
+        try fixture.write("keep.txt", files("keep"), folder: fixture.target)
+        let result = try await DiskDiagnostics.measure(at: fixture.target)
+        #expect(result.bytes == 64 * 1024 * 1024)
+        #expect(result.readBytesPerSecond > 0 && result.writeBytesPerSecond > 0)
+        #expect(try fixture.read("keep.txt") == files("keep"))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.target.path) == ["keep.txt"])
+    }
+
+    @Test("Complete restore points survive deletion, external overwrite and restart", arguments: [DiskFormat.apfs, .exfat])
+    func completePoints(_ format: DiskFormat) async throws {
+        let fixture = try Fixture(format)
+        try fixture.write("Folder/old.txt", files("old"))
+        try fixture.write("same.bin", Data(repeating: 7, count: 2 * blockSize + 17))
+        let engine = fixture.engine()
+        _ = try await baseline(engine, fixture)
+        let first = try #require(await engine.restorePoints().first)
+        try FileManager.default.removeItem(at: fixture.source.appending(path: "Folder/old.txt"))
+        try fixture.write("new.txt", files("new"))
+        try fixture.write("same.bin", Data(repeating: 9, count: blockSize + 4))
+        try await engine.simulate(source: Changes(fullScan: true))
+        _ = try await engine.syncNow()
+        let second = try #require(await engine.restorePoints().first)
+        #expect(first.id != second.id)
+        // Cleanup must keep every retained state, including files later deleted.
+        try await engine.maintenance(now: .now)
+        // Saved points must be independent of the editable Finder copy.
+        try fixture.write("same.bin", files("external"), folder: fixture.target)
+        let old = try await engine.restore(point: first.id, to: fixture.restore)
+        #expect(try fixture.read("Folder/old.txt", folder: old) == files("old"))
+        #expect(try fixture.read("same.bin", folder: old) == Data(repeating: 7, count: 2 * blockSize + 17))
+        #expect(!FileManager.default.fileExists(atPath: old.appending(path: "new.txt").path))
+        let latest = try await engine.restore(point: second.id, to: fixture.restore)
+        #expect(try fixture.read("new.txt", folder: latest) == files("new"))
+        #expect(!FileManager.default.fileExists(atPath: latest.appending(path: "Folder/old.txt").path))
+        await engine.finishAndClose()
+        let restarted = fixture.engine()
+        try await restarted.start()
+        #expect(try await restarted.restorePoints().count == 2)
+        let again = try await restarted.restore(point: first.id, to: fixture.restore)
+        #expect(try fixture.read("Folder/old.txt", folder: again) == files("old"))
+        await restarted.finishAndClose()
+    }
+
+    @Test("Offline source events are persisted without opening the backup disk")
+    func offlineObservation() async throws {
+        let fixture = try Fixture(.apfs, liveEvents: true)
+        try fixture.write("name.txt", files("AAAA"))
+        let engine = fixture.engine(watch: true)
+        _ = try await baseline(engine, fixture)
+        await engine.refreshConnection(available: false)
+        try fixture.write("name.txt", files("BBBB"))
+        try fixture.write("new.txt", files("new"))
+        try await waitForProgress(engine) { $0.pendingSourcePaths > 0 }
+        #expect(engine.presentation.volume == nil)
+        #expect(try fixture.read("name.txt") == files("AAAA"))
+        await engine.finishAndClose()
+        let restarted = fixture.engine(watch: true)
+        try await restarted.start(connect: false)
+        #expect(restarted.presentation.volume == nil)
+        _ = try await restarted.syncNow()
+        #expect(try fixture.read("name.txt") == files("BBBB"))
+        #expect(try fixture.read("new.txt") == files("new"))
+        await restarted.finishAndClose()
+    }
+
+    @Test("Incomplete points never appear as completed backups", arguments: [InterruptionPoint.pointPrepared, .pointCommitted])
+    func interruptedPoints(_ point: InterruptionPoint) async throws {
+        let fixture = try Fixture(.exfat)
+        let trip = Tripwire()
+        try fixture.write("data", files("first"))
+        let engine = fixture.engine(fault: { try trip.trigger($0) })
+        _ = try await baseline(engine, fixture)
+        try fixture.write("data", files("second"))
+        try await engine.simulate(source: Changes(fullScan: true))
+        trip.arm(point)
+        do { _ = try await engine.syncNow(); Issue.record("Expected interruption") } catch {}
+        await engine.finishAndClose()
+        let next = fixture.engine()
+        try await next.start()
+        let points = try await next.restorePoints()
+        #expect(points.count == (point == .pointCommitted ? 2 : 1))
+        _ = try await next.syncNow()
+        let saved = try #require(await next.restorePoints().first)
+        let restored = try await next.restore(point: saved.id, to: fixture.restore)
+        #expect(try fixture.read("data", folder: restored) == files("second"))
+        await next.finishAndClose()
+    }
+
     @Test("Only Backup Genius distribution builds are skipped and retired from existing copies")
     func generatedInstallers() async throws {
         let fixture = try Fixture()

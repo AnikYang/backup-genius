@@ -60,7 +60,7 @@ struct Patch {
     size_t window{IOProfile::window(StorageMedium::unknown)};
     std::vector<std::pair<int64_t, size_t>> writes(int64_t size, bool splitFirst = false) const;
 };
-enum class Interruption { prepared, firstBlock, applied, committed, pruning };
+enum class Interruption { prepared, firstBlock, applied, committed, pruning, pointPrepared, pointCommitted, pointPruning };
 using Fault = std::function<void(Interruption)>;
 
 class Repository {

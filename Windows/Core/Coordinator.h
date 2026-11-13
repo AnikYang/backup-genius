@@ -39,9 +39,10 @@ public:
     void pause();
     void resume();
     void safeEject();
-    fs::path restore(const fs::path& out, std::string_view version = {});
+    fs::path restore(const fs::path& out, std::string_view version = {}, std::string_view point = {});
     Json activities() { return selected().activities(); }
     Json history() { return selected().history(); }
+    Json restorePoints() { return selected().restorePoints(); }
     TakeoverPreview previewTakeover(const fs::path& folder) { return selected().previewTakeover(folder); }
     void confirmTakeover(std::string_view id, const std::map<std::string, AlignmentChoice>& choices);
     Presentation presentation() const;

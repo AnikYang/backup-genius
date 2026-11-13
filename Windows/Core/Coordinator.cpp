@@ -488,7 +488,7 @@ void BackupCoordinator::setEnabled(bool enabled) {
     publish();
 }
 void BackupCoordinator::setAutomatic(bool value) { selected().setAutomatic(value); publish(); }
-fs::path BackupCoordinator::restore(const fs::path& out, std::string_view version) {
+fs::path BackupCoordinator::restore(const fs::path& out, std::string_view version, std::string_view point) {
     auto& member = selected();
     const auto job = member.presentation().job;
     if (!member.presentation().volume && !job.set.empty() && connections_.contains(job.volume)) {
@@ -497,7 +497,7 @@ fs::path BackupCoordinator::restore(const fs::path& out, std::string_view versio
         openExisting(volume->mount / path(backupRoot));
         selected_ = job.id;
     }
-    return member.restore(out, version);
+    return member.restore(out, version, point);
 }
 void BackupCoordinator::confirmTakeover(std::string_view id, const std::map<std::string, AlignmentChoice>& choices) {
     auto& member = selected();
@@ -598,6 +598,7 @@ void BackupCoordinator::poll() {
     start();
     std::map<std::string, std::map<std::string, bool>> requests;
     for (auto job : all()) {
+        job->observeSource();
         const auto& entry = job->presentation().job;
         const auto connection = connections_.find(entry.volume);
         if (!writable(entry) || connection == connections_.end() || !connection->second.allowed ||
@@ -606,6 +607,7 @@ void BackupCoordinator::poll() {
             requests[entry.volume][entry.id] = *due;
     }
     for (const auto& [disk, due] : requests) if (!paused_) runDisk(disk, false, &due);
+    publish();
 }
 SyncProgress BackupCoordinator::sync(bool verify) {
     start();
@@ -623,6 +625,7 @@ SyncProgress BackupCoordinator::runDisk(std::string_view diskID, bool verify, co
     std::vector<SyncEngine*> jobs;
     bool allIncluded = true, autoEject = false, success = true;
     for (auto job : all()) {
+        job->observeSource();
         const auto& entry = job->presentation().job;
         const auto map = mapping(entry);
         if (entry.id.empty() || entry.volume != diskID || entry.restoreOnly || (map && !map->enabled)) continue;

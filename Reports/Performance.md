@@ -1,5 +1,9 @@
 # Backup Genius 性能报告
 
+## 1.5.0 的完整时间点
+
+加入独立时间点后的实测与资源开销见 [1.5.0 验证报告](Resident-and-restore-points.md#performance-on-virtual-volumes)。本轮完成 APFS 10 万小文件和 exFAT 1 千小文件测试；两组无变化时正文读写均为零。初次归档和变化后的时间点元数据处理带来额外开销，不能沿用下方 1.3.0 的耗时作为新版结果。
+
 ## 1.3.0 的 10 万小文件测试
 
 在 Apple Silicon、macOS 27.2 上使用 Release 备份引擎和实际 FSEvents，目标为挂载的 APFS 和 exFAT 稀疏磁盘镜像。两组各有 100,000 个 1 KiB 文件及一个 32 MiB 文件。修改与批量移动各涉及 1,000 个小文件。两组全部完成，问题数为零。

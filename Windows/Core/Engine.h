@@ -18,6 +18,8 @@ struct SyncProgress {
     double checkingSeconds{}, elapsedSeconds{};
     std::optional<double> writeBytesPerSecond, estimatedSecondsRemaining;
     std::string message, currentPath;
+    int64_t pendingSourcePaths{};
+    bool sourceNeedsScan{}, sourceObserving{};
 };
 struct BackupJob {
     std::string id, volume, format, relative, sourceId;
@@ -85,11 +87,13 @@ public:
     void pause();
     void resume();
     void safeEject();
-    fs::path restore(const fs::path&, std::string_view version = {});
+    fs::path restore(const fs::path&, std::string_view version = {}, std::string_view point = {});
     TakeoverPreview previewTakeover(const fs::path&);
     void confirmTakeover(std::string_view preview, const std::map<std::string, AlignmentChoice>&);
     Json activities();
     Json history();
+    Json restorePoints();
+    void observeSource();
     const Presentation& presentation() const { return view_; }
     void recordChanges(const Changes&, bool target = false);
     void installMember(BackupJob);

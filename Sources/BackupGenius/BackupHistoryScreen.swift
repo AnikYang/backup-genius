@@ -3,13 +3,14 @@ import BackupCore
 
 struct HistoryScreen: View {
     private enum Section: String, CaseIterable, Identifiable {
+        case points = "时间点"
         case backups = "备份记录"
         case versions = "历史版本"
         var id: Self { self }
     }
 
     let model: AppModel
-    @ViewState private var section = Section.backups
+    @ViewState private var section = Section.points
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,10 +19,11 @@ struct HistoryScreen: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 224)
+            .frame(maxWidth: 360)
             .padding(10)
             Divider()
             switch section {
+            case .points: RestorePointsScreen(model: model)
             case .backups: BackupRunsScreen(model: model)
             case .versions: VersionHistoryScreen(model: model)
             }

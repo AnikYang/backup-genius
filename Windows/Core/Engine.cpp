@@ -1,3 +1,4 @@
+#include "RestorePoints.h"
 #include "Engine.h"
 
 #include <algorithm>
@@ -34,7 +35,7 @@ public:
     using Callback = std::function<void(const SyncProgress&)>;
     TransferProgress(double total, Callback callback)
         : total_(total), started_(Clock::now()), sampled_(started_), lastWork_(started_) {
-        if (total > 0 && callback) {
+        if (callback) {
             timer_ = std::jthread([this, callback = std::move(callback)](std::stop_token stop) {
                 std::unique_lock lock(mutex_);
                 while (!wake_.wait_for(lock, stop, std::chrono::milliseconds(400), [] { return false; }) && !stop.stop_requested()) {
@@ -399,7 +400,7 @@ SyncEngine::SyncEngine(fs::path storage, Progress update, bool allowInternal, Fa
                        std::function<void()> changesReady)
     : storage_(std::move(storage)), notify_(std::move(update)), changesReady_(std::move(changesReady)), fault_(std::move(fault)),
       host_(std::move(host)), allowInternal_(allowInternal) {}
-SyncEngine::~SyncEngine() = default;
+SyncEngine::~SyncEngine() { try { drain(); } catch (...) {} }
 void SyncEngine::publish(bool force) {
     std::lock_guard lock(publishedMutex_);
     auto time = Clock::now();
@@ -438,8 +439,6 @@ void SyncEngine::disconnect() {
     drain();
     repo_.reset();
     targetWatch_.reset();
-    sourceWatch_.reset();
-    sourceGap_ = true;
     mappedVolume_.reset();
     view_.volume.reset();
     view_.progress.state = SyncState::disconnected;
@@ -462,6 +461,7 @@ void SyncEngine::setJob(BackupJob job) {
     sourceGap_ = true;
     sourceDevice_.reset();
     verifyAttempted_ = false;
+    observeSource();
 }
 void SyncEngine::saveJob() { settings_->put("settings", "job", jobJSON(view_.job)); }
 void SyncEngine::configure(const fs::path& in, const fs::path& out, bool automatic) {
@@ -625,9 +625,7 @@ void SyncEngine::refresh() {
     if (repo->recovered) index_->put("activity", uuid(), activity("recovered", "", 0, "已回滚未完成的事务"));
     view_.job.target = target;
     view_.volume = volume;
-    if (!view_.job.restoreOnly && !sourceWatch_) {
-        try { sourceWatch_ = std::make_unique<DirectoryWatch>(sourceTree().root(), changesReady_); } catch (...) {}
-    }
+    observeSource();
     targetWatch_ = std::make_unique<DirectoryWatch>(target, changesReady_, true);
     repo_ = std::move(repo);
     recordChanges({{}, true}, true);
@@ -648,9 +646,26 @@ void SyncEngine::recordChanges(const Changes& changes, bool target) {
         }
     });
 }
+void SyncEngine::observeSource() {
+    if (!index_ || view_.job.restoreOnly || view_.job.id.empty()) return;
+    try {
+        if (!sourceWatch_ || !sourceWatch_->alive()) {
+            if (sourceWatch_) recordChanges(sourceWatch_->take());
+            sourceWatch_ = std::make_unique<DirectoryWatch>(sourceTree().root(), changesReady_);
+            sourceGap_ = true;
+            index_->put("meta", "sourceFull", true);
+        }
+        drain();
+    } catch (...) { index_->put("meta", "sourceFull", true); }
+}
 void SyncEngine::drain() {
     if (sourceWatch_) recordChanges(sourceWatch_->take());
     if (targetWatch_) recordChanges(targetWatch_->take(), true);
+    if (index_) {
+        view_.progress.pendingSourcePaths = index_->count("sourceDirty");
+        view_.progress.sourceNeedsScan = index_->get("meta", "sourceFull") == true;
+        view_.progress.sourceObserving = sourceWatch_ && sourceWatch_->alive();
+    }
 }
 void SyncEngine::setAutomatic(bool value) {
     view_.job.automatic = value;
@@ -744,9 +759,17 @@ void SyncEngine::safeEject() {
 void SyncEngine::releaseForEjection() {
     refresh();
     if (repo_) repo_->tree.flushDirectory();
+    drain();
+    if (!view_.job.source.empty()) {
+        try {
+            if (inspect(view_.job.source).id == view_.job.volume) {
+                sourceWatch_.reset();
+                sourceGap_ = true;
+                index_->put("meta", "sourceFull", true);
+            }
+        } catch (...) {}
+    }
     targetWatch_.reset();
-    sourceWatch_.reset();
-    sourceGap_ = true;
     repo_.reset();
     mappedVolume_.reset();
     view_.volume.reset();
@@ -1139,6 +1162,20 @@ SyncProgress SyncEngine::run(bool verify) {
         if (cursor) index_->put("meta", "usn", Json{{"journal", cursor->journal}, {"next", cursor->next}});
         if (issues == 0 && (verify || index_->get("meta", "lastVerify").is_null())) index_->put("meta", "lastVerify", now().seconds);
     });
+    if (issues == 0) {
+        p.message = "正在保存备份时间点";
+        publish(true);
+        RestorePointStore points(*repo_, fault_);
+        points.capture([&](size_t bytes) { p.targetRead += bytes; meter.record(bytes, 0); },
+            [&](size_t bytes) { p.historyWritten += bytes; meter.record(0, bytes); publish(); },
+            [&] { if (paused_.load()) throw Paused(); });
+        const auto lastPointPrune = index_->get("meta", "points.lastPrune");
+        if (lastPointPrune.is_null() || now().seconds - integer(lastPointPrune) >= 86400) {
+            points.prune();
+            index_->put("meta", "points.lastPrune", now().seconds);
+        }
+        index_->put("meta", "restorePoints", points.list());
+    }
     const auto previousPrune = index_->get("meta", "lastPrune");
     if (previousPrune.is_null() || now().seconds - integer(previousPrune) > 86400) {
         repo_->prune(now());
@@ -1184,7 +1221,19 @@ Json SyncEngine::history() {
     for (auto& item : records) rows.push_back(std::move(item));
     return rows;
 }
-fs::path SyncEngine::restore(const fs::path& folder, std::string_view version) {
+Json SyncEngine::restorePoints() {
+    if (!repo_) {
+        auto cached = index_ ? index_->get("meta", "restorePoints") : Json();
+        auto values = Json::array();
+        if (cached.is_array()) for (const auto& point : cached)
+            if (values.empty() || decodeTime(point.at("date")).seconds >= now().seconds - 30 * 86400) values.push_back(point);
+        return values;
+    }
+    auto points = RestorePointStore(*repo_).list();
+    index_->put("meta", "restorePoints", points);
+    return points;
+}
+fs::path SyncEngine::restore(const fs::path& folder, std::string_view version, std::string_view point) {
     refresh();
     require(repo_ != nullptr, "硬盘未连接");
     Tree output(folder);
@@ -1196,7 +1245,9 @@ fs::path SyncEngine::restore(const fs::path& folder, std::string_view version) {
     output.mkdir(temporary);
     int64_t skipped = 0;
     try {
-        if (!version.empty()) {
+        if (!point.empty()) {
+            RestorePointStore(*repo_).restore(point, output, temporary);
+        } else if (!version.empty()) {
             const auto saved = index_->get("archive", identifier(std::string(version)));
             require(!saved.is_null(), "此历史版本已过期");
             auto filename = name(saved.at("item").at("path").get<std::string>());

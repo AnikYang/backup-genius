@@ -62,6 +62,8 @@ public final class SyncEngine: @unchecked Sendable {
     private let interruption: (@Sendable (InterruptionPoint) throws -> Void)?
     private let prepareEjection: @Sendable (URL) throws -> DiskEjectAction
     private var started = false
+    private var observationsClosed = false
+    private var eventDrainPending = false
     private var job: BackupJob?
     private var catalog: Catalog?
     private var repository: Repository?
@@ -150,7 +152,7 @@ public final class SyncEngine: @unchecked Sendable {
         publishedLock.withLock {
             guard force || now - lastPublished >= 0.2 else { return }
             var current = progress
-            if current.state == .syncing, subscribers.latest.progress.state == .syncing {
+            if (current.state == .syncing || current.state == .savingPoint), subscribers.latest.progress.state == current.state {
                 current.writeBytesPerSecond = subscribers.latest.progress.writeBytesPerSecond
                 current.estimatedSecondsRemaining = subscribers.latest.progress.estimatedSecondsRemaining
             }
@@ -175,7 +177,7 @@ public final class SyncEngine: @unchecked Sendable {
             let now = ProcessInfo.processInfo.systemUptime
             let old = subscribers.latest
             var current = old.progress
-            guard current.state == .syncing, now - lastPublished >= 0.2,
+            guard (current.state == .syncing || current.state == .savingPoint), now - lastPublished >= 0.2,
                   meter.sample(at: now, progress: &current) else { return }
             lastPublished = now
             subscribers.latest = BackupPresentation(job: old.job, volume: old.volume, progress: current,
@@ -194,6 +196,7 @@ public final class SyncEngine: @unchecked Sendable {
                     try engine.refresh()
                     engine.schedule(force: true)
                 }
+                engine.publish()
             } catch {
                 engine.fail(error)
                 throw error
@@ -214,6 +217,7 @@ public final class SyncEngine: @unchecked Sendable {
             try setJob(loaded)
         }
         started = true
+        maintainSourceObservation()
     }
 
     static func hostID(at url: URL) throws -> UUID {
@@ -339,6 +343,7 @@ public final class SyncEngine: @unchecked Sendable {
         self.sourceScope = sourceAccess
         self.targetScope = targetAccess
         storageScope = storageAccess
+        maintainSourceObservation()
         try JSONEncoder().encode(job).write(to: configURL, options: .atomic)
         setPaused(false)
         suppressConnection = false
@@ -633,8 +638,6 @@ public final class SyncEngine: @unchecked Sendable {
             stopMaintenance()
             repository = nil
             targetMonitor = nil
-            sourceMonitor = nil
-            sourceScope = nil
             targetScope = nil
             storageScope = nil
             mappedVolume = nil
@@ -669,8 +672,6 @@ public final class SyncEngine: @unchecked Sendable {
         targetMonitor = nil
         guard let (tree, volume) = try findTarget(job) else {
             try? persistEvents(flush: false)
-            sourceMonitor = nil
-            sourceScope = nil
             targetScope = nil
             storageScope = nil
             if progress.state != .ejected {
@@ -680,7 +681,7 @@ public final class SyncEngine: @unchecked Sendable {
             }
             return false
         }
-        if !job.restoreOnly, let source = try? sourceTree(job) { try startSourceMonitor(source, catalog: catalog) }
+        maintainSourceObservation()
         let disk = job.setID == nil ? try storageDisk(job, tree: tree, volume: volume) : nil
         let located = job.setID == nil ? try Repository.locatedTree(tree, volume: volume, disk: disk) : tree
         let next = try Repository(tree: located, volume: volume, job: job, catalog: catalog, host: host, interruption: interruption)
@@ -756,6 +757,22 @@ public final class SyncEngine: @unchecked Sendable {
         }
     }
 
+    private func maintainSourceObservation() {
+        guard monitor, !observationsClosed, let job, !job.restoreOnly, let catalog else { return }
+        do {
+            let source = try sourceTree(job)
+            try startSourceMonitor(source, catalog: catalog)
+            progress.sourceObservation = sourceMonitor == nil ? "需要核对变化" : "正在记录文件变化"
+            let pending = try catalog.pending("source")
+            progress.pendingSourcePaths = pending.paths.count
+            progress.sourceNeedsScan = pending.fullScan || streamFailure
+        } catch {
+            streamFailure = true
+            progress.sourceObservation = "源文件夹暂不可用，连接后重新核对"
+            try? catalog.recordChanges(Changes(fullScan: true), side: "source")
+        }
+    }
+
     private func startTargetMonitor(_ target: Tree) {
         guard monitor else { return }
         do {
@@ -768,7 +785,19 @@ public final class SyncEngine: @unchecked Sendable {
     }
 
     private func receivedEvents() {
-        queue.async { [weak self] in self?.schedule(force: false) }
+        queue.async { [weak self] in
+            guard let self, !self.observationsClosed, !self.eventDrainPending else { return }
+            self.eventDrainPending = true
+            self.queue.asyncAfter(deadline: .now() + .milliseconds(300)) { [weak self] in
+                guard let self else { return }
+                self.eventDrainPending = false
+                guard !self.observationsClosed else { return }
+                do {
+                    let changed = try self.persistEvents(flush: false)
+                    if changed { self.publish(force: false); self.schedule(force: true) }
+                } catch { self.fail(error) }
+            }
+        }
     }
 
     private func schedule(force: Bool, delay: DispatchTimeInterval = .milliseconds(300)) {
@@ -783,8 +812,9 @@ public final class SyncEngine: @unchecked Sendable {
         let force = forceAutomatic
         forceAutomatic = false
         do {
+            maintainSourceObservation()
             let changed = try persistEvents(flush: false)
-            if changed { automaticRetries = 0 }
+            if changed { automaticRetries = 0; publish(force: false) }
             guard let job, job.automatic, !job.restoreOnly, !isPaused, let repository, changed || force,
                   try !requiresTakeover(repository, job: job) else { return }
             if let automaticHandler {
@@ -824,6 +854,9 @@ public final class SyncEngine: @unchecked Sendable {
                 sourceMonitor = nil
             }
         }
+        let pending = try catalog.pending("source")
+        progress.pendingSourcePaths = pending.paths.count
+        progress.sourceNeedsScan = pending.fullScan || streamFailure
         return changed
     }
 
@@ -942,11 +975,16 @@ public final class SyncEngine: @unchecked Sendable {
                 if try repository.needsRecovery() { try repository.open() }
                 try repository.tree.checkRoot()
                 try repository.tree.root.flush(directory: true)
+                if let job = engine.job, let source = try? engine.sourceTree(job), source.device == repository.tree.device {
+                    engine.sourceMonitor = nil
+                    engine.sourceScope = nil
+                    engine.streamFailure = true
+                    engine.progress.sourceObservation = "源文件夹也位于此硬盘，重连后继续记录"
+                }
             }
             engine.repository = nil
             engine.stopMaintenance()
             engine.targetMonitor = nil
-            engine.sourceMonitor = nil
             engine.targetScope = nil
             engine.storageScope = nil
             engine.mappedVolume = nil
@@ -1031,8 +1069,10 @@ public final class SyncEngine: @unchecked Sendable {
         let eject = try? await perform { $0.ejectionTask }
         await eject?.value
         _ = try? await perform { engine in
+            engine.observationsClosed = true
             engine.scheduled?.cancel()
             engine.stopMaintenance()
+            try engine.persistEvents(flush: true)
             engine.sourceMonitor = nil
             engine.targetMonitor = nil
             engine.repository = nil
@@ -1045,6 +1085,22 @@ public final class SyncEngine: @unchecked Sendable {
     public func activity() async throws -> [Activity] { try await perform { try $0.catalog?.activities() ?? [] } }
     public func history() async throws -> [HistoryItem] { try await perform { try $0.catalog?.versions().map(\.item) ?? [] } }
     public func backupRuns() async throws -> [BackupRun] { try await perform { try $0.catalog?.backupRuns() ?? [] } }
+
+    public func restorePoints() async throws -> [RestorePoint] {
+        try await perform { engine in
+            guard let repo = engine.repository else {
+                guard let job = engine.job,
+                      let data = try? Data(contentsOf: engine.storage.appending(path: "\(job.id.uuidString)-points.json")) else { return [] }
+                let values = try JSONDecoder().decode([RestorePoint].self, from: data)
+                return values.filter { $0.date >= Date.now.addingTimeInterval(-30 * 86400) || $0.id == values.first?.id }
+            }
+            let points = try RestorePointStore(repo).list()
+            if let job = engine.job {
+                try JSONEncoder().encode(points).write(to: engine.storage.appending(path: "\(job.id.uuidString)-points.json"), options: .atomic)
+            }
+            return points
+        }
+    }
 
     public func backupChanges(in run: UUID, kind: Activity.Kind? = nil, query: String = "",
                               limit: Int = 200, offset: Int = 0) async throws -> BackupRunChangePage {
@@ -1263,6 +1319,7 @@ public final class SyncEngine: @unchecked Sendable {
         progress = SyncProgress(state: verify ? .verifying : .checking, trackedFiles: oldCount,
                                 unmanaged: progress.unmanaged, lastSuccess: lastSuccess)
         progress.lastRunID = previousRun
+        progress.sourceObservation = sourceMonitor == nil ? "需要核对变化" : "正在记录文件变化"
         progress.ioBufferBudget = profile.bufferBudget
         unstableThisRun = false
         publish()
@@ -1319,16 +1376,37 @@ public final class SyncEngine: @unchecked Sendable {
         try catalog.putActivity(Array(issues.prefix(500)))
         let success = problems.isEmpty
         try catalog.finishScan(sourceRetry: problems.mapValues { _ in flagModified | flagSubtree },
-                               targetRetry: targetRetry, verified: success && (verify || initial), date: success ? now : nil)
+                               targetRetry: targetRetry, verified: success && (verify || initial), date: nil)
         if needsInstallerCleanup { try catalog.set("source.installerExclusion", "1") }
         if verify && success {
             try catalog.putActivity([Activity(date: now, kind: .verified, path: "备份文件", detail: "完整校验完成", bytes: 0)])
+        }
+        if success {
+            progress.state = .savingPoint
+            if transferTimer == nil { startTransferProgress(meter) }
+            progress.message = "正在保存备份时间点"
+            publish()
+            let points = try RestorePointStore(repository, fault: interruption)
+            do {
+                try points.capture(catalog: catalog, shouldStop: { self.isPaused },
+                                   onRead: { progress.targetReadBytes += Int64($0); meter.record(read: $0) },
+                                   onWrite: { progress.historyWrittenBytes += Int64($0); meter.record(written: $0); publish(force: false) })
+            } catch BackupError.unstable(let path) {
+                try catalog.recordChanges(Changes(paths: [path: flagModified]), side: "target")
+                throw BackupError.unstable(path)
+            }
+            if now.timeIntervalSince(try date("points.lastPrune", catalog: catalog) ?? .distantPast) >= 86400 {
+                try points.prune()
+                try catalog.set("points.lastPrune", String(now.timeIntervalSinceReferenceDate))
+            }
+            try JSONEncoder().encode(points.list()).write(to: storage.appending(path: "\(job.id.uuidString)-points.json"), options: .atomic)
         }
         try pruneIfDue(repository)
         repository.refreshCapacity()
         let autoEject = automaticHandler == nil && job.ejectAfterBackup == true && success
         let newerChanges = try persistEvents(flush: autoEject)
         progress.trackedFiles = try catalog.fileCount()
+        if success { try catalog.set("lastSuccess", String(now.timeIntervalSinceReferenceDate)) }
         try catalog.finishRun(run.id, outcome: success ? .completed : .needsAttention, at: .now, issues: problems.count)
         finishedRun = true
         progress.lastRunID = run.id
@@ -1462,10 +1540,11 @@ public final class SyncEngine: @unchecked Sendable {
             try engine.refresh()
             guard let repo = engine.repository else { throw BackupError.disconnected }
             try repo.prune(now: now, onWrite: { _ in })
+            if try repo.tree.entry("\(controlName)/points") != nil { try RestorePointStore(repo, fault: engine.interruption).prune(now: now) }
         }
     }
 
-    public func restore(_ version: UUID? = nil, to folder: URL) async throws -> URL {
+    public func restore(_ version: UUID? = nil, point: UUID? = nil, to folder: URL) async throws -> URL {
         try await perform { engine in
             try engine.refresh()
             guard let repo = engine.repository, let catalog = engine.catalog else { throw BackupError.disconnected }
@@ -1480,7 +1559,9 @@ public final class SyncEngine: @unchecked Sendable {
                 let staging = ".backup-genius-restore-\(UUID().uuidString)"
                 try output.mkdir(staging)
                 defer { try? output.removeOwnedTree(staging) }
-                if let version {
+                if let point {
+                    try RestorePointStore(repo).restore(point, to: output, at: staging)
+                } else if let version {
                     guard let archive = try catalog.version(version) else { throw BackupError.message("此历史版本已过期") }
                     let path = pathJoin(staging, pathName(archive.item.path))
                     try repo.materialize(archive, on: output, at: path, rich: true)

@@ -51,12 +51,12 @@ public struct BackupJob: Codable, Sendable, Identifiable {
 }
 
 public enum SyncState: String, Codable, Sendable {
-    case unconfigured, disconnected, ready, checking, syncing, recovering, verifying
+    case unconfigured, disconnected, ready, checking, syncing, recovering, verifying, savingPoint
     case upToDate, paused, needsAttention, takeoverRequired, ejecting, ejected
 
     public var busy: Bool {
         switch self {
-        case .checking, .syncing, .recovering, .verifying, .ejecting: true
+        case .checking, .syncing, .recovering, .verifying, .savingPoint, .ejecting: true
         default: false
         }
     }
@@ -74,6 +74,9 @@ public struct SyncProgress: Codable, Sendable {
     public var targetReadBytes: Int64 = 0
     public var latestWrittenBytes: Int64 = 0
     public var historyWrittenBytes: Int64 = 0
+    public var pendingSourcePaths: Int = 0
+    public var sourceNeedsScan: Bool = false
+    public var sourceObservation: String? = nil
     public var sourceReadRequests = 0
     public var targetReadRequests = 0
     public var latestWriteRequests = 0

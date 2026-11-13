@@ -81,6 +81,12 @@ struct InteropTests {
         expected[0] = 77
         expected[blockSize] = 87
         #expect(try Data(contentsOf: target.appending(path: "payload.bin")) == expected)
+        let points = try await engine.restorePoints()
+        #expect(points.count >= 3)
+        let latestPoint = try #require(points.first)
+        let complete = try await engine.restore(point: latestPoint.id, to: output)
+        #expect(try Data(contentsOf: complete.appending(path: "payload.bin")) == expected)
+        #expect(fm.fileExists(atPath: complete.appending(path: "windows.txt").path))
         let archive = try #require(try await engine.history().first { $0.path == "payload.bin" })
         let restored = try await engine.restore(archive.id, to: output)
         #expect(try Data(contentsOf: restored.appending(path: "payload.bin"))[blockSize] == 65)

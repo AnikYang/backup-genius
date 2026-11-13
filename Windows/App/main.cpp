@@ -1,3 +1,4 @@
+#include "../Core/DiskDiagnostics.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -67,7 +68,7 @@ std::wstring backupTiming(const bg::SyncProgress& progress) {
     if (progress.processed >= progress.planned) return text + L"正在收尾";
     if (!progress.estimatedSecondsRemaining) return text + L"剩余时间估算中";
     const auto seconds = static_cast<int64_t>(std::clamp(*progress.estimatedSecondsRemaining + 1, 1.0, 31536000.0));
-    text += L"本文件夹约剩 ";
+    text += L"当前同步阶段约剩 ";
     if (seconds >= 3600) return text + std::to_wstring(seconds / 3600) + L" 小时 " + std::to_wstring(seconds / 60 % 60) + L" 分钟";
     if (seconds >= 60) return text + std::to_wstring(seconds / 60) + L" 分钟 " + std::to_wstring(seconds % 60) + L" 秒";
     return text + std::to_wstring(seconds) + L" 秒";
@@ -396,7 +397,7 @@ private:
         nav.IsSettingsVisible(false);
         nav.IsBackButtonVisible(NavigationViewBackButtonVisible::Collapsed);
         for (const auto& [name, icon] : std::vector<std::pair<const wchar_t*, Symbol>>{
-            {L"备份", Symbol::Save}, {L"活动记录", Symbol::List}, {L"历史版本", Symbol::Clock}}) {
+            {L"备份", Symbol::Save}, {L"活动记录", Symbol::List}, {L"历史版本", Symbol::Clock}, {L"时间点", Symbol::Calendar}, {L"硬盘检测", Symbol::Repair}}) {
             NavigationViewItem item;
             item.Content(box_value(hstring(name)));
             item.Icon(SymbolIcon(icon));
@@ -469,17 +470,22 @@ private:
         page.Children().Append(content_);
         makeOverview();
         makeRecords();
+        makeDiagnostics();
         nav.SelectedItem(nav.MenuItems().GetAt(0));
         nav.SelectionChanged([this](NavigationView const&, NavigationViewSelectionChangedEventArgs const& args) {
             if (auto item = args.SelectedItem().try_as<NavigationViewItem>()) {
                 auto name = unbox_value<hstring>(item.Content());
-                page_ = name == L"活动记录" ? 1 : name == L"历史版本" ? 2 : 0;
+                page_ = name == L"活动记录" ? 1 : name == L"历史版本" ? 2 : name == L"时间点" ? 3 : name == L"硬盘检测" ? 4 : 0;
                 overview_.Visibility(page_ == 0 ? Visibility::Visible : Visibility::Collapsed);
-                records_.Visibility(page_ == 0 ? Visibility::Collapsed : Visibility::Visible);
-                recordTitle_.Text(page_ == 2 ? L"历史版本" : L"活动记录");
-                restoreSelected_.Visibility(page_ == 2 ? Visibility::Visible : Visibility::Collapsed);
+                records_.Visibility(page_ == 0 || page_ == 4 ? Visibility::Collapsed : Visibility::Visible);
+                diagnostics_.Visibility(page_ == 4 ? Visibility::Visible : Visibility::Collapsed);
+                recordTitle_.Text(page_ == 3 ? L"完整备份时间点" : page_ == 2 ? L"历史版本" : L"活动记录");
+                search_.Visibility(page_ == 3 ? Visibility::Collapsed : Visibility::Visible);
+                changeKind_.Visibility(page_ == 3 ? Visibility::Collapsed : Visibility::Visible);
+                restoreSelected_.Content(box_value(hstring(page_ == 3 ? L"恢复此时间点…" : L"恢复所选版本…")));
+                restoreSelected_.Visibility(page_ == 2 || page_ == 3 ? Visibility::Visible : Visibility::Collapsed);
                 restoreCurrent_.Visibility(page_ == 2 ? Visibility::Visible : Visibility::Collapsed);
-                if (page_) loadRows();
+                if (page_ > 0 && page_ < 4) loadRows();
             }
         });
     }
@@ -574,6 +580,60 @@ private:
         });
         content.Children().Append(login);
     }
+    void makeDiagnostics() {
+        diagnostics_ = ScrollViewer();
+        diagnostics_.Visibility(Visibility::Collapsed);
+        StackPanel body;
+        body.Margin({24, 20, 24, 24}); body.Spacing(16);
+        body.Children().Append(label(L"硬盘检测", 28));
+        body.Children().Append(label(L"读取设备健康报告，或使用 64 MiB 临时文件测量顺序读写和随机读取延迟。短测受缓存影响，不代表持续写入速度。结束后自动删除临时文件。"));
+        healthCheck_ = button(L"读取健康信息", [this] { diagnose(false); });
+        speedCheck_ = button(L"开始性能检测", [this] { diagnose(true); });
+        body.Children().Append(healthCheck_);
+        body.Children().Append(speedCheck_);
+        diagnosticText_ = label(L"请选择并连接已登记的备份硬盘。USB 硬盘盒可能不传递 S.M.A.R.T. 信息。未知状态不会当作健康。SMR / CMR 无法确认时需按型号查询厂商规格。");
+        body.Children().Append(diagnosticText_);
+        diagnostics_.Content(body);
+        content_.Children().Append(diagnostics_);
+    }
+    void diagnose(bool speed) {
+        if (view_.busy || busy(view_.progress.state) || diagnosing_ || !view_.selectedDiskConnected || view_.job.id.empty()) return;
+        const auto job = view_.job;
+        diagnosing_ = true;
+        const auto current = view_;
+        render(current);
+        diagnosticText_.Text(L"正在检测，请保持硬盘连接…");
+        worker_->submit([this, job, speed](auto&) {
+          try {
+            const auto volume = bg::findMountedVolume(job.volume);
+            if (!volume) throw std::runtime_error("请连接已登记的备份硬盘");
+            const auto target = volume->mount / bg::path(job.relative);
+            auto report = bg::diskHealth(target);
+            auto measurement = speed ? bg::diskSpeed(target) : bg::Json();
+            dispatcher_.TryEnqueue([this, id = job.id, report = std::move(report), measurement = std::move(measurement)] {
+                diagnosing_ = false;
+                const auto current = view_;
+                render(current);
+                if (view_.job.id != id) return;
+                auto text = wide(report.at("model").get<std::string>()) + L" · " + wide(report.at("medium").get<std::string>()) + L"\n\n" +
+                    wide(report.at("health").get<std::string>()) + L"\n" + wide(report.at("recording").get<std::string>());
+                if (report.contains("percentageUsed")) text += L"\n厂家估算寿命已使用 " + std::to_wstring(report.at("percentageUsed").get<int>()) + L"%";
+                if (report.contains("temperature")) text += L"\n温度 " + std::to_wstring(report.at("temperature").get<int>()) + L" °C";
+                if (!measurement.is_null()) text += L"\n\n顺序读取 " + quantity(static_cast<int64_t>(measurement.at("read").get<double>())) + L"/s\n顺序写入 " +
+                    quantity(static_cast<int64_t>(measurement.at("write").get<double>())) + L"/s\n随机读取延迟 " + std::to_wstring(measurement.at("latency").get<double>()) + L" ms";
+                diagnosticText_.Text(text);
+            });
+          } catch (const std::exception& e) {
+            dispatcher_.TryEnqueue([this, id = job.id, message = std::string(e.what())] {
+                diagnosing_ = false;
+                const auto current = view_;
+                render(current);
+                if (view_.job.id == id) diagnosticText_.Text(L"检测未完成：" + wide(message));
+                error(wide(message));
+            });
+          }
+        });
+    }
     void makeRecords() {
         records_ = Grid();
         records_.Margin({30, 20, 30, 24});
@@ -626,6 +686,8 @@ private:
         const auto previousJob = view_.job.id;
         auto previousPrompts = std::move(view_.backupPrompts);
         view_ = presentation;
+        if (previousJob != view_.job.id)
+            diagnosticText_.Text(L"连接当前所选的备份硬盘后，可读取健康信息或进行性能检测。");
         if (previousPrompts != view_.backupPrompts) {
             backupPrompts_.Children().Clear();
             for (const auto& prompt : view_.backupPrompts) {
@@ -646,7 +708,7 @@ private:
             }
         }
         const auto& p = view_.progress;
-        const bool active = view_.busy || busy(p.state);
+        const bool active = view_.busy || busy(p.state) || diagnosing_;
         const bool configured = !view_.job.id.empty();
         const bool connected = view_.volume.has_value();
         using S = bg::SyncState;
@@ -666,14 +728,19 @@ private:
         else if (text.empty() && p.state == S::upToDate) text = L"最新备份可用。";
         if (p.unmanaged) text += L"  硬盘有 " + std::to_wstring(p.unmanaged) + L" 个未管理项目。";
         if (!view_.runningFolder.empty()) text = wide(view_.runningFolder) + L"  " + text;
+        if (!view_.job.restoreOnly && configured && !active)
+            text += L"\n后台记录：" + std::to_wstring(p.pendingSourcePaths) + L" 个待核对路径" +
+                (p.sourceNeedsScan ? L"，需要补充核对" : L"，硬盘断开时继续记录");
         detail_.Text(text);
         statusProgress_.Visibility(active ? Visibility::Visible : Visibility::Collapsed);
-        const bool determinate = p.state == S::syncing && p.planned > 0;
+        const bool savingPoint = p.message == "正在保存备份时间点";
+        const bool determinate = p.state == S::syncing && p.planned > 0 && !savingPoint;
         statusProgress_.IsIndeterminate(active && !determinate);
         if (determinate) statusProgress_.Value(100.0 * p.processed / p.planned);
         const bool estimating = p.state == S::checking || p.state == S::verifying;
-        timing_.Visibility(determinate || estimating ? Visibility::Visible : Visibility::Collapsed);
-        if (determinate) timing_.Text(hstring(backupTiming(p)));
+        timing_.Visibility(determinate || estimating || savingPoint ? Visibility::Visible : Visibility::Collapsed);
+        if (savingPoint) timing_.Text(L"归档写入 " + (p.writeBytesPerSecond ? quantity(static_cast<int64_t>(*p.writeBytesPerSecond)) + L"/s" : L"测量中") + L" · 剩余时间估算中");
+        else if (determinate) timing_.Text(hstring(backupTiming(p)));
         else if (estimating) timing_.Text(L"剩余时间估算中");
         route_.Text(configured ? (view_.job.restoreOnly ? L"已有备份" : view_.job.source.wstring()) + L"\n↓\n" + view_.job.target.wstring() : L"");
         metrics_.Text(configured ? L"已管理 " + std::to_wstring(p.tracked) + L" 项  ·  最新副本写入 " +
@@ -706,6 +773,8 @@ private:
         explorer_.Visibility(connected ? Visibility::Visible : Visibility::Collapsed);
         restoreCurrent_.IsEnabled((connected || view_.selectedDiskConnected) && !active);
         restoreSelected_.IsEnabled((connected || view_.selectedDiskConnected) && !active && list_.SelectedIndex() >= 0);
+        healthCheck_.IsEnabled(configured && view_.selectedDiskConnected && !active);
+        speedCheck_.IsEnabled(healthCheck_.IsEnabled());
         automatic_.Visibility(configured && !view_.job.restoreOnly ? Visibility::Visible : Visibility::Collapsed);
         rendering_ = true;
         askOnConnect_.IsOn(view_.askOnConnect);
@@ -754,14 +823,14 @@ private:
         rendering_ = false;
         auto tray = trayData();
         if (trayReady_) Shell_NotifyIconW(NIM_MODIFY, &tray);
-        if (page_ && (previousJob != view_.job.id || previous != p.state) && !active) loadRows();
+        if (page_ > 0 && page_ < 4 && (previousJob != view_.job.id || previous != p.state) && !active) loadRows();
     }
     void loadRows() {
         if (!worker_) return;
         const auto page = page_;
         const auto job = view_.job.id;
         worker_->submit([this, page, job](auto& engine) {
-            auto rows = page == 2 ? engine.history() : engine.activities();
+            auto rows = page == 3 ? engine.restorePoints() : page == 2 ? engine.history() : engine.activities();
             dispatcher_.TryEnqueue([this, page, job, rows = std::move(rows)] {
                 if (page_ != page || view_.job.id != job) return;
                 rows_ = rows;
@@ -775,6 +844,11 @@ private:
         std::vector<IInspectable> items;
         auto query = bg::folded(to_string(search_.Text()));
         for (const auto& row : rows_) {
+            if (page_ == 3) {
+                visibleIDs_.push_back(row.at("id").get<std::string>());
+                items.push_back(box_value(hstring(timestamp(row.at("date")) + L"   " + std::to_wstring(row.value("files", int64_t{})) + L" 个文件")));
+                continue;
+            }
             auto path = row.value("path", "");
             if (!query.empty() && bg::folded(path).find(query) == std::string::npos) continue;
             const auto rawKind = row.value(page_ == 2 ? "reason" : "kind", "");
@@ -1026,8 +1100,9 @@ private:
         try {
             auto folder = selectFolder(hwnd_, L"选择恢复位置");
             if (folder.empty()) return;
-            worker_->submit([this, folder, version = std::move(version)](auto& engine) {
-                auto result = engine.restore(folder, version);
+            const bool point = page_ == 3;
+            worker_->submit([this, folder, version = std::move(version), point](auto& engine) {
+                auto result = point ? engine.restore(folder, {}, version) : engine.restore(folder, version);
                 dispatcher_.TryEnqueue([this, result = std::move(result)] { explore(result); });
             });
         } catch (const hresult_error& e) { error(e.message()); }
@@ -1086,8 +1161,11 @@ private:
     bg::Presentation view_;
     bg::Json rows_ = bg::Json::array();
     std::vector<std::string> visibleIDs_, folderIDs_, folderLabels_;
+    ScrollViewer diagnostics_{nullptr};
+    TextBlock diagnosticText_{nullptr};
+    Button healthCheck_{nullptr}, speedCheck_{nullptr};
     int page_{};
-    bool trayReady_{}, rendering_{}, dialogOpen_{}, quitting_{}, exiting_{};
+    bool trayReady_{}, rendering_{}, dialogOpen_{}, quitting_{}, exiting_{}, diagnosing_{};
 };
 
 struct Program : ApplicationT<Program> {

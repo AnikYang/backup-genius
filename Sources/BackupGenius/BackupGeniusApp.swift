@@ -77,7 +77,7 @@ enum SetupMode: String, Identifiable {
 }
 
 enum Page: String, CaseIterable, Identifiable {
-    case overview, activity, history
+    case overview, activity, history, disk
     var id: Self { self }
 
     var title: String {
@@ -85,6 +85,7 @@ enum Page: String, CaseIterable, Identifiable {
         case .overview: "备份"
         case .activity: "活动记录"
         case .history: "备份历史"
+        case .disk: "硬盘检测"
         }
     }
 
@@ -93,6 +94,7 @@ enum Page: String, CaseIterable, Identifiable {
         case .overview: "externaldrive"
         case .activity: "list.bullet.rectangle"
         case .history: "clock.arrow.circlepath"
+        case .disk: "externaldrive.badge.checkmark"
         }
     }
 }
@@ -119,6 +121,10 @@ final class AppModel {
     var activities: [Activity] = []
     var versions: [HistoryItem] = []
     var backupRuns: [BackupRun] = []
+    var restorePoints: [RestorePoint] = []
+    var healthReport: DiskHealthReport?
+    var speedReport: DiskSpeedReport?
+    var diagnosing = false
     var setup: SetupMode?
     var page: Page = .overview
     var error: String?
@@ -197,7 +203,7 @@ final class AppModel {
         progress = snapshot.progress
         organizedStorage = snapshot.organizedStorage
         sourceDevice = snapshot.sourceDevice
-        if changed { activities = []; versions = []; backupRuns = [] }
+        if changed { activities = []; versions = []; backupRuns = []; restorePoints = []; healthReport = nil; speedReport = nil }
         if shouldLoad { loadRecords() }
     }
 
@@ -276,7 +282,7 @@ final class AppModel {
     }
 
     func loadRecords() {
-        guard page != .overview else { return }
+        guard page == .activity || page == .history else { return }
         loadRecordsTask?.cancel()
         let page = page
         let engine = engine
@@ -288,16 +294,18 @@ final class AppModel {
                 } else {
                     let runs = try await engine.backupRuns()
                     let values = try await engine.history()
+                    let points = try await engine.restorePoints()
                     if !Task.isCancelled {
                         backupRuns = runs
                         versions = values
+                        restorePoints = points
                     }
                 }
             } catch { self.error = error.localizedDescription }
         }
     }
 
-    func restore(_ id: UUID?) {
+    func restore(_ id: UUID?, point: UUID? = nil) {
         guard canRestore, let job = job?.id else { return }
         Task {
             guard let folder = await chooseFolder(title: "选择恢复位置", prompt: "恢复到此处", canCreate: true),
@@ -305,7 +313,7 @@ final class AppModel {
             restoring = true
             defer { restoring = false }
             do {
-                let result = try await coordinator.restore(job, version: id, to: folder)
+                let result = try await coordinator.restore(job, version: id, point: point, to: folder)
                 NSWorkspace.shared.activateFileViewerSelecting([result])
             } catch {
                 self.error = error.localizedDescription
@@ -356,6 +364,20 @@ final class AppModel {
         Task {
             do { try await coordinator.setEnabled(enabled, job: id) }
             catch { self.error = error.localizedDescription }
+        }
+    }
+
+    func diagnose(speed: Bool) {
+        guard let id = job?.id, !busy, !diagnosing, selectedDiskConnected else { return }
+        diagnosing = true
+        Task {
+            defer { diagnosing = false }
+            do {
+                let (health, measurement) = try await coordinator.diagnose(id, speed: speed)
+                guard self.job?.id == id else { return }
+                healthReport = health
+                if let measurement { speedReport = measurement }
+            } catch { self.error = error.localizedDescription }
         }
     }
 

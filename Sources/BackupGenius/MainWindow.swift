@@ -11,6 +11,7 @@ extension SyncState {
         case .checking: "正在检查变化"
         case .syncing: "正在同步"
         case .recovering: "正在恢复中断的同步"
+        case .savingPoint: "正在保存备份时间点"
         case .verifying: "正在校验备份"
         case .upToDate: "已同步"
         case .paused: "备份已暂停"
@@ -27,7 +28,7 @@ extension SyncState {
         case .disconnected: "externaldrive.badge.minus"
         case .unconfigured, .ready: "externaldrive"
         case .checking, .verifying: "magnifyingglass"
-        case .syncing, .recovering: "arrow.triangle.2.circlepath"
+        case .syncing, .recovering, .savingPoint: "arrow.triangle.2.circlepath"
         case .paused: "pause.circle"
         case .needsAttention: "exclamationmark.triangle"
         case .takeoverRequired: "arrow.left.arrow.right.circle"
@@ -86,7 +87,7 @@ func backupTiming(_ progress: SyncProgress) -> String {
     formatter.allowedUnits = seconds >= 3600 ? [.hour, .minute] : (seconds >= 60 ? [.minute, .second] : [.second])
     formatter.maximumUnitCount = 2
     let duration = formatter.string(from: max(1, min(seconds.rounded(.up), 365 * 86400))) ?? "估算中"
-    return "写入速度 \(rate) · 本文件夹约剩 \(duration)"
+    return "写入速度 \(rate) · 当前同步阶段约剩 \(duration)"
 }
 
 struct MainWindow: View {
@@ -113,6 +114,7 @@ struct MainWindow: View {
                 case .overview: Overview(model: model)
                 case .activity: ActivityScreen(model: model)
                 case .history: HistoryScreen(model: model)
+                case .disk: DiskDiagnosticsScreen(model: model)
                 }
             }
             .safeAreaInset(edge: .top, spacing: 0) {
@@ -256,16 +258,21 @@ struct Overview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     status
-                    ForEach(model.backupPrompts) { prompt in
-                        HStack {
-                            Label("「\(prompt.volumeName)」已连接，备份 \(prompt.folderCount) 个文件夹？", systemImage: "externaldrive")
-                            Spacer()
-                            Button("稍后") { model.respondToBackupPrompt(prompt.id, backup: false) }
-                            Button("立即备份") { model.respondToBackupPrompt(prompt.id, backup: true) }
-                                .buttonStyle(.borderedProminent)
+                    ForEach(model.backupPrompts.filter { $0.volumeID.caseInsensitiveCompare(job.volumeID) == .orderedSame }) { prompt in
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label("「\(prompt.volumeName)」已连接", systemImage: "externaldrive")
+                                .font(.headline)
+                            HStack {
+                                Text("可备份 \(prompt.folderCount) 个文件夹").foregroundStyle(.secondary)
+                                Spacer(minLength: 8)
+                                Button("稍后") { model.respondToBackupPrompt(prompt.id, backup: false) }
+                                Button("立即备份") { model.respondToBackupPrompt(prompt.id, backup: true) }
+                                    .buttonStyle(.borderedProminent)
+                            }
                         }
-                        .padding(12)
-                        .background(.background.secondary, in: .rect(cornerRadius: 10))
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.background.secondary, in: .rect(cornerRadius: 12))
                     }
                     if job.setID != nil {
                         ForEach(model.folders.filter { $0.job.setID == job.setID }) { folder in
@@ -284,8 +291,22 @@ struct Overview: View {
                     if model.progress.state == .takeoverRequired || (job.restoreOnly && job.format == .exfat && model.volume != nil) {
                         Button("预览接管…") { model.setup = .takeover }.buttonStyle(.borderedProminent)
                     }
+                    if !job.restoreOnly {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label(model.progress.sourceObservation ?? "准备记录文件变化", systemImage: "waveform.path")
+                            Text(model.displayedProgress.state.busy ? "同步期间的新变化会继续记录，留待下一轮处理。" :
+                                 (model.progress.sourceNeedsScan ? "事件记录需要补充核对；连接后自动处理。" :
+                                  "已记录 \(model.progress.pendingSourcePaths.formatted()) 个待核对路径，硬盘断开时继续记录。"))
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
                     route(job)
-                    metrics
+                    if model.displayedProgress.elapsedSeconds > 0 || model.displayedProgress.state.busy {
+                        metrics
+                    } else {
+                        Text("开始备份后显示本次进度与写入量。")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
                     if model.progress.unmanaged > 0 || model.progress.issueCount > 0 {
                         notices
                     }
@@ -300,7 +321,7 @@ struct Overview: View {
                     .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: 850)
-                .padding(30)
+                .padding(22)
                 .frame(maxWidth: .infinity, alignment: .top)
             }
         } else {
@@ -374,6 +395,10 @@ struct Overview: View {
                 }
                 Spacer(minLength: 0)
             }
+            if let running = model.folders.first(where: { $0.id == model.runningFolder }), running.id != model.selectedFolder,
+               running.job.volumeID == model.job?.volumeID {
+                Text("当前正在处理：\(running.title)").font(.callout).foregroundStyle(.secondary)
+            }
             if state.busy || model.ejecting {
                 if let fraction = progress.fraction, !model.ejecting {
                     ProgressView(value: fraction) {
@@ -384,6 +409,12 @@ struct Overview: View {
                     ProgressView()
                         .progressViewStyle(.linear)
                         .accessibilityLabel(state.title)
+                }
+                if state == .savingPoint && model.job?.format == .apfs {
+                    Text("正在保存文件版本与目录信息").font(.callout).foregroundStyle(.secondary)
+                } else if state == .savingPoint {
+                    Text("归档写入 \(progress.writeBytesPerSecond.map { byteCount(Int64($0)) + "/s" } ?? "测量中") · 剩余时间估算中")
+                        .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
                 }
                 if !model.ejecting && (state == .checking || state == .verifying || (state == .syncing && progress.planned > 0)) {
                     Text(state == .syncing ? backupTiming(progress) : "剩余时间估算中")
@@ -396,6 +427,7 @@ struct Overview: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                        .help(path)
                 }
             }
         }
@@ -408,7 +440,10 @@ struct Overview: View {
         if let message = progress.message { return message }
         switch progress.state {
         case .disconnected:
-            if model.selectedDiskConnected { return "可立即备份或校验。" }
+            if model.selectedDiskConnected {
+                return model.backupPrompts.contains { $0.volumeID.caseInsensitiveCompare(model.job?.volumeID ?? "") == .orderedSame }
+                    ? "确认后将处理已记录的文件变化。" : "可立即备份或校验。"
+            }
             return "连接 \(model.job?.volumeName ?? "备份硬盘") 以继续。"
         case .ready:
             return model.job?.restoreOnly == true ? "可浏览历史版本和恢复当前备份。" :
@@ -419,6 +454,7 @@ struct Overview: View {
             return "正在比对文件内容与校验值。"
         case .syncing:
             return "\(max(0, progress.planned - progress.processed).formatted()) 项待处理"
+        case .savingPoint: return "正在保存可独立恢复的文件版本。"
         case .recovering:
             return "正在恢复上次未提交的更新。"
         case .upToDate:
@@ -444,7 +480,7 @@ struct Overview: View {
 
     private func route(_ job: BackupJob) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("备份路径").font(.headline)
+            Text("所选文件夹的备份路径").font(.headline)
             HStack(spacing: 14) {
                 FolderTile(role: "源文件夹", title: job.source.lastPathComponent, path: job.source.path, icon: "folder.fill")
                 Image(systemName: "arrow.right")

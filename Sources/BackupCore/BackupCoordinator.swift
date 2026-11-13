@@ -666,7 +666,7 @@ public actor BackupCoordinator {
         }
     }
 
-    public func restore(_ id: UUID, version: UUID?, to folder: URL) async throws -> URL {
+    public func restore(_ id: UUID, version: UUID?, point: UUID? = nil, to folder: URL) async throws -> URL {
         try beginOperation()
         defer { endOperation() }
         guard let engine = engine(for: id) else { throw BackupError.disconnected }
@@ -674,7 +674,21 @@ public actor BackupCoordinator {
            engine.presentation.volume == nil {
             try await openForRestore(job, engine: engine, at: connection.mount)
         }
-        return try await engine.restore(version, to: folder)
+        return try await engine.restore(version, point: point, to: folder)
+    }
+
+    public func diagnose(_ id: UUID, speed: Bool) async throws -> (DiskHealthReport, DiskSpeedReport?) {
+        try beginOperation()
+        defer { endOperation() }
+        guard let engine = engine(for: id), let job = engine.presentation.job else { throw BackupError.disconnected }
+        if let connection = connections[job.volumeID.uppercased()], engine.presentation.volume == nil {
+            try await openForRestore(job, engine: engine, at: connection.mount)
+        }
+        guard let volume = engine.presentation.volume else { throw BackupError.disconnected }
+        let target = volume.mount.appending(path: engine.presentation.job!.targetRelativePath)
+        let health = try await DiskDiagnostics.health(at: target)
+        let result = speed ? try await DiskDiagnostics.measure(at: target) : nil
+        return (health, result)
     }
 
     private func openForRestore(_ job: BackupJob, engine: SyncEngine, at mount: URL) async throws {

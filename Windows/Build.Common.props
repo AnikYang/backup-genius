@@ -25,6 +25,8 @@
   <ItemGroup>
     <ClCompile Include="$(MSBuildThisFileDirectory)Core\NativeFiles.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)Core\Store.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)Core\RestorePoints.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)Core\DiskDiagnostics.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)Core\Watch.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)Core\Engine.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)Core\BackupSet.cpp" />

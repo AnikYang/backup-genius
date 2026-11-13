@@ -103,5 +103,5 @@ struct Envelope: Codable {
 }
 
 enum InterruptionPoint: Sendable, Equatable {
-    case prepared, firstBlock, applied, committed, pruning
+    case prepared, firstBlock, applied, committed, pruning, pointPrepared, pointCommitted, pointPruning
 }

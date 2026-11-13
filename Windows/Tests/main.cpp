@@ -1,3 +1,5 @@
+#include "../Core/RestorePoints.h"
+#include "../Core/DiskDiagnostics.h"
 #include "../Core/Coordinator.h"
 #include <fstream>
 #include <iostream>
@@ -41,6 +43,61 @@ struct Fixture {
         fs::remove_all(root, error);
     }
 };
+
+void restorePoints(const fs::path& volume) {
+    Fixture f(volume);
+    Tree source(f.source), disk(f.target);
+    bool armed = false, pauseAtPoint = false;
+    SyncEngine* running = nullptr;
+    SyncEngine engine(f.state, [&](const Presentation& value) {
+        if (pauseAtPoint && value.progress.message == "正在保存备份时间点") {
+            pauseAtPoint = false;
+            running->requestPause();
+        }
+    }, true, [&](Interruption point) {
+        if (armed && point == Interruption::pointPrepared) { armed = false; throw std::runtime_error("point interrupted"); }
+    });
+    running = &engine;
+    write(source, "folder/old.txt", "old");
+    write(source, "same.bin", Bytes(2 * blockSize + 17, 'a'));
+    engine.configure(f.source, f.target, false);
+    expect(engine.sync().state == SyncState::upToDate, "point first backup");
+    auto first = engine.restorePoints().at(0).at("id").get<std::string>();
+    source.remove("folder/old.txt");
+    write(source, "new.txt", "new");
+    write(source, "same.bin", Bytes(blockSize + 4, 'b'));
+    engine.recordChanges({{}, true});
+    expect(engine.sync().state == SyncState::upToDate, "point second backup");
+    auto second = engine.restorePoints().at(0).at("id").get<std::string>();
+    write(disk, "same.bin", "external");
+    Tree old(engine.restore(f.restore, {}, first));
+    expect(read(old, "folder/old.txt") == "old" && !old.entry("new.txt"), "point exact historical tree");
+    expect(read(old, "same.bin") == Bytes(2 * blockSize + 17, 'a'), "point survives external overwrite");
+    Tree latest(engine.restore(f.restore, {}, second));
+    expect(read(latest, "new.txt") == "new" && !latest.entry("folder/old.txt"), "point deleted file omitted");
+    write(source, "new.txt", "changed");
+    engine.recordChanges({{}, true}, true);
+    engine.recordChanges({{}, true});
+    armed = true;
+    try { engine.sync(); } catch (...) {}
+    expect(!armed && engine.restorePoints().size() == 2, "unpublished point hidden");
+    expect(engine.sync().state == SyncState::upToDate, "point retry");
+    auto saved = engine.restorePoints().at(0).at("id").get<std::string>();
+    expect(read(Tree(engine.restore(f.restore, {}, saved)), "new.txt") == "changed", "point retry data");
+    write(source, "new.txt", "after pause");
+    engine.recordChanges({{}, true});
+    const auto beforePause = engine.restorePoints().size();
+    pauseAtPoint = true;
+    expect(engine.sync().state == SyncState::paused, "point cancellation reports paused");
+    expect(engine.restorePoints().size() == beforePause, "paused capture publishes no incomplete point");
+    engine.clearPause();
+    expect(engine.sync().state == SyncState::upToDate, "point cancellation can resume");
+    const auto resumed = engine.restorePoints().at(0).at("id").get<std::string>();
+    expect(read(Tree(engine.restore(f.restore, {}, resumed)), "new.txt") == "after pause", "resumed point complete");
+    const auto speed = diskSpeed(f.target);
+    expect(speed.at("bytes") == 64 * 1024 * 1024 && speed.at("read").get<double>() > 0, "bounded speed test");
+    for (const auto& name : disk.children()) expect(!name.starts_with(".backup-genius-speed-"), "speed cleanup");
+}
 
 void incremental(const fs::path& volume) {
     Fixture f(volume);
@@ -582,6 +639,10 @@ void interop(const fs::path& input, const fs::path& output, const fs::path& volu
         });
         engine.openExisting(f.target);
         expect(read(disk, "payload.bin").front() == 'M', "Swift prepared edit rolled back");
+        auto points = engine.restorePoints();
+        expect(points.size() >= 2, "read Swift restore points");
+        Tree pointOutput(engine.restore(f.restore, {}, points.back().at("id").get<std::string>()));
+        expect(read(pointOutput, "payload.bin").front() == 'A', "restore complete Swift point from C++");
         auto history = engine.history();
         expect(!history.empty(), "read Swift history");
         auto restored = Tree(engine.restore(f.restore, history[0].at("id").get<std::string>()));
@@ -624,6 +685,7 @@ int entry(std::vector<std::string> args) {
         } else {
             auto volume = args.size() == 2 ? path(args[1]) : fs::path{};
             std::cout << "Incremental backup\n" << std::flush;
+            restorePoints(volume);
             incremental(volume);
             std::cout << "Interrupted transactions\n" << std::flush;
             for (auto at : {Interruption::prepared, Interruption::firstBlock, Interruption::applied, Interruption::committed})
@@ -639,7 +701,7 @@ int entry(std::vector<std::string> args) {
 #ifdef _WIN32
             liveEvents(volume);
 #endif
-            std::cout << "Passed: incremental, 4 interruption points, takeover, safety, pruning\n";
+            std::cout << "Passed: complete restore points, point interruption, bounded disk measurement, incremental, 4 interruption points, takeover, safety, pruning\n";
         }
         return 0;
     } catch (const std::exception& error) {
