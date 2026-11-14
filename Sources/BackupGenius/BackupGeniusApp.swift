@@ -104,16 +104,18 @@ enum Page: String, CaseIterable, Identifiable {
 final class AppModel {
     let coordinator: BackupCoordinator
     private(set) var engine: SyncEngine
-    var folders: [BackupFolderStatus] = []
-    var selectedFolder: UUID?
+    private(set) var folders: [BackupFolderStatus] = []
+    private(set) var disks: [BackupDiskStatus] = []
+    private(set) var selectedFolder: UUID?
+    private(set) var job: BackupJob?
+    private var preferredDisk = UserDefaults.standard.string(forKey: "selectedBackupDisk")
+    private var preferredFolders = UserDefaults.standard.dictionary(forKey: "selectedBackupFolders") as? [String: String] ?? [:]
     var runningFolder: UUID?
     var diskProgress: [String: SyncProgress] = [:]
     var media: [String: StorageMedium] = [:]
     var askOnConnect = true
     var backupPrompts: [BackupPrompt] = []
-    var connectedDisks = Set<String>()
     var busy = false
-    var job: BackupJob?
     var volume: VolumeInfo?
     var organizedStorage = false
     var sourceDevice: StorageDeviceInfo?
@@ -124,12 +126,12 @@ final class AppModel {
     var restorePoints: [RestorePoint] = []
     var healthReport: DiskHealthReport?
     var speedReport: DiskSpeedReport?
-    var diagnosing = false
+    private var diagnosingDisk: String?
     var setup: SetupMode?
     var page: Page = .overview
     var error: String?
-    var restoring = false
-    private var ejectRequested = false
+    private var restoringJob: UUID?
+    private var ejectingDisk: String?
     var loginEnabled = false
     var loginNeedsApproval = false
 
@@ -162,21 +164,18 @@ final class AppModel {
         observer = Task { [weak self] in
             for await snapshot in await coordinator.updates() {
                 guard let self else { return }
-                self.folders = snapshot.folders
                 self.runningFolder = snapshot.running
                 self.diskProgress = snapshot.diskProgress
                 self.media = snapshot.media
                 self.busy = snapshot.busy
                 self.askOnConnect = snapshot.askOnConnect
-                self.connectedDisks = snapshot.connectedDisks
                 if self.backupPrompts.map(\.id) != snapshot.backupPrompts.map(\.id) {
                     self.backupPrompts = snapshot.backupPrompts
                     self.backupNotifications.update(snapshot.backupPrompts)
                 } else if !snapshot.backupPrompts.isEmpty {
                     self.backupPrompts = snapshot.backupPrompts
                 }
-                let selected = snapshot.folders.first(where: { $0.id == self.selectedFolder }) ?? snapshot.folders.first
-                await self.show(selected)
+                self.updateSelection(snapshot)
             }
         }
         Task { [weak self] in
@@ -191,26 +190,97 @@ final class AppModel {
         }
     }
 
-    private func show(_ folder: BackupFolderStatus?) async {
+    func updateSelection(_ snapshot: CoordinatorPresentation, selecting id: UUID? = nil) {
+        folders = snapshot.folders
+        disks = snapshot.disks
+        if let id, let folder = folders.first(where: { $0.id == id }) {
+            choose(folder)
+            return
+        }
+        let disk = preferredDisk.flatMap { id in disks.first { $0.id == id } }
+            ?? selectedDiskID.flatMap { id in disks.first { $0.id == id } }
+            ?? disks.first
+        if let selectedFolder, let folder = folders.first(where: { $0.id == selectedFolder }),
+           folder.job.volumeID.uppercased() == disk?.id {
+            show(folder)
+        } else {
+            show(disk.flatMap { preferredFolder(on: $0.id) })
+        }
+    }
+
+    private func preferredFolder(on disk: String) -> BackupFolderStatus? {
+        let members = folders.filter { $0.job.volumeID.uppercased() == disk }
+        return members.first { $0.id.uuidString == preferredFolders[disk] }
+            ?? members.first { !$0.job.restoreOnly && $0.mapping?.enabled != false }
+            ?? members.first
+    }
+
+    private func show(_ folder: BackupFolderStatus?) {
         let changed = job?.id != folder?.id
-        if changed, let folder, let next = await coordinator.engine(for: folder.id) { engine = next }
-        let snapshot = folder?.snapshot ?? coordinator.legacy.presentation
-        let shouldLoad = changed || progress.lastRunID != snapshot.progress.lastRunID ||
-            (progress.state.busy && !snapshot.progress.state.busy)
+        let diskChanged = selectedDiskID != folder?.job.volumeID.uppercased()
+        let next = folder?.snapshot.progress ?? SyncProgress()
+        let shouldLoad = changed || progress.lastRunID != next.lastRunID || (progress.state.busy && !next.state.busy)
+        engine = folder?.engine ?? coordinator.legacy
         selectedFolder = folder?.id
-        job = snapshot.job
-        volume = snapshot.volume
-        progress = snapshot.progress
-        organizedStorage = snapshot.organizedStorage
-        sourceDevice = snapshot.sourceDevice
-        if changed { activities = []; versions = []; backupRuns = []; restorePoints = []; healthReport = nil; speedReport = nil }
+        job = folder?.job
+        volume = selectedDiskConnected ? folder?.snapshot.volume : nil
+        progress = next
+        organizedStorage = folder?.snapshot.organizedStorage ?? false
+        sourceDevice = folder?.snapshot.sourceDevice
+        if changed {
+            loadRecordsTask?.cancel()
+            activities = []
+            versions = []
+            backupRuns = []
+            restorePoints = []
+        }
+        if diskChanged {
+            healthReport = nil
+            speedReport = nil
+        }
         if shouldLoad { loadRecords() }
+    }
+
+    private func choose(_ folder: BackupFolderStatus) {
+        let disk = folder.job.volumeID.uppercased()
+        preferredDisk = disk
+        preferredFolders[disk] = folder.id.uuidString
+        UserDefaults.standard.set(disk, forKey: "selectedBackupDisk")
+        UserDefaults.standard.set(preferredFolders, forKey: "selectedBackupFolders")
+        show(folder)
     }
 
     func selectFolder(_ id: UUID) {
         guard let folder = folders.first(where: { $0.id == id }) else { return }
-        selectedFolder = id
-        Task { await show(folder) }
+        choose(folder)
+    }
+
+    func selectDisk(_ id: String) {
+        guard id != selectedDiskID, let folder = preferredFolder(on: id) else { return }
+        choose(folder)
+    }
+
+    var selectedDiskID: String? { job?.volumeID.uppercased() }
+    var selectedDisk: BackupDiskStatus? { disks.first { $0.id == selectedDiskID } }
+    var foldersOnSelectedDisk: [BackupFolderStatus] { folders.filter { $0.job.volumeID.uppercased() == selectedDiskID } }
+    var selectedDiskName: String? { selectedDisk.map { diskName($0) } ?? job?.volumeName }
+    var runningDiskID: String? { folders.first { $0.id == runningFolder }?.job.volumeID.uppercased() }
+    var selectedDiskPrompt: BackupPrompt? { backupPrompts.first { $0.volumeID == selectedDiskID } }
+
+    private func diskName(_ disk: BackupDiskStatus) -> String {
+        if disks.filter({ $0.name == disk.name }).count > 1 {
+            // A mount suffix (for example, "Drive 1") distinguishes live same-name disks.
+            return disk.mount?.lastPathComponent ?? "\(disk.name) (\(disk.id.suffix(6)))"
+        }
+        return disk.name
+    }
+
+    func diskLabel(_ disk: BackupDiskStatus) -> String {
+        let status: String
+        if !disk.isConnected { status = "未连接" }
+        else if disk.id == runningDiskID { status = "正在备份" }
+        else { status = "已连接" }
+        return "\(diskName(disk)) · \(status)"
     }
 
     var displayedProgress: SyncProgress {
@@ -228,7 +298,7 @@ final class AppModel {
 
     var selectedMapping: FolderMapping? { folders.first(where: { $0.id == selectedFolder })?.mapping }
 
-    var menuStatus: String { backupPrompts.isEmpty ? displayedProgress.state.title : "等待确认备份" }
+    var menuStatus: String { selectedDiskPrompt == nil ? displayedProgress.state.title : "等待确认备份" }
     var menuSymbol: String {
         if !backupPrompts.isEmpty || displayedProgress.state == .needsAttention { return "externaldrive.badge.exclamationmark" }
         return "externaldrive"
@@ -238,13 +308,21 @@ final class AppModel {
         job?.restoreOnly == false && selectedMapping?.enabled != false && !busy &&
             (volume != nil || selectedDiskConnected || progress.state == .needsAttention) &&
             !progress.state.busy && progress.state != .takeoverRequired &&
-            progress.state != .paused && !restoring && !ejecting
+            progress.state != .paused && restoringJob == nil && ejectingDisk == nil && !ejecting
     }
-    var selectedDiskConnected: Bool { job.map { connectedDisks.contains($0.volumeID.uppercased()) } ?? false }
-    var canPause: Bool { job?.restoreOnly == false && volume != nil && !restoring && !ejecting }
-    var ejecting: Bool { ejectRequested || progress.state == .ejecting }
-    var canEject: Bool { (volume != nil || selectedDiskConnected) && !restoring && !ejecting }
-    var canRestore: Bool { (volume != nil || selectedDiskConnected) && !busy && !progress.state.busy && !restoring && !ejecting }
+    var selectedDiskConnected: Bool { selectedDisk?.isConnected == true }
+    var restoring: Bool { restoringJob != nil && restoringJob == selectedFolder }
+    var diagnosing: Bool { diagnosingDisk != nil && diagnosingDisk == selectedDiskID }
+    var canPause: Bool {
+        job?.restoreOnly == false && volume != nil && !restoring && !ejecting && (!busy || selectedDiskID == runningDiskID)
+    }
+    var ejecting: Bool { (ejectingDisk != nil && ejectingDisk == selectedDiskID) || progress.state == .ejecting }
+    var canEject: Bool {
+        selectedDiskConnected && restoringJob == nil && ejectingDisk == nil && !ejecting && (!busy || selectedDiskID == runningDiskID)
+    }
+    var canRestore: Bool {
+        selectedDiskConnected && !busy && !progress.state.busy && restoringJob == nil && ejectingDisk == nil && !ejecting
+    }
 
     func sync() {
         guard canSync, let id = job?.id else { return }
@@ -258,17 +336,18 @@ final class AppModel {
 
     func togglePause() {
         guard canPause, let id = job?.id else { return }
+        let resuming = progress.state == .paused
         Task {
-            if progress.state == .paused { await coordinator.resume(id) }
+            if resuming { await coordinator.resume(id) }
             else { await coordinator.pause() }
         }
     }
 
     func eject() {
-        guard canEject, let id = job?.id else { return }
-        ejectRequested = true
+        guard canEject, let id = job?.id, let disk = selectedDiskID else { return }
+        ejectingDisk = disk
         Task {
-            defer { ejectRequested = false }
+            defer { ejectingDisk = nil }
             do { try await coordinator.eject(id) }
             catch { self.error = error.localizedDescription }
         }
@@ -281,26 +360,28 @@ final class AppModel {
     }
 
     func loadRecords() {
-        guard page == .activity || page == .history else { return }
         loadRecordsTask?.cancel()
+        guard (page == .activity || page == .history), let id = selectedFolder else { return }
         let page = page
         let engine = engine
         loadRecordsTask = Task {
             do {
                 if page == .activity {
                     let values = try await engine.activity()
-                    if !Task.isCancelled { activities = values }
+                    if !Task.isCancelled, selectedFolder == id { activities = values }
                 } else {
                     let runs = try await engine.backupRuns()
                     let values = try await engine.history()
                     let points = try await engine.restorePoints()
-                    if !Task.isCancelled {
+                    if !Task.isCancelled, selectedFolder == id {
                         backupRuns = runs
                         versions = values
                         restorePoints = points
                     }
                 }
-            } catch { self.error = error.localizedDescription }
+            } catch {
+                if !Task.isCancelled, selectedFolder == id { self.error = error.localizedDescription }
+            }
         }
     }
 
@@ -308,9 +389,9 @@ final class AppModel {
         guard canRestore, let job = job?.id else { return }
         Task {
             guard let folder = await chooseFolder(title: "选择恢复位置", prompt: "恢复到此处", canCreate: true),
-                  canRestore else { return }
-            restoring = true
-            defer { restoring = false }
+                  selectedFolder == job, canRestore else { return }
+            restoringJob = job
+            defer { restoringJob = nil }
             do {
                 let result = try await coordinator.restore(job, version: id, point: point, to: folder)
                 NSWorkspace.shared.activateFileViewerSelecting([result])
@@ -342,10 +423,8 @@ final class AppModel {
     }
 
     func respondToBackupPrompt(_ id: UUID, backup: Bool) {
-        if backup, let prompt = backupPrompts.first(where: { $0.id == id }), job?.volumeID.uppercased() != prompt.volumeID,
-           let folder = folders.first(where: { $0.job.volumeID.uppercased() == prompt.volumeID &&
-               !$0.job.restoreOnly && $0.mapping?.enabled != false }) {
-            selectFolder(folder.id)
+        if backup, let prompt = backupPrompts.first(where: { $0.id == id }), setup == nil {
+            selectDisk(prompt.volumeID)
         }
         Task { await coordinator.respondToBackupPrompt(id, backup: backup) }
     }
@@ -367,16 +446,18 @@ final class AppModel {
     }
 
     func diagnose(speed: Bool) {
-        guard let id = job?.id, !busy, !diagnosing, selectedDiskConnected else { return }
-        diagnosing = true
+        guard let id = job?.id, let disk = selectedDiskID, !busy, diagnosingDisk == nil, selectedDiskConnected else { return }
+        diagnosingDisk = disk
         Task {
-            defer { diagnosing = false }
+            defer { diagnosingDisk = nil }
             do {
                 let (health, measurement) = try await coordinator.diagnose(id, speed: speed)
-                guard self.job?.id == id else { return }
+                guard selectedDiskID == disk else { return }
                 healthReport = health
                 if let measurement { speedReport = measurement }
-            } catch { self.error = error.localizedDescription }
+            } catch {
+                if selectedDiskID == disk { self.error = error.localizedDescription }
+            }
         }
     }
 
@@ -388,6 +469,7 @@ final class AppModel {
     }
 
     func organizeBackupDirectory() {
+        let engine = engine
         Task {
             guard let disk = await chooseFolder(title: "授权存放备份记录的硬盘根目录", prompt: "授权",
                                                 startingAt: volume?.mount) else { return }
@@ -397,6 +479,7 @@ final class AppModel {
     }
 
     func setExistingFilesPolicy(_ policy: ExistingFilesPolicy) {
+        let engine = engine
         Task {
             do { try await engine.setExistingFilesPolicy(policy) }
             catch { self.error = error.localizedDescription }
@@ -452,7 +535,16 @@ struct MenuControls: View {
             Text(backupTiming(model.displayedProgress))
         }
         if let job = model.job {
-            Text("\(model.volume?.name ?? job.volumeName) · \(job.format.name)")
+            Text("\(model.selectedDiskName ?? job.volumeName) · \(job.format.name)")
+        }
+        if model.disks.count > 1 {
+            Picker("备份硬盘", selection: Binding(
+                get: { model.selectedDiskID }, set: { if let id = $0 { model.selectDisk(id) } }
+            )) {
+                ForEach(model.disks) { disk in
+                    Text(model.diskLabel(disk)).tag(Optional(disk.id))
+                }
+            }
         }
         Divider()
         ForEach(model.backupPrompts) { prompt in

@@ -28,6 +28,7 @@ public:
     void confirmSetup(std::string_view preview, const std::map<std::string, std::string>& groups, bool automatic, bool eject);
     void openExisting(const fs::path& target);
     void select(std::string id);
+    void selectDisk(std::string_view disk);
     void setEnabled(bool);
     void setAutomatic(bool);
     void setAskOnConnect(bool);
@@ -87,6 +88,7 @@ private:
     std::unique_ptr<SyncEngine> legacy_;
     std::unique_ptr<Index> settings_;
     std::string host_, selected_, running_;
+    std::map<std::string, std::string> selectedFolders_;
     std::set<std::string> confirmedDisks_;
     std::map<std::string, Binding> bindings_;
     std::map<std::string, BackupSet> sets_;

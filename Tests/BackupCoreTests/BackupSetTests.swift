@@ -39,7 +39,11 @@ private final class SetFixture {
 
 private actor SetEjection {
     private(set) var count = 0
-    func completed() { count += 1 }
+    private(set) var mount: URL?
+    func completed(_ mount: URL? = nil) {
+        count += 1
+        self.mount = mount
+    }
 }
 
 private final class SetFault: @unchecked Sendable {
@@ -142,6 +146,52 @@ extension BackupCoreTests {
             #expect(VolumeInfo.matchingMounts(volume.identifier, format: format).contains { $0.path == volume.mount.path })
             #expect(VolumeInfo.matchingMounts(UUID().uuidString, format: format).isEmpty)
         }
+    }
+
+    @Test("Two mounted backup disks retain separate folders, records and eject targets",
+          .enabled(if: ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_APFS"] != nil &&
+                   ProcessInfo.processInfo.environment["BACKUP_GENIUS_TEST_EXFAT"] != nil))
+    func separateBackupDisks() async throws {
+        let first = try SetFixture(.apfs)
+        let second = try SetFixture(.exfat)
+        let firstSource = try first.source("Projects", data: Data("first disk".utf8))
+        let secondSource = try second.source("Projects", data: Data("second disk".utf8))
+        let ejected = SetEjection()
+        let coordinator = first.coordinator { mount in { await ejected.completed(mount) } }
+        try await coordinator.start()
+        let firstPreview = try await coordinator.previewSetup(volumeRoot: first.mount, sources: [firstSource])
+        let firstSet = try await coordinator.confirmSetup(firstPreview.id, automatic: false, ejectAfterBackup: false)
+        first.track(firstSet)
+        let secondPreview = try await coordinator.previewSetup(volumeRoot: second.mount, sources: [secondSource])
+        let secondSet = try await coordinator.confirmSetup(secondPreview.id, automatic: false, ejectAfterBackup: false)
+        second.track(secondSet)
+
+        let firstID = firstPreview.volume.identifier.uppercased()
+        let secondID = secondPreview.volume.identifier.uppercased()
+        let firstJob = firstSet.mappings[0].job
+        let secondJob = secondSet.mappings[0].job
+        let selection = await coordinator.presentation
+        #expect(Set(selection.disks.map(\.id)) == [firstID, secondID])
+        #expect(selection.disks.allSatisfy { $0.isConnected })
+        let firstFolder = try #require(selection.folders.first { $0.id == firstJob })
+        let secondFolder = try #require(selection.folders.first { $0.id == secondJob })
+
+        let path = "BackupGenius/Projects/payload.bin"
+        await coordinator.sync(secondFolder.id)
+        #expect(try Data(contentsOf: second.mount.appending(path: path)) == Data("second disk".utf8))
+        #expect(!FileManager.default.fileExists(atPath: first.mount.appending(path: path).path))
+        #expect(try await firstFolder.engine.backupRuns().isEmpty)
+        #expect(try await secondFolder.engine.backupRuns().count == 1)
+
+        await coordinator.sync(firstFolder.id)
+        try await coordinator.eject(secondFolder.id)
+        #expect(await ejected.mount?.path == second.mount.path)
+        let after = await coordinator.presentation
+        #expect(after.connectedDisks == [firstID])
+        #expect(after.disks.contains { $0.id == secondID && !$0.isConnected })
+        #expect(try await secondFolder.engine.backupRuns().count == 1)
+        #expect(try Data(contentsOf: first.mount.appending(path: path)) == Data("first disk".utf8))
+        await coordinator.finishAndClose()
     }
 
     private func copySetFixture(_ source: URL, to target: URL) throws {

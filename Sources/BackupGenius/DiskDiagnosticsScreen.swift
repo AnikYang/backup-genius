@@ -6,7 +6,7 @@ struct DiskDiagnosticsScreen: View {
     var body: some View {
         Form {
             Section("设备信息") {
-                deviceValue("硬盘", model.volume?.name ?? model.job?.volumeName ?? "尚未选择")
+                deviceValue("硬盘", model.selectedDiskName ?? "尚未选择")
                 if let report = model.healthReport {
                     deviceValue("型号", report.model)
                     LabeledContent("连接方式", value: report.connection)

@@ -450,6 +450,16 @@ private:
         alert_.Margin({24, 0, 24, 0});
         StackPanel controls;
         controls.Children().Append(alert_);
+        disks_ = ComboBox();
+        disks_.Header(box_value(L"备份硬盘"));
+        disks_.Margin({24, 4, 24, 4});
+        disks_.MaxWidth(420);
+        disks_.SelectionChanged([this](auto&&, auto&&) {
+            const auto index = disks_.SelectedIndex();
+            if (rendering_ || index < 0 || static_cast<size_t>(index) >= diskIDs_.size()) return;
+            selectContext(diskIDs_[index], true);
+        });
+        controls.Children().Append(disks_);
         backupPrompts_ = StackPanel();
         backupPrompts_.Margin({24, 0, 24, 0});
         backupPrompts_.Spacing(8);
@@ -460,7 +470,7 @@ private:
         folders_.SelectionChanged([this](auto&&, auto&&) {
             const auto index = folders_.SelectedIndex();
             if (rendering_ || index < 0 || static_cast<size_t>(index) >= folderIDs_.size()) return;
-            worker_->submit([id = folderIDs_[index]](auto& engine) { engine.select(id); });
+            selectContext(folderIDs_[index], false);
         });
         controls.Children().Append(folders_);
         Grid::SetRow(controls, 1);
@@ -684,13 +694,25 @@ private:
     void render(const bg::Presentation& presentation) {
         const auto previous = view_.progress.state;
         const auto previousJob = view_.job.id;
+        const auto previousDisk = view_.job.volume;
         auto previousPrompts = std::move(view_.backupPrompts);
         view_ = presentation;
-        if (previousJob != view_.job.id)
+        if (pendingContext_) {
+            const auto& [id, disk] = *pendingContext_;
+            if (id == (disk ? view_.job.volume : view_.job.id)) pendingContext_.reset();
+        }
+        if (previousDisk != view_.job.volume)
             diagnosticText_.Text(L"连接当前所选的备份硬盘后，可读取健康信息或进行性能检测。");
-        if (previousPrompts != view_.backupPrompts) {
+        if (previousJob != view_.job.id && page_ > 0 && page_ < 4) {
+            rows_.clear();
+            renderRows();
+        }
+        if (previousPrompts != view_.backupPrompts || previousDisk != view_.job.volume) {
             backupPrompts_.Children().Clear();
             for (const auto& prompt : view_.backupPrompts) {
+                if (std::none_of(previousPrompts.begin(), previousPrompts.end(), [&](const auto& prior) { return prior.id == prompt.id; }))
+                    notifyConnectedDisk(prompt);
+                if (prompt.disk != view_.job.volume) continue;
                 InfoBar bar;
                 bar.Title(hstring(L"「" + wide(prompt.name) + L"」已连接"));
                 bar.Message(hstring(L"备份 " + std::to_wstring(prompt.folders) + L" 个文件夹？"));
@@ -703,12 +725,10 @@ private:
                 actions.Children().Append(button(L"稍后", [this, id = prompt.id] { respond(id, false); }));
                 bar.Content(actions);
                 backupPrompts_.Children().Append(bar);
-                if (std::none_of(previousPrompts.begin(), previousPrompts.end(), [&](const auto& prior) { return prior.id == prompt.id; }))
-                    notifyConnectedDisk(prompt);
             }
         }
         const auto& p = view_.progress;
-        const bool active = view_.busy || busy(p.state) || diagnosing_;
+        const bool active = view_.busy || busy(p.state) || diagnosing_ || pendingContext_.has_value();
         const bool configured = !view_.job.id.empty();
         const bool connected = view_.volume.has_value();
         using S = bg::SyncState;
@@ -732,10 +752,10 @@ private:
             text += L"\n后台记录：" + std::to_wstring(p.pendingSourcePaths) + L" 个待核对路径" +
                 (p.sourceNeedsScan ? L"，需要补充核对" : L"，硬盘断开时继续记录");
         detail_.Text(text);
-        statusProgress_.Visibility(active ? Visibility::Visible : Visibility::Collapsed);
+        statusProgress_.Visibility(busy(p.state) ? Visibility::Visible : Visibility::Collapsed);
         const bool savingPoint = p.message == "正在保存备份时间点";
         const bool determinate = p.state == S::syncing && p.planned > 0 && !savingPoint;
-        statusProgress_.IsIndeterminate(active && !determinate);
+        statusProgress_.IsIndeterminate(busy(p.state) && !determinate);
         if (determinate) statusProgress_.Value(100.0 * p.processed / p.planned);
         const bool estimating = p.state == S::checking || p.state == S::verifying;
         timing_.Visibility(determinate || estimating || savingPoint ? Visibility::Visible : Visibility::Collapsed);
@@ -753,17 +773,19 @@ private:
             free_.Text(L"可用 " + quantity(static_cast<int64_t>(disk.free)));
             capacity_.Value(disk.total ? 100.0 * (disk.total - disk.free) / disk.total : 0);
         } else {
-            disk_.Text(view_.selectedDiskConnected ? L"硬盘已连接" : (configured ? L"硬盘未连接" : L"尚未选择硬盘"));
+            const auto selection = std::find_if(view_.disks.begin(), view_.disks.end(), [&](const auto& disk) { return disk.id == view_.job.volume; });
+            disk_.Text(selection == view_.disks.end() ? L"尚未选择硬盘" :
+                wide(selection->name) + (view_.selectedDiskConnected ? L" · 已连接" : L" · 未连接"));
             free_.Text(L"");
         }
         capacity_.Visibility(connected ? Visibility::Visible : Visibility::Collapsed);
         sync_.IsEnabled((connected || view_.selectedDiskConnected) && !active && !view_.job.restoreOnly &&
                        p.state != S::paused && p.state != S::takeoverRequired);
         verify_.IsEnabled(sync_.IsEnabled());
-        pause_.IsEnabled(connected && !view_.job.restoreOnly && p.state != S::takeoverRequired);
+        pause_.IsEnabled(!pendingContext_ && connected && !view_.job.restoreOnly && p.state != S::takeoverRequired);
         pause_.Label(p.state == S::paused ? L"继续" : L"暂停");
         pause_.Icon(SymbolIcon(p.state == S::paused ? Symbol::Play : Symbol::Pause));
-        eject_.IsEnabled(connected || view_.selectedDiskConnected);
+        eject_.IsEnabled(!pendingContext_ && (connected || view_.selectedDiskConnected));
         setup_.IsEnabled(!active);
         open_.IsEnabled(!active);
         takeover_.IsEnabled(connected && !active);
@@ -778,10 +800,12 @@ private:
         automatic_.Visibility(configured && !view_.job.restoreOnly ? Visibility::Visible : Visibility::Collapsed);
         rendering_ = true;
         askOnConnect_.IsOn(view_.askOnConnect);
+        renderDisks();
         std::vector<std::string> ids, labels;
         std::wstring states;
         std::optional<bg::FolderMapping> selected;
         for (const auto& folder : view_.folders) {
+            if (folder.job.volume != view_.job.volume) continue;
             const auto label = folder.mapping ? folder.mapping->folder : bg::utf8(folder.job.target.filename());
             ids.push_back(folder.job.id);
             labels.push_back(label);
@@ -824,6 +848,53 @@ private:
         auto tray = trayData();
         if (trayReady_) Shell_NotifyIconW(NIM_MODIFY, &tray);
         if (page_ > 0 && page_ < 4 && (previousJob != view_.job.id || previous != p.state) && !active) loadRows();
+    }
+    void renderDisks() {
+        std::vector<std::string> ids, labels;
+        for (const auto& disk : view_.disks) {
+            auto name = disk.name;
+            if (std::count_if(view_.disks.begin(), view_.disks.end(), [&](const auto& other) { return other.name == disk.name; }) > 1) {
+                if (!disk.mount.empty()) name += " (" + bg::utf8(disk.mount) + ")";
+                else name += " (" + disk.id.substr(disk.id.size() > 6 ? disk.id.size() - 6 : 0) + ")";
+            }
+            ids.push_back(disk.id);
+            labels.push_back(name + (disk.connected ? (disk.id == view_.runningDisk ? " · 正在备份" : " · 已连接") : " · 未连接"));
+        }
+        if (diskIDs_ != ids || diskLabels_ != labels) {
+            diskIDs_ = std::move(ids);
+            diskLabels_ = std::move(labels);
+            std::vector<IInspectable> values;
+            for (const auto& label : diskLabels_) values.push_back(box_value(wide(label)));
+            disks_.ItemsSource(single_threaded_observable_vector<IInspectable>(std::move(values)));
+        }
+        const auto selected = std::find(diskIDs_.begin(), diskIDs_.end(), view_.job.volume);
+        if (!pendingContext_ || !pendingContext_->second)
+            disks_.SelectedIndex(selected == diskIDs_.end() ? -1 : static_cast<int32_t>(selected - diskIDs_.begin()));
+        disks_.Visibility(diskIDs_.size() > 1 ? Visibility::Visible : Visibility::Collapsed);
+        disks_.IsEnabled(!view_.busy && !diagnosing_ && !pendingContext_);
+    }
+    void selectContext(std::string id, bool disk) {
+        if (pendingContext_ || view_.busy || diagnosing_ || id == (disk ? view_.job.volume : view_.job.id)) return;
+        pendingContext_.emplace(id, disk);
+        const auto current = view_;
+        render(current);
+        worker_->submit([this, id = std::move(id), disk](auto& engine) {
+            try {
+                if (disk) engine.selectDisk(id);
+                else engine.select(id);
+                const auto selected = engine.presentation().job;
+                if (id == (disk ? selected.volume : selected.id)) return;
+                throw std::runtime_error("无法切换到所选备份");
+            } catch (const std::exception& e) {
+                dispatcher_.TryEnqueue([this, message = std::string(e.what())] {
+                    if (quitting_) return;
+                    pendingContext_.reset();
+                    const auto current = view_;
+                    render(current);
+                    error(wide(message));
+                });
+            }
+        });
     }
     void loadRows() {
         if (!worker_) return;
@@ -1097,6 +1168,7 @@ private:
         if (!folder.empty()) ShellExecuteW(hwnd_, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
     void restore(std::string version) {
+        if (pendingContext_) return;
         try {
             auto folder = selectFolder(hwnd_, L"选择恢复位置");
             if (folder.empty()) return;
@@ -1108,6 +1180,7 @@ private:
         } catch (const hresult_error& e) { error(e.message()); }
     }
     void pause() {
+        if (pendingContext_) return;
         if (view_.progress.state == bg::SyncState::paused) {
             worker_->submit([](auto& engine) { engine.resume(); });
         } else {
@@ -1116,6 +1189,7 @@ private:
         }
     }
     void eject() {
+        if (pendingContext_) return;
         worker_->interrupt();
         worker_->submit([](auto& engine) { engine.safeEject(); });
     }
@@ -1153,7 +1227,7 @@ private:
     Button configureButton_{nullptr}, existingButton_{nullptr}, takeoverButton_{nullptr}, explorer_{nullptr};
     Button restoreCurrent_{nullptr}, restoreSelected_{nullptr};
     ToggleSwitch automatic_{nullptr}, automaticEject_{nullptr}, enabled_{nullptr}, askOnConnect_{nullptr};
-    ComboBox folders_{nullptr}, diskType_{nullptr}, sourceDiskType_{nullptr}, changeKind_{nullptr};
+    ComboBox disks_{nullptr}, folders_{nullptr}, diskType_{nullptr}, sourceDiskType_{nullptr}, changeKind_{nullptr};
     InfoBar alert_{nullptr};
     ListView list_{nullptr};
     TextBox search_{nullptr};
@@ -1161,6 +1235,8 @@ private:
     bg::Presentation view_;
     bg::Json rows_ = bg::Json::array();
     std::vector<std::string> visibleIDs_, folderIDs_, folderLabels_;
+    std::vector<std::string> diskIDs_, diskLabels_;
+    std::optional<std::pair<std::string, bool>> pendingContext_;
     ScrollViewer diagnostics_{nullptr};
     TextBlock diagnosticText_{nullptr};
     Button healthCheck_{nullptr}, speedCheck_{nullptr};

@@ -175,12 +175,13 @@ struct BackupGuide: View {
                     let result = try await model.coordinator.confirmSetup(preview.id, groups: groups,
                                                                          automatic: automatic, ejectAfterBackup: eject)
                     let snapshot = await model.coordinator.presentation
-                    model.folders = snapshot.folders
                     if let id = result.mappings.first(where: { mapping in
                         preview.rows.contains(where: { $0.id == mapping.id && $0.previousFolder == nil })
                     })?.job {
-                        model.selectFolder(id)
+                        model.updateSelection(snapshot, selecting: id)
                         if !automatic { Task { await model.coordinator.sync(id) } }
+                    } else {
+                        model.updateSelection(snapshot)
                     }
                     if login != model.loginEnabled { model.setLogin(login) }
                     model.page = .overview

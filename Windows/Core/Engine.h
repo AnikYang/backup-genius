@@ -28,6 +28,7 @@ struct BackupJob {
     bool restoreOnly{};
     std::string set;
     bool ejectAfterBackup{};
+    std::string volumeName;
 };
 struct FolderStatus {
     BackupJob job;
@@ -39,12 +40,19 @@ struct BackupPrompt {
     size_t folders{};
     bool operator==(const BackupPrompt&) const = default;
 };
+struct BackupDiskStatus {
+    std::string id, name;
+    fs::path mount;
+    bool connected{};
+};
 struct Presentation {
     BackupJob job;
     std::optional<Volume> volume;
     SyncProgress progress;
     std::vector<FolderStatus> folders;
+    std::vector<BackupDiskStatus> disks;
     std::string runningFolder;
+    std::string runningDisk;
     bool busy{};
     bool askOnConnect{true}, selectedDiskConnected{};
     std::vector<BackupPrompt> backupPrompts;

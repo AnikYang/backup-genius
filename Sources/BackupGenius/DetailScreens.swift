@@ -162,6 +162,7 @@ struct SetupView: View {
 
     private func save() {
         guard let target, let volume else { return }
+        let engine = model.engine
         pending = true
         failure = nil
         Task {
@@ -177,21 +178,21 @@ struct SetupView: View {
                 switch mode {
                 case .configure:
                     guard let source else { return }
-                    model.job = try await model.engine.configure(source: source, target: target, automatic: automatic,
-                                                                existingFiles: existingFiles, ejectAfterBackup: ejectAfterBackup,
-                                                                volumeRoot: disk)
+                    let job = try await engine.configure(source: source, target: target, automatic: automatic,
+                                                         existingFiles: existingFiles, ejectAfterBackup: ejectAfterBackup,
+                                                         volumeRoot: disk)
+                    await model.updateSelection(model.coordinator.presentation, selecting: job.id)
                     if login != model.loginEnabled { model.setLogin(login) }
                     model.page = .overview
                 case .existing:
                     if setTarget, let disk {
                         try await model.coordinator.openCollection(on: disk)
-                        model.folders = await model.coordinator.presentation.folders
-                        if let id = model.folders.first(where: { $0.job.setID != nil && $0.job.volumeID == volume.identifier })?.id {
-                            model.selectFolder(id)
-                        }
+                        let snapshot = await model.coordinator.presentation
+                        let id = snapshot.folders.first { $0.job.setID != nil && $0.job.volumeID.caseInsensitiveCompare(volume.identifier) == .orderedSame }?.id
+                        model.updateSelection(snapshot, selecting: id)
                     } else {
                         let job = try await model.coordinator.legacy.openExisting(target: target, volumeRoot: disk)
-                        model.selectedFolder = job.id
+                        await model.updateSelection(model.coordinator.presentation, selecting: job.id)
                     }
                     model.page = .history
                     model.loadRecords()
@@ -322,7 +323,8 @@ struct TakeoverView: View {
         Task {
             defer { working = false }
             do {
-                model.job = try await model.coordinator.confirmTakeover(job: job, preview: preview.id, choices: choices)
+                let updated = try await model.coordinator.confirmTakeover(job: job, preview: preview.id, choices: choices)
+                await model.updateSelection(model.coordinator.presentation, selecting: updated.id)
                 model.page = .overview
                 dismiss()
             } catch {

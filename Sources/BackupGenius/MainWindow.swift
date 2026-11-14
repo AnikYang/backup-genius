@@ -106,13 +106,14 @@ struct MainWindow: View {
                 }
                 .listStyle(.sidebar)
                 Divider().padding(.horizontal, 14)
-                SidebarDisk(job: model.job, volume: model.volume, state: model.progress.state, connected: model.selectedDiskConnected)
+                SidebarDisk(name: model.selectedDiskName ?? "备份硬盘", volume: model.volume,
+                            state: model.progress.state, connected: model.selectedDiskConnected, configured: model.job != nil)
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 216, max: 260)
         } detail: {
             VStack(spacing: 0) {
-                if model.folders.count > 1 || model.job?.setID != nil {
-                    folderBar
+                if model.disks.count > 1 || showsFolderPicker {
+                    selectionBar
                     Divider()
                 }
                 // Native tables can propose their ideal height in a split column.
@@ -130,7 +131,7 @@ struct MainWindow: View {
                 }
             }
             .navigationTitle(model.page.title)
-            .navigationSubtitle(model.job.map { $0.restoreOnly ? "已有备份" : (model.volume?.name ?? $0.volumeName) } ?? "Backup Genius")
+            .navigationSubtitle(model.selectedDiskName ?? "Backup Genius")
             .toolbar {
                 if model.job != nil {
                     ToolbarItemGroup(placement: .primaryAction) {
@@ -155,6 +156,7 @@ struct MainWindow: View {
                             }
                             Divider()
                             Button("新手引导…") { model.setup = .guide }.disabled(model.busy)
+                            Button("打开已有备份…") { model.setup = .existing }.disabled(model.busy)
                             if model.job?.setID == nil {
                                 Button("更改备份…") { model.setup = .configure }
                                     .disabled(model.busy || model.restoring || model.ejecting)
@@ -195,17 +197,33 @@ struct MainWindow: View {
         }
     }
 
-    private var folderBar: some View {
-        Group {
-            if model.page == .overview {
-                HStack(spacing: 12) {
-                    folderPicker
-                    Spacer(minLength: 0)
-                    Button("添加备份文件夹…", systemImage: "plus") { model.setup = .guide }
-                        .fixedSize(horizontal: true, vertical: false)
-                        .disabled(model.busy)
+    private var showsFolderPicker: Bool { model.foldersOnSelectedDisk.count > 1 || model.job?.setID != nil }
+
+    private var selectionBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if model.disks.count > 1 {
+                Picker("备份硬盘", selection: Binding(
+                    get: { model.selectedDiskID }, set: { if let id = $0 { model.selectDisk(id) } }
+                )) {
+                    ForEach(model.disks) { disk in
+                        Text(model.diskLabel(disk)).tag(Optional(disk.id))
+                    }
                 }
-            } else {
+                .lineLimit(1)
+                .frame(maxWidth: 420, alignment: .leading)
+                .help(model.selectedDisk.map { model.diskLabel($0) } ?? "选择备份硬盘")
+            }
+            if model.page == .overview {
+                if showsFolderPicker {
+                    HStack(spacing: 12) {
+                        folderPicker
+                        Spacer(minLength: 0)
+                        addFolderButton
+                    }
+                } else {
+                    addFolderButton.frame(maxWidth: .infinity, alignment: .trailing)
+                }
+            } else if showsFolderPicker {
                 folderPicker
             }
         }
@@ -214,11 +232,17 @@ struct MainWindow: View {
         .padding(.vertical, 8)
     }
 
+    private var addFolderButton: some View {
+        Button("添加备份文件夹…", systemImage: "plus") { model.setup = .guide }
+            .fixedSize(horizontal: true, vertical: false)
+            .disabled(model.busy)
+    }
+
     private var folderPicker: some View {
         Picker("所属文件夹", selection: Binding(
             get: { model.selectedFolder }, set: { if let id = $0 { model.selectFolder(id) } }
         )) {
-            ForEach(model.folders) { folder in
+            ForEach(model.foldersOnSelectedDisk) { folder in
                 Text(folder.title).tag(Optional(folder.id))
             }
         }
@@ -229,12 +253,11 @@ struct MainWindow: View {
 }
 
 private struct SidebarDisk: View {
-    let job: BackupJob?
+    let name: String
     let volume: VolumeInfo?
     let state: SyncState
     let connected: Bool
-
-    private var name: String { volume?.name ?? job?.volumeName ?? "备份硬盘" }
+    let configured: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -251,8 +274,8 @@ private struct SidebarDisk: View {
                         .foregroundStyle(.secondary)
                 }
             } icon: {
-                Image(systemName: volume == nil ? "externaldrive" : "externaldrive.fill")
-                    .foregroundStyle(volume == nil ? Color.secondary : Color.accentColor)
+                Image(systemName: connected ? "externaldrive.fill" : "externaldrive")
+                    .foregroundStyle(connected ? Color.accentColor : Color.secondary)
             }
             if let volume, volume.totalBytes > 0 {
                 ProgressView(value: min(1, max(0, 1 - Double(volume.availableBytes) / Double(volume.totalBytes))))
@@ -273,7 +296,7 @@ private struct SidebarDisk: View {
         if connected { return "已连接" }
         if state == .ejected { return "已推出" }
         if state == .ejecting { return "正在推出" }
-        return job == nil ? "尚未选择" : "未连接"
+        return configured ? "未连接" : "尚未选择"
     }
 }
 
@@ -285,7 +308,7 @@ struct Overview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     status
-                    ForEach(model.backupPrompts.filter { $0.volumeID.caseInsensitiveCompare(job.volumeID) == .orderedSame }) { prompt in
+                    if let prompt = model.selectedDiskPrompt {
                         VStack(alignment: .leading, spacing: 10) {
                             Label {
                                 Text(prompt.volumeName).lineLimit(2).truncationMode(.middle)
@@ -310,7 +333,7 @@ struct Overview: View {
                     }
                     if job.setID != nil {
                         VStack(alignment: .leading, spacing: 11) {
-                            ForEach(model.folders.filter { $0.job.setID == job.setID }) { folder in
+                            ForEach(model.foldersOnSelectedDisk.filter { $0.job.setID == job.setID }) { folder in
                                 Button { model.selectFolder(folder.id) } label: {
                                     HStack(spacing: 12) {
                                         Label {
@@ -493,13 +516,13 @@ struct Overview: View {
         switch progress.state {
         case .disconnected:
             if model.selectedDiskConnected {
-                return model.backupPrompts.contains { $0.volumeID.caseInsensitiveCompare(model.job?.volumeID ?? "") == .orderedSame }
+                return model.selectedDiskPrompt != nil
                     ? "确认后将处理已记录的文件变化。" : "可立即备份或校验。"
             }
-            return "连接 \(model.job?.volumeName ?? "备份硬盘") 以继续。"
+            return "连接 \(model.selectedDiskName ?? "备份硬盘") 以继续。"
         case .ready:
             return model.job?.restoreOnly == true ? "可浏览历史版本和恢复当前备份。" :
-                (model.backupPrompts.isEmpty && model.job?.automatic == true ? "正在等待备份。" : "可手动开始备份。")
+                (model.selectedDiskPrompt == nil && model.job?.automatic == true ? "正在等待备份。" : "可手动开始备份。")
         case .checking:
             return "已检查 \(progress.examined.formatted()) 项"
         case .verifying:
@@ -524,7 +547,7 @@ struct Overview: View {
     }
 
     private func overviewTitle(_ state: SyncState) -> String {
-        if let disk = model.job?.volumeID.uppercased(), model.backupPrompts.contains(where: { $0.volumeID == disk }) {
+        if model.selectedDiskPrompt != nil {
             return "等待确认备份"
         }
         return state == .disconnected && model.selectedDiskConnected ? "硬盘已连接" : state.title

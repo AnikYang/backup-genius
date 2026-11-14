@@ -129,12 +129,12 @@ Json jobJSON(const BackupJob& job) {
     return {{"id", job.id}, {"volume", job.volume}, {"format", job.format}, {"relative", job.relative},
         {"sourceId", job.sourceId}, {"source", utf8(job.source)}, {"target", utf8(job.target)},
         {"automatic", job.automatic}, {"restoreOnly", job.restoreOnly}, {"set", job.set},
-        {"ejectAfterBackup", job.ejectAfterBackup}};
+        {"ejectAfterBackup", job.ejectAfterBackup}, {"volumeName", job.volumeName}};
 }
 BackupJob loadJob(const Json& j) {
     return {identifier(j.at("id")), j.at("volume"), j.at("format"), j.at("relative"), j.at("sourceId"),
         path(j.at("source").get<std::string>()), path(j.at("target").get<std::string>()), j.at("automatic"), j.at("restoreOnly"),
-        j.value("set", ""), j.value("ejectAfterBackup", false)};
+        j.value("set", ""), j.value("ejectAfterBackup", false), j.value("volumeName", "")};
 }
 namespace {
 void validateFolders(const fs::path& source, const fs::path& target, const fs::path& storage) {
@@ -477,7 +477,7 @@ void SyncEngine::configure(const fs::path& in, const fs::path& out, bool automat
     auto marker = Repository::create(target, format, host_, !allowInternal_);
     auto relative = target.root().lexically_relative(volume.mount);
     setJob({identifier(marker.at("job")), volume.id, format, relative == "." ? "" : utf8(relative),
-        source.identity().identity, source.root(), target.root(), automatic, false});
+        source.identity().identity, source.root(), target.root(), automatic, false, {}, false, volume.label});
     saveJob();
     refresh();
     publish(true);
@@ -490,7 +490,7 @@ void SyncEngine::openExisting(const fs::path& out) {
     auto marker = Repository::readMarker(target);
     auto relative = target.root().lexically_relative(volume.mount);
     setJob({identifier(marker.at("job")), volume.id, marker.at("format"), relative == "." ? "" : utf8(relative), "",
-        {}, target.root(), false, true});
+        {}, target.root(), false, true, {}, false, volume.label});
     saveJob();
     refresh();
     publish(true);
@@ -623,7 +623,11 @@ void SyncEngine::refresh() {
     if (repo->owner == host_ && repo->generation == 0 && !view_.job.restoreOnly && index_->get("meta", "binding").is_null())
         repo->bind(view_.job.sourceId);
     if (repo->recovered) index_->put("activity", uuid(), activity("recovered", "", 0, "已回滚未完成的事务"));
-    view_.job.target = target;
+    if (view_.job.target != target || view_.job.volumeName != volume.label) {
+        view_.job.target = target;
+        view_.job.volumeName = volume.label;
+        saveJob();
+    }
     view_.volume = volume;
     observeSource();
     targetWatch_ = std::make_unique<DirectoryWatch>(target, changesReady_, true);

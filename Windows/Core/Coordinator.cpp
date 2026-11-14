@@ -17,7 +17,7 @@ BackupJob memberJob(const BackupSet& set, const FolderMapping& mapping, const Vo
     auto relative = relativeToRoot(mapping.folder);
     return {mapping.job, volume.id, volume.format, relative, row ? row->sourceId : "",
         row ? row->source : fs::path{}, representable(relative) ? volume.mount / path(relative) : volume.mount,
-        automatic, !row, set.id, eject};
+        automatic, !row, set.id, eject, volume.label};
 }
 void accumulate(SyncProgress& summary, const SyncProgress& value) {
     summary.examined += value.examined;
@@ -74,8 +74,17 @@ void BackupCoordinator::start() {
     for (const auto& [key, value] : settings_->all("media")) {
         media_[key] = value == "ssd" ? StorageMedium::ssd : StorageMedium::hdd;
     }
+    for (const auto& [disk, value] : settings_->all("selectedFolders")) {
+        if (value.is_string()) selectedFolders_[disk] = value.get<std::string>();
+    }
+    const auto savedSelection = settings_->get("settings", "selectedFolder");
+    if (savedSelection.is_string() && engine(savedSelection.get<std::string>())) selected_ = savedSelection.get<std::string>();
     for (auto job : all()) job->setMedia(media_);
     refreshConnections();
+    if (selected_.empty()) {
+        const auto disks = presentation().disks;
+        if (!disks.empty() && disks.front().connected) selectDisk(disks.front().id);
+    }
     publish();
 }
 bool BackupCoordinator::offerGuide() {
@@ -111,7 +120,6 @@ Presentation BackupCoordinator::presentation() const {
         selected = !legacy_->presentation().job.id.empty() || engines_.empty() ? legacy_.get() : engines_.begin()->second.get();
     auto view = selected->presentation();
     view.askOnConnect = askOnConnect_;
-    view.selectedDiskConnected = connections_.contains(view.job.volume);
     for (const auto& [disk, connection] : connections_) if (!connection.prompt.empty()) {
         size_t count = 0;
         for (auto job : all()) {
@@ -128,23 +136,50 @@ Presentation BackupCoordinator::presentation() const {
         const auto setting = media_.find(folded(view.sourceDevice->id));
         if (setting != media_.end()) view.sourceMediumOverride = setting->second;
     }
+    std::map<std::string, BackupDiskStatus> disks;
     for (auto engine : all()) {
         const auto& snapshot = engine->presentation();
-        if (!snapshot.job.id.empty()) view.folders.push_back({snapshot.job, mapping(snapshot.job), snapshot.progress});
+        const auto& job = snapshot.job;
+        if (job.id.empty()) continue;
+        view.folders.push_back({job, mapping(job), snapshot.progress});
+        auto& disk = disks[job.volume];
+        disk.id = job.volume;
+        if (disk.name.empty()) disk.name = job.volumeName.empty() ? job.volume : job.volumeName;
+        if (ejected_.contains(job.volume)) continue;
+        if (auto connection = connections_.find(job.volume); connection != connections_.end()) {
+            disk.connected = true;
+            disk.mount = connection->second.mount;
+            if (!connection->second.name.empty()) disk.name = connection->second.name;
+        } else if (snapshot.volume) {
+            disk.connected = true;
+            disk.mount = snapshot.volume->mount;
+            if (!snapshot.volume->label.empty()) disk.name = snapshot.volume->label;
+        }
     }
+    for (auto& [_, disk] : disks) view.disks.push_back(std::move(disk));
+    std::sort(view.disks.begin(), view.disks.end(), [](const auto& lhs, const auto& rhs) {
+        if (lhs.connected != rhs.connected) return lhs.connected;
+        return std::tie(lhs.name, lhs.id) < std::tie(rhs.name, rhs.id);
+    });
+    view.selectedDiskConnected = std::any_of(view.disks.begin(), view.disks.end(), [&](const auto& disk) {
+        return disk.id == view.job.volume && disk.connected;
+    });
     std::sort(view.folders.begin(), view.folders.end(), [](const auto& lhs, const auto& rhs) {
         return std::tie(lhs.job.volume, lhs.job.relative) < std::tie(rhs.job.volume, rhs.job.relative);
     });
-    if (auto active = active_.load(); busy_ && active && active->presentation().job.volume == view.job.volume) {
-        view.progress = active->presentation().progress;
-        view.runningJob = active->presentation().job.id;
-        if (view.progress.state == SyncState::ready) view.progress.state = SyncState::checking;
+    if (auto active = active_.load(); busy_ && active) {
+        view.runningDisk = active->presentation().job.volume;
+        if (view.runningDisk == view.job.volume) {
+            view.progress = active->presentation().progress;
+            view.runningJob = active->presentation().job.id;
+            if (view.progress.state == SyncState::ready) view.progress.state = SyncState::checking;
+        }
     } else if (!view.job.set.empty() && view.volume && view.progress.state != SyncState::takeoverRequired &&
                view.progress.state != SyncState::paused && diskProgress_.contains(view.job.volume)) {
         view.progress = diskProgress_.at(view.job.volume);
     }
     view.busy = busy_;
-    view.runningFolder = running_;
+    if (view.runningDisk == view.job.volume) view.runningFolder = running_;
     return view;
 }
 void BackupCoordinator::publish(bool force) {
@@ -171,7 +206,36 @@ void BackupCoordinator::publishTransfer(std::string_view job, const SyncProgress
     publishedView_.progress = progress;
     notify_(publishedView_);
 }
-void BackupCoordinator::select(std::string id) { if (engine(id)) { selected_ = std::move(id); publish(); } }
+void BackupCoordinator::select(std::string id) {
+    auto* member = id.empty() ? nullptr : engine(id);
+    if (!member) return;
+    const auto& disk = member->presentation().job.volume;
+    if (settings_) {
+        settings_->transaction([&] {
+            settings_->put("settings", "selectedFolder", id);
+            settings_->put("selectedFolders", disk, id);
+        });
+    }
+    selectedFolders_[disk] = id;
+    selected_ = std::move(id);
+    publish();
+}
+void BackupCoordinator::selectDisk(std::string_view disk) {
+    const auto previous = selectedFolders_.find(std::string(disk));
+    if (previous != selectedFolders_.end()) {
+        if (const auto* member = engine(previous->second); member && member->presentation().job.volume == disk) {
+            select(previous->second);
+            return;
+        }
+    }
+    const auto folders = presentation().folders;
+    const auto matching = [&](const auto& folder) { return folder.job.volume == disk; };
+    const auto enabled = std::find_if(folders.begin(), folders.end(), [&](const auto& folder) {
+        return matching(folder) && writable(folder.job);
+    });
+    if (enabled != folders.end()) select(enabled->job.id);
+    else if (const auto first = std::find_if(folders.begin(), folders.end(), matching); first != folders.end()) select(first->job.id);
+}
 void BackupCoordinator::loadEngines(std::string_view set, const Binding& binding) {
     for (const auto& id : binding.jobs) if (!engines_.contains(id)) {
         auto job = std::make_unique<SyncEngine>(root_ / "collections" / path(set) / path(id),
@@ -437,7 +501,7 @@ void BackupCoordinator::confirmSetup(std::string_view id, const std::map<std::st
     finalize(set, binding, jobs);
     attach(set, store);
     connections_[volume.id] = {volume.mount, volume.label, true, {}};
-    if (!jobs.empty()) selected_ = jobs.front().id;
+    if (!jobs.empty()) select(jobs.front().id);
     preview_.reset();
     previewSet_.reset();
     paused_ = false;
@@ -450,8 +514,7 @@ void BackupCoordinator::openExisting(const fs::path& target) {
     const Tree disk(volume.mount);
     if (folded(utf8(target.lexically_normal())) != folded(utf8((volume.mount / path(backupRoot)).lexically_normal()))) {
         legacy_->openExisting(target);
-        selected_ = legacy_->presentation().job.id;
-        publish();
+        select(legacy_->presentation().job.id);
         return;
     }
     require(allowInternal_ || volume.external, "请选择外置备份硬盘");
@@ -471,8 +534,7 @@ void BackupCoordinator::openExisting(const fs::path& target) {
     }
     attach(*set, store);
     if (temporary) stores_[set->id] = std::move(temporary);
-    selected_ = set->mappings.front().job;
-    publish();
+    select(set->mappings.front().job);
 }
 void BackupCoordinator::setEnabled(bool enabled) {
     const auto job = selected().presentation().job;
@@ -495,7 +557,7 @@ fs::path BackupCoordinator::restore(const fs::path& out, std::string_view versio
         const auto volume = connectedVolume(job.volume, connections_.at(job.volume).mount);
         require(volume.has_value(), "硬盘未连接");
         openExisting(volume->mount / path(backupRoot));
-        selected_ = job.id;
+        select(job.id);
     }
     return member.restore(out, version, point);
 }
@@ -532,12 +594,7 @@ void BackupCoordinator::respondToBackupPrompt(std::string_view id, bool backup) 
     found->second.prompt.clear();
     found->second.allowed = backup;
     if (backup) {
-        if (selected().presentation().job.volume != disk) {
-            for (auto member : all()) {
-                const auto& job = member->presentation().job;
-                if (job.volume == disk && writable(job)) { selected_ = job.id; break; }
-            }
-        }
+        if (selected().presentation().job.volume != disk) selectDisk(disk);
         confirmedDisks_.insert(disk);
         if (!paused_) {
             refreshConnections();

@@ -4,12 +4,21 @@ public struct BackupFolderStatus: Identifiable, Sendable {
     public let job: BackupJob
     public let mapping: FolderMapping?
     public let snapshot: BackupPresentation
+    public let engine: SyncEngine
     public var id: UUID { job.id }
     public var title: String { mapping?.folder ?? job.target.lastPathComponent }
 }
 
+public struct BackupDiskStatus: Identifiable, Sendable {
+    public let id: String
+    public let name: String
+    public let mount: URL?
+    public var isConnected: Bool { mount != nil }
+}
+
 public struct CoordinatorPresentation: Sendable {
     public let folders: [BackupFolderStatus]
+    public let disks: [BackupDiskStatus]
     public let running: UUID?
     public let busy: Bool
     public let diskProgress: [String: SyncProgress]
@@ -162,7 +171,7 @@ public actor BackupCoordinator {
             let snapshot = engine.presentation
             guard let job = snapshot.job else { return nil }
             let mapping = job.setID.flatMap { sets[$0]?.mappings.first(where: { $0.job == job.id }) }
-            return BackupFolderStatus(job: job, mapping: mapping, snapshot: snapshot)
+            return BackupFolderStatus(job: job, mapping: mapping, snapshot: snapshot, engine: engine)
         }
     }
 
@@ -178,8 +187,19 @@ public actor BackupCoordinator {
             guard count > 0 else { return nil }
             return BackupPrompt(id: token, volumeID: disk, volumeName: connection.mount.lastPathComponent, folderCount: count)
         }.sorted { ($0.volumeName, $0.id.uuidString) < ($1.volumeName, $1.id.uuidString) }
-        return CoordinatorPresentation(folders: folders, running: running, busy: busy, diskProgress: diskProgress, media: media,
-                                       askOnConnect: askOnConnect, backupPrompts: prompts, connectedDisks: Set(connections.keys))
+        let disks = Dictionary(grouping: folders, by: { $0.job.volumeID.uppercased() }).map { id, members in
+            let volume = members.compactMap(\.snapshot.volume).first
+            let mount = disconnectedDisks.contains(id) || ejectedVolumes[id] != nil ? nil : (connections[id]?.mount ?? volume?.mount)
+            let name = (mount == volume?.mount ? volume?.name : nil) ?? mount?.lastPathComponent ?? members[0].job.volumeName
+            return BackupDiskStatus(id: id, name: name, mount: mount)
+        }.sorted { lhs, rhs in
+            if lhs.isConnected != rhs.isConnected { return lhs.isConnected }
+            let comparison = lhs.name.localizedStandardCompare(rhs.name)
+            return comparison == .orderedSame ? lhs.id < rhs.id : comparison == .orderedAscending
+        }
+        return CoordinatorPresentation(folders: folders, disks: disks, running: running, busy: busy,
+                                       diskProgress: diskProgress, media: media, askOnConnect: askOnConnect,
+                                       backupPrompts: prompts, connectedDisks: Set(disks.filter(\.isConnected).map(\.id)))
     }
 
     public func updates() -> AsyncStream<CoordinatorPresentation> {

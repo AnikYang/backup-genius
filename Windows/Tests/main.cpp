@@ -408,6 +408,67 @@ void collectionRecovery(const fs::path& volume) {
     }
 }
 
+void separateBackupDisks(const fs::path& volume) {
+    if (volume.empty() || inspect(volume).format != "exfat") return;
+    Fixture f;
+    const auto local = inspect(f.target);
+    const auto external = inspect(volume);
+    expect(local.id != external.id, "disk selection needs two independent test volumes");
+    write(Tree(f.source), "local.txt", "local backup");
+    const auto first = f.root / "First", second = f.root / "Second";
+    fs::create_directories(first);
+    fs::create_directories(second);
+    write(Tree(first), "file.txt", "first mapping");
+    write(Tree(second), "file.txt", "second mapping");
+    std::vector<std::string> jobs;
+    struct Cleanup {
+        fs::path volume;
+        std::vector<std::string>& jobs;
+        ~Cleanup() {
+            std::error_code error;
+            fs::remove_all(volume / path(backupRoot), error);
+            fs::remove_all(volume / path(join(storageFolder, "set")), error);
+            for (const auto& job : jobs) fs::remove_all(volume / path(join(storageFolder, job)), error);
+        }
+    } cleanup{volume, jobs};
+    {
+        SyncEngine legacy(f.state, {}, true);
+        legacy.configure(f.source, f.target, false);
+        expect(legacy.sync().state == SyncState::upToDate, "legacy fixture sync");
+    }
+    std::string remembered;
+    {
+        BackupCoordinator coordinator(f.state, {}, true);
+        coordinator.start();
+        const auto preview = coordinator.previewSetup(volume, {first, second});
+        coordinator.confirmSetup(preview.id, {}, false, false);
+        auto view = coordinator.presentation();
+        expect(view.disks.size() == 2 && view.selectedDiskConnected, "present both connected backup disks");
+        for (const auto& folder : view.folders) if (folder.job.volume == external.id) {
+            jobs.push_back(folder.job.id);
+            if (folder.mapping && folder.mapping->folder == "Second") remembered = folder.job.id;
+        }
+        expect(!remembered.empty(), "record the second folder on the external disk");
+        coordinator.select(remembered);
+        const auto secondPoints = coordinator.restorePoints();
+        expect(!secondPoints.empty(), "selected external folder has its own history");
+        coordinator.selectDisk(local.id);
+        expect(coordinator.presentation().job.volume == local.id && coordinator.restorePoints() != secondPoints,
+               "disk switch changes the history source");
+        write(Tree(f.source), "local.txt", "updated only on local disk");
+        write(Tree(second), "file.txt", "waiting for second disk");
+        expect(coordinator.sync(true).state == SyncState::upToDate, "sync selected local disk");
+        expect(read(Tree(f.target), "local.txt") == "updated only on local disk" &&
+               read(Tree(volume), "BackupGenius/Second/file.txt") == "second mapping", "sync does not write the other disk");
+        coordinator.selectDisk(external.id);
+        expect(coordinator.presentation().job.id == remembered, "reselect disk restores its prior folder");
+    }
+    BackupCoordinator reopened(f.state, {}, true);
+    reopened.start();
+    expect(reopened.presentation().job.id == remembered && reopened.presentation().disks.size() == 2,
+           "restart retains disk and folder selection");
+}
+
 void collections(const fs::path& volume) {
     if (volume.empty() || inspect(volume).format != "exfat") return;
     Fixture f;
@@ -696,6 +757,7 @@ int entry(std::vector<std::string> args) {
             macOnlyNames(volume);
             organizedRepository(volume);
             collectionRecovery(volume);
+            separateBackupDisks(volume);
             collections(volume);
             pruning(volume);
 #ifdef _WIN32
