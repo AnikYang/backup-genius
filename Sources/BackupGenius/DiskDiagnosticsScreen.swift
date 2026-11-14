@@ -6,9 +6,9 @@ struct DiskDiagnosticsScreen: View {
     var body: some View {
         Form {
             Section("设备信息") {
-                LabeledContent("硬盘", value: model.volume?.name ?? model.job?.volumeName ?? "尚未选择")
+                deviceValue("硬盘", model.volume?.name ?? model.job?.volumeName ?? "尚未选择")
                 if let report = model.healthReport {
-                    LabeledContent("型号", value: report.model)
+                    deviceValue("型号", report.model)
                     LabeledContent("连接方式", value: report.connection)
                     LabeledContent("介质", value: report.medium.name)
                     LabeledContent("健康报告") {
@@ -47,6 +47,15 @@ struct DiskDiagnosticsScreen: View {
         }
         .formStyle(.grouped)
     }
+
+    private func deviceValue(_ label: String, _ value: String) -> some View {
+        LabeledContent(label) {
+            Text(value)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .help(value)
+        }
+    }
 }
 
 struct RestorePointsScreen: View {
@@ -54,14 +63,13 @@ struct RestorePointsScreen: View {
     @ViewState private var selection: UUID?
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("回到一次完整备份").font(.headline)
-                    Text("恢复所选文件夹在该时间点的全部内容，保存到新文件夹。保留最近 30 天及最后一个时间点。")
-                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer()
-            }.padding(16)
+            VStack(alignment: .leading, spacing: 5) {
+                Text("回到一次完整备份").font(.headline)
+                Text("恢复所选文件夹在该时间点的全部内容，保存到新文件夹。保留最近 \(BackupJob.retentionDays) 天及最后一个时间点。")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
             Divider()
             if model.restorePoints.isEmpty {
                 ContentUnavailableView("暂无可恢复的时间点", systemImage: "clock.arrow.circlepath",
@@ -69,17 +77,25 @@ struct RestorePointsScreen: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Table(model.restorePoints, selection: $selection) {
-                    TableColumn("备份时间") { point in Text(point.date.formatted(date: .abbreviated, time: .standard)).monospacedDigit() }
-                    TableColumn("文件数") { point in Text(point.files.formatted()).monospacedDigit() }.width(min: 70, ideal: 100)
-                }.accessibilityLabel("可完整恢复的备份时间点")
+                    TableColumn("备份时间") { point in
+                        Text(point.date.formatted(date: .abbreviated, time: .standard)).monospacedDigit()
+                    }
+                    .width(min: 165, ideal: 245)
+                    TableColumn("文件数") { point in Text(point.files.formatted()).monospacedDigit() }
+                        .width(min: 70, ideal: 100, max: 140)
+                }
+                .accessibilityLabel("可完整恢复的备份时间点")
                 Divider()
-                HStack {
-                    Text(model.restoring ? "正在恢复…" : "恢复后不会改写原来的文件夹。")
+                ResponsiveActionRow {
+                    Text(model.restoring ? "正在恢复…" : "\(model.restorePoints.count.formatted()) 个时间点")
                         .foregroundStyle(.secondary).font(.caption)
-                    Spacer()
-                    Button("恢复此时间点…") { model.restore(nil, point: selection) }
-                        .disabled(selection == nil || !model.canRestore)
-                }.padding(12)
+                } actions: {
+                    Button("恢复此时间点…") {
+                        if let selection { model.restore(nil, point: selection) }
+                    }
+                    .disabled(selection == nil || !model.canRestore)
+                }
+                .padding(12)
             }
         }
         .onChange(of: model.restorePoints.map(\.id), initial: true) { _, ids in

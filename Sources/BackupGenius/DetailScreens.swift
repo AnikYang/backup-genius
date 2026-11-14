@@ -112,17 +112,21 @@ struct SetupView: View {
     }
 
     private func folderRow(_ title: String, url: URL?, choose: @escaping () -> Void) -> some View {
-        HStack(spacing: 9) {
-            Text(title)
-            Spacer()
-            if let url {
-                Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle).help(url.path)
-            } else {
-                Text("未选择").foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.subheadline.weight(.medium))
+            HStack(spacing: 10) {
+                if let url {
+                    Text(url.lastPathComponent)
+                        .lineLimit(1).truncationMode(.middle).help(url.path)
+                } else {
+                    Text("未选择").foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                Button(url == nil ? "选择…" : "更改…", action: choose)
+                    .accessibilityLabel("选择\(title)")
+                    .fixedSize(horizontal: true, vertical: false)
+                    .disabled(pending)
             }
-            Button(url == nil ? "选择…" : "更改…", action: choose)
-                .accessibilityLabel("选择\(title)")
-                .disabled(pending)
         }
         .accessibilityElement(children: .contain)
     }
@@ -253,10 +257,10 @@ struct TakeoverView: View {
                 List(preview.changes) { change in
                     HStack {
                         VStack(alignment: .leading) {
-                            Text(change.path).lineLimit(1).truncationMode(.middle)
+                            Text(change.path).lineLimit(1).truncationMode(.middle).help(change.path)
                             Text(label(change.kind)).font(.caption).foregroundStyle(.secondary)
                         }
-                        Spacer()
+                        Spacer(minLength: 0)
                         if change.kind == .conflict && !preview.resuming {
                             Picker("处理冲突", selection: Binding(get: { choices[change.path] }, set: { choices[change.path] = $0 })) {
                                 Text("请选择").tag(nil as TakeoverChoice?)
@@ -265,13 +269,17 @@ struct TakeoverView: View {
                                 if change.canKeepBoth { Text("保留两份").tag(TakeoverChoice.both as TakeoverChoice?) }
                             }
                             .labelsHidden()
+                            .fixedSize(horizontal: true, vertical: false)
                             .accessibilityLabel("处理 \(change.path) 的冲突")
                         }
                     }
                 }
                 .listStyle(.inset)
             } else { Spacer() }
-            if let error { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
+            if let error {
+                Text(error).foregroundStyle(.orange).textSelection(.enabled)
+                    .lineLimit(3).help(error).fixedSize(horizontal: false, vertical: true)
+            }
             HStack {
                 if working { ProgressView().controlSize(.small).accessibilityLabel("正在检查或对齐文件") }
                 Spacer()
@@ -328,6 +336,7 @@ struct TakeoverView: View {
 struct ActivityScreen: View {
     let model: AppModel
     @ViewState private var query = ""
+    @ViewState private var selection: UUID?
 
     private var matching: [Activity] {
         if query.isEmpty { return model.activities }
@@ -337,37 +346,56 @@ struct ActivityScreen: View {
     }
 
     var body: some View {
-        Group {
-            if model.activities.isEmpty {
-                ContentUnavailableView("暂无活动记录", systemImage: "list.bullet.rectangle",
-                                       description: Text("每次备份的变化和需要处理的项目会显示在这里。"))
-            } else if matching.isEmpty {
-                ContentUnavailableView.search(text: query)
-            } else {
-                Table(matching) {
-                    TableColumn("操作") { item in
-                        Label(item.kind.title, systemImage: item.kind.symbol)
-                            .foregroundStyle(item.kind == .issue ? Color.orange : Color.primary)
-                    }
-                    .width(min: 88, ideal: 100)
-                    TableColumn("文件") { item in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(item.path).lineLimit(1).truncationMode(.middle)
-                            if let detail = item.detail {
-                                Text(detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                            }
+        VStack(spacing: 0) {
+            Group {
+                if model.activities.isEmpty {
+                    ContentUnavailableView("暂无活动记录", systemImage: "list.bullet.rectangle",
+                                           description: Text("每次备份的变化和需要处理的项目会显示在这里。"))
+                } else if matching.isEmpty {
+                    ContentUnavailableView.search(text: query)
+                } else {
+                    Table(matching, selection: $selection) {
+                        TableColumn("操作") { item in
+                            Label(item.kind.title, systemImage: item.kind.symbol)
+                                .foregroundStyle(item.kind == .issue ? Color.orange : Color.primary)
                         }
-                        .help(item.detail ?? item.path)
+                        .width(min: 76, ideal: 90, max: 120)
+                        TableColumn("文件") { item in
+                            Text(item.path).lineLimit(1).truncationMode(.middle)
+                                .help(item.detail ?? item.path)
+                        }
+                        .width(min: 96, ideal: 260)
+                        TableColumn("时间") { item in
+                            Text(item.date.formatted(date: .abbreviated, time: .shortened))
+                                .foregroundStyle(.secondary).lineLimit(1)
+                                .help(item.date.formatted(date: .long, time: .standard))
+                        }
+                        .width(min: 115, ideal: 146, max: 195)
+                        TableColumn("写入") { item in
+                            Text(item.bytes == 0 ? "—" : byteCount(item.bytes)).monospacedDigit().lineLimit(1)
+                        }
+                        .width(min: 58, ideal: 80, max: 120)
                     }
-                    TableColumn("时间") { item in
-                        Text(item.date.formatted(date: .abbreviated, time: .shortened)).foregroundStyle(.secondary)
-                    }
-                    .width(min: 100, ideal: 132)
-                    TableColumn("写入") { item in
-                        Text(item.bytes == 0 ? "—" : byteCount(item.bytes)).monospacedDigit()
-                    }
-                    .width(min: 65, ideal: 80)
                 }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if let selection, let item = matching.first(where: { $0.id == selection }) {
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.path)
+                            .font(.callout).fixedSize(horizontal: false, vertical: true)
+                        if let detail = item.detail {
+                            Text(detail).font(.callout).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(12)
+                }
+                .frame(height: 88)
+                .scrollBounceBehavior(.basedOnSize)
             }
         }
         .searchable(text: $query, prompt: "搜索活动")
@@ -401,13 +429,16 @@ struct VersionHistoryScreen: View {
                                 .lineLimit(1).truncationMode(.middle)
                                 .help(item.path)
                         }
+                        .width(min: 105, ideal: 250)
                         TableColumn("版本日期") { item in
                             Text(item.date.formatted(date: .abbreviated, time: .shortened))
+                                .lineLimit(1)
+                                .help(item.date.formatted(date: .long, time: .standard))
                         }
-                        .width(min: 100, ideal: 142)
-                        TableColumn("来源") { item in Text(item.reason.title) }.width(min: 65, ideal: 80)
+                        .width(min: 110, ideal: 146, max: 190)
+                        TableColumn("来源") { item in Text(item.reason.title) }.width(min: 60, ideal: 75, max: 115)
                         TableColumn("大小") { item in Text(byteCount(item.size)).monospacedDigit() }
-                            .width(min: 65, ideal: 85)
+                            .width(min: 58, ideal: 85, max: 118)
                     }
                     .contextMenu(forSelectionType: UUID.self) { ids in
                         if let id = ids.first {
@@ -419,19 +450,23 @@ struct VersionHistoryScreen: View {
                 }
             }
             Divider()
-            HStack {
+            ResponsiveActionRow {
                 if model.restoring {
-                    ProgressView().controlSize(.small)
-                    Text("正在恢复…").foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("正在恢复…").foregroundStyle(.secondary)
+                    }
                 } else {
                     Text("\(matching.count.formatted()) 个版本").foregroundStyle(.secondary)
                 }
-                Spacer()
-                Button("恢复当前备份…") { model.restore(nil) }
-                    .disabled(!model.canRestore || model.progress.trackedFiles == 0)
-                Button("恢复所选版本…") { model.restore(selection) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!model.canRestore || !matching.contains(where: { $0.id == selection }))
+            } actions: {
+                HStack(spacing: 8) {
+                    Button("恢复当前备份…") { model.restore(nil) }
+                        .disabled(!model.canRestore || model.progress.trackedFiles == 0)
+                    Button("恢复所选版本…") { model.restore(selection) }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!model.canRestore || !matching.contains(where: { $0.id == selection }))
+                }
             }
             .padding(12)
         }

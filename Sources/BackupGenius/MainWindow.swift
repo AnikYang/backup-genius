@@ -96,47 +96,37 @@ struct MainWindow: View {
 
     var body: some View {
         NavigationSplitView {
-            List(selection: Binding<Page?>(get: { model.page }, set: { model.page = $0 ?? .overview })) {
-                Section("备份管理") {
-                    ForEach(Page.allCases) { page in
-                        Label(page.title, systemImage: page.symbol).tag(page)
+            VStack(spacing: 0) {
+                List(selection: Binding<Page?>(get: { model.page }, set: { model.page = $0 ?? .overview })) {
+                    Section("备份管理") {
+                        ForEach(Page.allCases) { page in
+                            Label(page.title, systemImage: page.symbol).tag(page)
+                        }
                     }
                 }
-            }
-            .listStyle(.sidebar)
-            .navigationSplitViewColumnWidth(min: 180, ideal: 216, max: 260)
-            .safeAreaInset(edge: .bottom, spacing: 0) {
+                .listStyle(.sidebar)
+                Divider().padding(.horizontal, 14)
                 SidebarDisk(job: model.job, volume: model.volume, state: model.progress.state, connected: model.selectedDiskConnected)
             }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 216, max: 260)
         } detail: {
-            Group {
-                switch model.page {
-                case .overview: Overview(model: model)
-                case .activity: ActivityScreen(model: model)
-                case .history: HistoryScreen(model: model)
-                case .disk: DiskDiagnosticsScreen(model: model)
-                }
-            }
-            .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
                 if model.folders.count > 1 || model.job?.setID != nil {
-                    HStack {
-                        Picker("所属文件夹", selection: Binding(
-                            get: { model.selectedFolder }, set: { if let id = $0 { model.selectFolder(id) } }
-                        )) {
-                            ForEach(model.folders) { folder in
-                                Text(folder.title).tag(Optional(folder.id))
-                            }
-                        }
-                        .frame(maxWidth: 420, alignment: .leading)
-                        Spacer()
-                        if model.page == .overview {
-                            Button("添加备份文件夹…", systemImage: "plus") { model.setup = .guide }
-                                .disabled(model.busy)
+                    folderBar
+                    Divider()
+                }
+                // Native tables can propose their ideal height in a split column.
+                // Keep each page within the space left after the folder bar.
+                GeometryReader { geometry in
+                    Group {
+                        switch model.page {
+                        case .overview: Overview(model: model)
+                        case .activity: ActivityScreen(model: model)
+                        case .history: HistoryScreen(model: model)
+                        case .disk: DiskDiagnosticsScreen(model: model)
                         }
                     }
-                    .padding(.horizontal, 22)
-                    .padding(.vertical, 8)
-                    Divider()
+                    .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
                 }
             }
             .navigationTitle(model.page.title)
@@ -204,6 +194,38 @@ struct MainWindow: View {
             Text(model.error ?? "")
         }
     }
+
+    private var folderBar: some View {
+        Group {
+            if model.page == .overview {
+                HStack(spacing: 12) {
+                    folderPicker
+                    Spacer(minLength: 0)
+                    Button("添加备份文件夹…", systemImage: "plus") { model.setup = .guide }
+                        .fixedSize(horizontal: true, vertical: false)
+                        .disabled(model.busy)
+                }
+            } else {
+                folderPicker
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 22)
+        .padding(.vertical, 8)
+    }
+
+    private var folderPicker: some View {
+        Picker("所属文件夹", selection: Binding(
+            get: { model.selectedFolder }, set: { if let id = $0 { model.selectFolder(id) } }
+        )) {
+            ForEach(model.folders) { folder in
+                Text(folder.title).tag(Optional(folder.id))
+            }
+        }
+        .lineLimit(1)
+        .frame(maxWidth: 420, alignment: .leading)
+        .help(model.folders.first(where: { $0.id == model.selectedFolder })?.title ?? "所属文件夹")
+    }
 }
 
 private struct SidebarDisk: View {
@@ -212,14 +234,18 @@ private struct SidebarDisk: View {
     let state: SyncState
     let connected: Bool
 
+    private var name: String { volume?.name ?? job?.volumeName ?? "备份硬盘" }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Divider()
             Label {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(volume?.name ?? job?.volumeName ?? "备份硬盘")
+                    Text(name)
                         .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(name)
                     Text(connectionStatus)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -237,8 +263,9 @@ private struct SidebarDisk: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
-        .padding(.bottom, 14)
+        .padding(.vertical, 12)
     }
 
     private var connectionStatus: String {
@@ -260,14 +287,21 @@ struct Overview: View {
                     status
                     ForEach(model.backupPrompts.filter { $0.volumeID.caseInsensitiveCompare(job.volumeID) == .orderedSame }) { prompt in
                         VStack(alignment: .leading, spacing: 10) {
-                            Label("「\(prompt.volumeName)」已连接", systemImage: "externaldrive")
-                                .font(.headline)
-                            HStack {
-                                Text("可备份 \(prompt.folderCount) 个文件夹").foregroundStyle(.secondary)
-                                Spacer(minLength: 8)
-                                Button("稍后") { model.respondToBackupPrompt(prompt.id, backup: false) }
-                                Button("立即备份") { model.respondToBackupPrompt(prompt.id, backup: true) }
-                                    .buttonStyle(.borderedProminent)
+                            Label {
+                                Text(prompt.volumeName).lineLimit(2).truncationMode(.middle)
+                            } icon: {
+                                Image(systemName: "externaldrive")
+                            }
+                            .font(.headline)
+                            .help(prompt.volumeName)
+                            ResponsiveActionRow {
+                                Text("已连接，可备份 \(prompt.folderCount) 个文件夹").foregroundStyle(.secondary)
+                            } actions: {
+                                HStack(spacing: 8) {
+                                    Button("稍后") { model.respondToBackupPrompt(prompt.id, backup: false) }
+                                    Button("立即备份") { model.respondToBackupPrompt(prompt.id, backup: true) }
+                                        .buttonStyle(.borderedProminent)
+                                }
                             }
                         }
                         .padding(14)
@@ -275,17 +309,26 @@ struct Overview: View {
                         .background(.background.secondary, in: .rect(cornerRadius: 12))
                     }
                     if job.setID != nil {
-                        ForEach(model.folders.filter { $0.job.setID == job.setID }) { folder in
-                            Button { model.selectFolder(folder.id) } label: {
-                                HStack {
-                                    Label(folder.title, systemImage: "folder")
-                                    Spacer()
-                                    Text(folder.mapping?.enabled == false ? "已停用" : folder.snapshot.progress.state.title)
-                                        .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 11) {
+                            ForEach(model.folders.filter { $0.job.setID == job.setID }) { folder in
+                                Button { model.selectFolder(folder.id) } label: {
+                                    HStack(spacing: 12) {
+                                        Label {
+                                            Text(folder.title).lineLimit(1).truncationMode(.middle)
+                                        } icon: {
+                                            Image(systemName: "folder")
+                                        }
+                                        Spacer(minLength: 0)
+                                        Text(folder.mapping?.enabled == false ? "已停用" : folder.snapshot.progress.state.title)
+                                            .font(.callout)
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: true, vertical: false)
+                                    }
+                                    .contentShape(Rectangle())
                                 }
-                                .contentShape(Rectangle())
+                                .buttonStyle(.plain)
+                                .help(folder.title)
                             }
-                            .buttonStyle(.plain)
                         }
                     }
                     if model.progress.state == .takeoverRequired || (job.restoreOnly && job.format == .exfat && model.volume != nil) {
@@ -311,9 +354,9 @@ struct Overview: View {
                         notices
                     }
                     Divider()
-                    HStack {
+                    ResponsiveActionRow {
                         Label("保留旧版 \(BackupJob.retentionDays) 天", systemImage: "clock.arrow.circlepath")
-                        Spacer()
+                    } actions: {
                         Button("打开备份", systemImage: "folder", action: model.openFolder)
                             .disabled(model.volume == nil || model.progress.state.busy)
                     }
@@ -325,7 +368,11 @@ struct Overview: View {
                 .frame(maxWidth: .infinity, alignment: .top)
             }
         } else {
-            empty
+            ViewThatFits(in: .vertical) {
+                empty
+                ScrollView { empty }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -371,14 +418,14 @@ struct Overview: View {
                 .padding(.top, 5)
         }
         .padding(28)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
     }
 
     private var status: some View {
         let progress = model.displayedProgress
         let state = progress.state
         return VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
                 Image(systemName: state.symbol)
                     .font(.system(size: 24, weight: .medium))
                     .foregroundStyle(state.color)
@@ -392,12 +439,17 @@ struct Overview: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                        .lineLimit(4)
+                        .help(statusDetail)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
             }
             if let running = model.folders.first(where: { $0.id == model.runningFolder }), running.id != model.selectedFolder,
                running.job.volumeID == model.job?.volumeID {
-                Text("当前正在处理：\(running.title)").font(.callout).foregroundStyle(.secondary)
+                Text("当前正在处理：\(running.title)")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle).help(running.title)
             }
             if state.busy || model.ejecting {
                 if let fraction = progress.fraction, !model.ejecting {
@@ -481,29 +533,60 @@ struct Overview: View {
     private func route(_ job: BackupJob) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("所选文件夹的备份路径").font(.headline)
-            HStack(spacing: 14) {
-                FolderTile(role: "源文件夹", title: job.source.lastPathComponent, path: job.source.path, icon: "folder.fill")
-                Image(systemName: "arrow.right")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.tertiary)
-                    .accessibilityLabel("同步到")
-                FolderTile(role: "目标文件夹", title: job.target.lastPathComponent,
-                           path: job.target.path, icon: "externaldrive.fill")
+            let target = FolderTile(role: "目标文件夹", title: job.target.lastPathComponent,
+                                    path: job.target.path, icon: "externaldrive.fill")
+            if job.restoreOnly {
+                target
+            } else {
+                let source = FolderTile(role: "源文件夹", title: job.source.lastPathComponent,
+                                        path: job.source.path, icon: "folder.fill")
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 14) {
+                        source.frame(minWidth: 205, idealWidth: 205, maxWidth: .infinity)
+                        routeArrow("arrow.right")
+                        target.frame(minWidth: 205, idealWidth: 205, maxWidth: .infinity)
+                    }
+                    VStack(spacing: 8) {
+                        source
+                        routeArrow("arrow.down")
+                        target
+                    }
+                }
             }
         }
+    }
+
+    private func routeArrow(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.secondary)
+            .accessibilityLabel("同步到")
     }
 
     private var metrics: some View {
         let progress = model.displayedProgress
         return VStack(alignment: .leading, spacing: 12) {
             Text("本次同步").font(.headline)
-            HStack(spacing: 0) {
-                Metric(name: "已跳过", value: progress.skipped.formatted(), unit: "个未变化文件")
-                Divider().frame(height: 43)
-                Metric(name: "最新副本写入", value: byteCount(progress.latestWrittenBytes), unit: "文件数据")
-                Divider().frame(height: 43)
-                Metric(name: "历史数据写入", value: byteCount(progress.historyWrittenBytes), unit: "已归档的数据")
+            let skipped = Metric(name: "已跳过", value: progress.skipped.formatted(), unit: "个未变化文件")
+            let written = Metric(name: "最新副本写入", value: byteCount(progress.latestWrittenBytes), unit: "文件数据")
+            let history = Metric(name: "历史数据写入", value: byteCount(progress.historyWrittenBytes), unit: "已归档的数据")
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 0) {
+                    skipped.fixedSize(horizontal: true, vertical: false).frame(maxWidth: .infinity, alignment: .leading)
+                    Divider().frame(height: 43)
+                    written.fixedSize(horizontal: true, vertical: false).frame(maxWidth: .infinity, alignment: .leading)
+                    Divider().frame(height: 43)
+                    history.fixedSize(horizontal: true, vertical: false).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    skipped
+                    Divider().padding(.horizontal, 16)
+                    written
+                    Divider().padding(.horizontal, 16)
+                    history
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 14)
             .background(.background.secondary, in: .rect(cornerRadius: 12))
             .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(.separator) }
@@ -545,10 +628,9 @@ private struct FolderTile: View {
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 4) {
                 Text(role).font(.caption).foregroundStyle(.secondary)
-                Text(title).font(.subheadline.weight(.semibold)).lineLimit(1)
+                Text(title).font(.subheadline.weight(.semibold)).lineLimit(1).truncationMode(.middle)
                 Text(path).font(.caption).lineLimit(1).truncationMode(.middle).foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
         }
         .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -567,11 +649,31 @@ private struct Metric: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(name).font(.caption).foregroundStyle(.secondary)
-            Text(value).font(.title2.monospacedDigit().weight(.semibold)).lineLimit(1)
+            Text(value).font(.title2.monospacedDigit().weight(.semibold))
             Text(unit).font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 16)
         .accessibilityElement(children: .combine)
+    }
+}
+
+struct ResponsiveActionRow<Caption: View, Actions: View>: View {
+    @ViewBuilder let caption: Caption
+    @ViewBuilder let actions: Actions
+
+    var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                caption
+                Spacer(minLength: 0)
+                actions
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                caption
+                actions
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

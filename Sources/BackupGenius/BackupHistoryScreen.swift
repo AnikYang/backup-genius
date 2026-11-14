@@ -22,11 +22,14 @@ struct HistoryScreen: View {
             .frame(maxWidth: 360)
             .padding(10)
             Divider()
-            switch section {
-            case .points: RestorePointsScreen(model: model)
-            case .backups: BackupRunsScreen(model: model)
-            case .versions: VersionHistoryScreen(model: model)
+            Group {
+                switch section {
+                case .points: RestorePointsScreen(model: model)
+                case .backups: BackupRunsScreen(model: model)
+                case .versions: VersionHistoryScreen(model: model)
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }
@@ -69,15 +72,27 @@ private struct BackupRunsScreen: View {
                        query: query.trimmingCharacters(in: .whitespacesAndNewlines), page: page)
     }
 
+    private var visibleChanges: BackupRunChangePage? {
+        guard let (completed, result) = loaded, completed == request else { return nil }
+        return result
+    }
+
     var body: some View {
         Group {
             if model.backupRuns.isEmpty {
                 ContentUnavailableView("暂无备份记录", systemImage: "clock.arrow.circlepath",
                                        description: Text("完成一轮备份后，可在这里查看新增和修改的文件。"))
             } else {
-                VSplitView {
-                    runsTable.frame(minHeight: 100, idealHeight: 158)
-                    changesPane.frame(minHeight: 190)
+                VStack(spacing: 0) {
+                    VSplitView {
+                        runsTable.frame(minHeight: 88, idealHeight: 140)
+                        changesPane.frame(minHeight: 104)
+                    }
+                    .frame(maxHeight: .infinity)
+                    if let request, let result = visibleChanges, !result.items.isEmpty {
+                        Divider()
+                        pagination(request, result)
+                    }
                 }
             }
         }
@@ -129,54 +144,76 @@ private struct BackupRunsScreen: View {
 
     private var changesPane: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Picker("变化类型", selection: $filter) {
-                    ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    changeFilter
+                    Spacer(minLength: 0)
+                    changeSearch
                 }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 177)
-                Spacer(minLength: 0)
-                TextField("搜索文件名或路径", text: $query)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 255)
+                VStack(alignment: .leading, spacing: 8) {
+                    changeFilter
+                    changeSearch
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(10)
             Divider()
-            if let (completed, result) = loaded, completed == request {
+            if let result = visibleChanges {
                 if result.items.isEmpty {
-                    ContentUnavailableView(request?.changeCount == 0 ? "本轮无新增或修改" : "没有符合筛选的文件",
-                                           systemImage: "doc.text.magnifyingglass")
+                    Text(request?.changeCount == 0 ? "本轮无新增或修改" : "没有符合筛选的文件")
+                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                        .multilineTextAlignment(.center)
+                        .padding(8)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     Table(result.items) {
                         TableColumn("类型") { item in Label(item.kind.title, systemImage: item.kind.symbol) }
-                            .width(min: 75, ideal: 90)
+                            .width(min: 75, ideal: 90, max: 120)
                         TableColumn("文件") { item in
                             Text(item.path).lineLimit(1).truncationMode(.middle).help(item.path)
                         }
+                        .width(min: 96, ideal: 270)
                         TableColumn("写入") { item in
                             Text(byteCount(item.bytes)).monospacedDigit()
                         }
-                        .width(min: 65, ideal: 82)
+                        .width(min: 60, ideal: 82, max: 115)
                     }
-                    Divider()
-                    HStack(spacing: 10) {
-                        let first = completed.page * pageSize + 1
-                        let last = first + result.items.count - 1
-                        Text("\(first.formatted())–\(last.formatted()) / \(result.total.formatted()) 项")
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                        Spacer()
-                        Button("上一页", systemImage: "chevron.left") { page -= 1 }.disabled(page == 0)
-                        Button("下一页", systemImage: "chevron.right") { page += 1 }.disabled(last >= result.total)
-                    }
-                    .controlSize(.small)
-                    .padding(10)
                 }
             } else {
                 ProgressView("正在读取备份记录…").frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+    }
+
+    private var changeFilter: some View {
+        Picker("变化类型", selection: $filter) {
+            ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+    }
+
+    private var changeSearch: some View {
+        TextField("搜索文件名或路径", text: $query)
+            .textFieldStyle(.roundedBorder)
+            .frame(minWidth: 155, maxWidth: 255)
+    }
+
+    private func pagination(_ request: Request, _ result: BackupRunChangePage) -> some View {
+        let first = request.page * pageSize + 1
+        let last = first + result.items.count - 1
+        return ResponsiveActionRow {
+            Text("\(first.formatted())–\(last.formatted()) / \(result.total.formatted()) 项")
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        } actions: {
+            HStack(spacing: 8) {
+                Button("上一页", systemImage: "chevron.left") { page -= 1 }.disabled(page == 0)
+                Button("下一页", systemImage: "chevron.right") { page += 1 }.disabled(last >= result.total)
+            }
+        }
+        .controlSize(.small)
+        .padding(10)
     }
 }

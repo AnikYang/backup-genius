@@ -37,7 +37,12 @@ struct BackupGuide: View {
                 case 1:
                     Section("主目录") {
                         LabeledContent("文件夹名称", value: BackupSet.folderName)
-                        LabeledContent("位置", value: disk?.appending(path: BackupSet.folderName).path ?? "")
+                        if let disk {
+                            let path = disk.appending(path: BackupSet.folderName).path
+                            LabeledContent("位置") {
+                                Text(path).lineLimit(2).truncationMode(.middle).help(path)
+                            }
+                        }
                         Text("开始备份时，Backup Genius 会创建或打开这个主目录。")
                             .foregroundStyle(.secondary)
                     }
@@ -45,11 +50,16 @@ struct BackupGuide: View {
                     Section("源文件夹") {
                         ForEach(sources, id: \.self) { source in
                             HStack {
-                                Label(source.path, systemImage: "folder")
-                                    .lineLimit(2)
-                                Spacer()
+                                Label {
+                                    Text(source.path).lineLimit(2).truncationMode(.middle)
+                                } icon: {
+                                    Image(systemName: "folder")
+                                }
+                                .help(source.path)
+                                Spacer(minLength: 0)
                                 Button("移除", systemImage: "minus.circle") { sources.removeAll { $0 == source } }
                                     .labelStyle(.iconOnly)
+                                    .fixedSize()
                                     .accessibilityLabel("移除 \(source.lastPathComponent)")
                             }
                         }
@@ -59,7 +69,9 @@ struct BackupGuide: View {
                     Section("源文件夹与备份位置") {
                         ForEach(preview?.rows ?? []) { row in
                             VStack(alignment: .leading, spacing: 5) {
-                                Text(row.source?.path ?? row.name).font(.subheadline)
+                                let source = row.source?.path ?? row.name
+                                Text(source).font(.subheadline)
+                                    .lineLimit(2).truncationMode(.middle).help(source)
                                 if !row.group.isEmpty {
                                     TextField("来源分组", text: Binding(
                                         get: { groups[row.id] ?? row.group },
@@ -69,6 +81,7 @@ struct BackupGuide: View {
                                 let group = groups[row.id] ?? row.group
                                 let target = group.isEmpty ? row.name : "\(group)/\(row.name)"
                                 Text("BackupGenius/\(target)").font(.callout).foregroundStyle(.secondary)
+                                    .lineLimit(2).truncationMode(.middle).help("BackupGenius/\(target)")
                                 if let previous = row.previousFolder, previous != target {
                                     Text("将已有备份从 \(previous) 移到此处")
                                         .font(.caption).foregroundStyle(.secondary)

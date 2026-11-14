@@ -218,7 +218,6 @@ final class AppModel {
         if let runningFolder, let current = folders.first(where: { $0.id == runningFolder }),
            current.job.volumeID == job.volumeID {
             var state = current.snapshot.progress
-            if state.message == nil { state.message = current.title }
             if busy, !state.state.busy { state.state = .checking }
             return state
         }
